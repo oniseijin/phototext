@@ -21,6 +21,8 @@ from pathlib import Path
 
 from . import db
 from .config import Config, ensure_noindex
+from .faces import MAX_FACES as PERSON_MAX_FACES
+from .faces import detect_faces, vision_problem
 from .imaging import ImageReadError, crop_jpeg, prepare_image
 from .ollama_client import (
     ModelOutputError,
@@ -204,9 +206,20 @@ def run_matching(
         return 0
     profiles = people_json_for_prompt(conn, person_ids)
     threshold = cfg.person_min_confidence
+    if cfg.face_detection:
+        face_problem = vision_problem()
+        if face_problem is not None:
+            # Without Vision every photo would look faceless and the whole
+            # pass would mark everyone absent — fall back to whole-photo
+            # matching instead of silently degrading.
+            print(f"warning: {face_problem}; matching whole photos instead")
+            cfg = replace(cfg, face_detection=False)
+    face_note = "macOS Vision face detection on" if cfg.face_detection else ""
     print(
         f"Matching {len(candidates)} photo(s) against {len(selected)} person(s) "
-        f"with model '{client.person_model}' (confidence threshold {threshold:.2f})...",
+        f"with model '{client.person_model}' (confidence threshold {threshold:.2f})"
+        + (f", {face_note}" if face_note else "")
+        + "...",
         flush=True,
     )
     controller = RunController()
@@ -243,18 +256,46 @@ def run_matching(
             print(f"  [{evaluated + 1}/{len(candidates)}] photo {photo_id}: no readable file",
                   flush=True)
             continue
+        face_boxes: list[tuple[int, int, int, int]] = []
+        if cfg.face_detection:
+            face_boxes = detect_faces(Path(path), photo_id)
+            if not face_boxes:
+                # No faces -> nobody in the selected set can appear. Record
+                # absent for everyone without spending a model call; seed and
+                # user rows are ground truth and stay untouched.
+                for person in selected:
+                    existing = db.person_tag_row(conn, photo_id, person["id"])
+                    if existing is not None and existing["present"] and existing["origin"] != "model":
+                        continue
+                    db.tag_person(
+                        conn, photo_id, person["id"], 0.0, "model", present=False
+                    )
+                    absent += 1
+                evaluated += 1
+                print(f"  [{evaluated}/{len(candidates)}] photo {photo_id}: no faces", flush=True)
+                continue
+        images_b64: list[str] = []
         try:
-            image_bytes = prepare_image(
-                Path(path), cfg.max_image_edge, max_pixels=cfg.max_image_pixels
-            )
+            if face_boxes:
+                # Match on close-up face crops (largest first, bounded).
+                for box in face_boxes[:PERSON_MAX_FACES]:
+                    crop = crop_jpeg(
+                        Path(path), box, max_edge=PERSON_SEED_EDGE,
+                        max_pixels=cfg.max_image_pixels,
+                    )
+                    images_b64.append(base64.b64encode(crop).decode("ascii"))
+            if not images_b64:
+                image_bytes = prepare_image(
+                    Path(path), cfg.max_image_edge, max_pixels=cfg.max_image_pixels
+                )
+                images_b64 = [base64.b64encode(image_bytes).decode("ascii")]
         except ImageReadError as e:
             errors += 1
             print(f"  [{evaluated + 1}/{len(candidates)}] photo {photo_id}: unreadable ({e})",
                   flush=True)
             continue
-        b64 = base64.b64encode(image_bytes).decode("ascii")
         try:
-            raw, _content = client.match_people(b64, profiles)
+            raw, _content = client.match_people(images_b64, profiles)
         except (ModelOutputError, OllamaServerError, OllamaTimeout) as e:
             errors += 1
             print(f"  [{evaluated + 1}/{len(candidates)}] photo {photo_id}: {e}", flush=True)

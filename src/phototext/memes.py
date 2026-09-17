@@ -18,6 +18,7 @@ from . import imaging  # noqa: F401  (registers the HEIF opener)
 from PIL import Image
 
 HAMMING_DEFAULT = 8
+DUPLICATE_HAMMING_DEFAULT = 4
 
 
 def dhash(path: Path) -> int | None:
@@ -66,17 +67,24 @@ def find_clusters(
     conn: sqlite3.Connection,
     max_distance: int = HAMMING_DEFAULT,
     min_size: int = 2,
+    exclude_derivatives: bool = False,
 ) -> list[list[sqlite3.Row]]:
     """Groups of near-identical photos (hamming distance <= max_distance).
 
-    Rows carry id, phash, has_text, text_kind, text, status, and the first
-    location path. Groups are returned largest first.
-    """
+    Rows carry id, phash, has_text, text_kind, status, and the first
+    location path. Groups are returned largest first. With
+    exclude_derivatives, iCloud preview proxies are skipped so a local
+    original never pairs with its own cloud preview (used by the
+    duplicates view, not the meme view)."""
+    where = "p.phash IS NOT NULL AND p.deleted_at IS NULL"
+    if exclude_derivatives:
+        where += " AND p.derivative = 0"
     rows = conn.execute(
         "SELECT p.id, p.phash, p.has_text, p.text_kind, p.category, p.tiled, "
         "p.gated, p.derivative, p.status, p.error, p.text, p.language, p.model, "
+        "p.byte_size, p.date_taken, "
         "(SELECT path FROM locations WHERE photo_id = p.id ORDER BY id LIMIT 1) AS path "
-        "FROM photos p WHERE p.phash IS NOT NULL AND p.deleted_at IS NULL"
+        f"FROM photos p WHERE {where}"
     ).fetchall()
     parent = list(range(len(rows)))
 

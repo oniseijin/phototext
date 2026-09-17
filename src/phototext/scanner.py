@@ -11,7 +11,7 @@ from pathlib import Path
 from PIL import Image
 
 from . import db, memes as memes_mod
-from .imaging import sha256_file
+from .imaging import read_date_taken, sha256_file
 from .library_meta import LibraryMetaError, norm_path, resolve_paths
 
 IMAGE_EXTS = {
@@ -244,10 +244,20 @@ def _slice_checker(uri: str, kind: str, spec: Slice):
         if allowed is not None and norm_path(path) not in allowed:
             return False
         if date_from is not None or date_to is not None:
-            mtime = datetime.fromtimestamp(st.st_mtime)
-            if date_from is not None and mtime < date_from:
+            # Prefer the EXIF capture date (what the user means by "photos
+            # from 2013"); fall back to the file date when there is none.
+            when: datetime | None = None
+            taken = read_date_taken(path)
+            if taken:
+                try:
+                    when = datetime.fromisoformat(taken)
+                except ValueError:
+                    when = None
+            if when is None:
+                when = datetime.fromtimestamp(st.st_mtime)
+            if date_from is not None and when < date_from:
                 return False
-            if date_to is not None and mtime > date_to:
+            if date_to is not None and when > date_to:
                 return False
         return True
 
@@ -325,7 +335,17 @@ def scan_source(
             with warnings.catch_warnings(record=True) as caught:
                 warnings.simplefilter("always", UserWarning)
                 phash = memes_mod.dhash(image_path)
-            photo_id, created = db.upsert_photo(conn, digest, st.st_size, phash)
+            date_taken = read_date_taken(image_path)
+            photo_id, created = db.upsert_photo(
+                conn, digest, st.st_size, phash, date_taken
+            )
+            if not created and date_taken is not None:
+                # Pre-date-taken catalogs: opportunistically fill the gap
+                # when a known file is re-seen.
+                conn.execute(
+                    "UPDATE photos SET date_taken = ? WHERE id = ? AND date_taken IS NULL",
+                    (date_taken, photo_id),
+                )
             for warning in caught:
                 db.record_warning(
                     conn, photo_id,
@@ -417,6 +437,13 @@ def _scan_photos_library(
             if phash is not None:
                 conn.execute(
                     "UPDATE photos SET phash = ? WHERE id = ?", (phash, photo_id)
+                )
+            date_taken = read_date_taken(original)
+            if date_taken is not None:
+                conn.execute(
+                    "UPDATE photos SET date_taken = COALESCE(date_taken, ?) "
+                    "WHERE id = ?",
+                    (date_taken, photo_id),
                 )
             for warning in caught:
                 db.record_warning(

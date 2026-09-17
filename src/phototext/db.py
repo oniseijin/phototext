@@ -127,6 +127,11 @@ MIGRATIONS: dict[int, str] = {
 
     CREATE INDEX idx_person_tags_person ON person_tags(person_id);
     """,
+    10: """
+    ALTER TABLE photos ADD COLUMN date_taken TEXT;
+    ALTER TABLE person_tags ADD COLUMN seed INTEGER NOT NULL DEFAULT 0;
+    UPDATE person_tags SET seed = 1 WHERE origin = 'seed';
+    """,
 }
 
 
@@ -276,12 +281,16 @@ def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
 
 
 def upsert_photo(
-    conn: sqlite3.Connection, sha256: str, byte_size: int, phash: int | None = None
+    conn: sqlite3.Connection,
+    sha256: str,
+    byte_size: int,
+    phash: int | None = None,
+    date_taken: str | None = None,
 ) -> tuple[int, bool]:
     cur = conn.execute(
-        "INSERT INTO photos (sha256, byte_size, phash) VALUES (?, ?, ?) "
+        "INSERT INTO photos (sha256, byte_size, phash, date_taken) VALUES (?, ?, ?, ?) "
         "ON CONFLICT(sha256) DO NOTHING",
-        (sha256, byte_size, phash),
+        (sha256, byte_size, phash, date_taken),
     )
     created = cur.rowcount == 1
     row = conn.execute("SELECT id FROM photos WHERE sha256 = ?", (sha256,)).fetchone()
@@ -716,6 +725,37 @@ def find_first_existing_location(conn: sqlite3.Connection, photo_id: int) -> str
     return None
 
 
+def photos_missing_date_taken(conn: sqlite3.Connection) -> list[int]:
+    """Photo ids (not tombstoned) without a date_taken, oldest rows first."""
+    return [
+        r["id"]
+        for r in conn.execute(
+            "SELECT id FROM photos WHERE date_taken IS NULL AND deleted_at IS NULL "
+            "ORDER BY id"
+        )
+    ]
+
+
+def set_date_taken(
+    conn: sqlite3.Connection, photo_id: int, value: str
+) -> bool:
+    """Record date_taken if the photo does not have one yet."""
+    cur = conn.execute(
+        "UPDATE photos SET date_taken = ? WHERE id = ? AND date_taken IS NULL",
+        (value, photo_id),
+    )
+    return cur.rowcount == 1
+
+
+def date_taken_histogram(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """(year, n) rows for visible photos with a known date, newest year first."""
+    return conn.execute(
+        "SELECT strftime('%Y', date_taken) AS year, COUNT(*) AS n "
+        "FROM photos WHERE date_taken IS NOT NULL AND deleted_at IS NULL AND hidden = 0 "
+        "GROUP BY year ORDER BY year DESC"
+    ).fetchall()
+
+
 def recent_results(
     conn: sqlite3.Connection,
     n: int = 20,
@@ -760,6 +800,27 @@ def last_finished(conn: sqlite3.Connection) -> str | None:
     return row["m"]
 
 
+def _date_filter_parts(
+    date_from: str | None, date_to: str | None, year: str | None
+) -> tuple[list[str], list]:
+    """SQL fragments + params filtering photos.date_taken, in a fixed order.
+
+    Date filters only match photos that have a date_taken; NULLs fall out.
+    """
+    frags: list[str] = []
+    params: list = []
+    if date_from:
+        frags.append("p.date_taken >= ?")
+        params.append(date_from)
+    if date_to:
+        frags.append("p.date_taken <= ?")
+        params.append(date_to)
+    if year:
+        frags.append("strftime('%Y', p.date_taken) = ?")
+        params.append(year)
+    return frags, params
+
+
 def search_photos(
     conn: sqlite3.Connection,
     query: str,
@@ -769,6 +830,9 @@ def search_photos(
     category: str | None = None,
     include_hidden: bool = False,
     person: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    year: str | None = None,
 ) -> tuple[list[sqlite3.Row], str]:
     """Full-text search over text + context, optionally within a category.
 
@@ -798,6 +862,9 @@ def search_photos(
             "JOIN people pe ON pe.id = t.person_id "
             "WHERE pe.name = ? COLLATE NOCASE AND t.present = 1)"
         )
+    date_frags, date_params = _date_filter_parts(date_from, date_to, year)
+    if date_frags:
+        sql += " AND " + " AND ".join(date_frags)
     sql += " ORDER BY rank LIMIT ? OFFSET ?"
     open_m, close_m = highlight
 
@@ -807,6 +874,7 @@ def search_photos(
             params.append(category)
         if person:
             params.append(person)
+        params += date_params
         params += [limit, offset]
         return conn.execute(sql, params).fetchall()
 
@@ -823,6 +891,7 @@ def search_photos(
 def search_count(
     conn: sqlite3.Connection, query: str, include_hidden: bool = False,
     person: str | None = None,
+    date_from: str | None = None, date_to: str | None = None, year: str | None = None,
 ) -> int:
     """Number of photos matching an FTS5 query (visible ones only)."""
     sql = (
@@ -837,11 +906,15 @@ def search_count(
             "JOIN people pe ON pe.id = t.person_id "
             "WHERE pe.name = ? COLLATE NOCASE AND t.present = 1)"
         )
+    date_frags, date_params = _date_filter_parts(date_from, date_to, year)
+    if date_frags:
+        sql += " AND " + " AND ".join(date_frags)
 
     def run(q: str) -> int:
         params = [q]
         if person:
             params.append(person)
+        params += date_params
         return conn.execute(sql, params).fetchone()["n"]
 
     try:
@@ -863,6 +936,9 @@ def page_photos(
     offset: int = 0,
     show_hidden: bool = False,
     person: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    year: str | None = None,
 ) -> tuple[list[sqlite3.Row], int]:
     """Browse photos (no query), most recently finished first. Returns
     (rows, total matching the filter)."""
@@ -886,6 +962,10 @@ def page_photos(
             "WHERE pe.name = ? COLLATE NOCASE AND t.present = 1)"
         )
         params.append(person)
+    date_frags, date_params = _date_filter_parts(date_from, date_to, year)
+    for frag in date_frags:
+        where.append(frag)
+    params += date_params
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
     total = conn.execute(
         f"SELECT COUNT(*) AS n FROM photos p {where_sql}", params
@@ -978,35 +1058,54 @@ def tag_person(
     origin: str,
     box: str | None = None,
     present: bool = True,
+    seed: bool = False,
 ) -> None:
     """Upsert a person tag. User and seed rows are ground truth: a later
     model tag never overwrites them. present=False records that the model
-    judged the person absent (re-runs skip the photo)."""
+    judged the person absent (re-runs skip the photo). seed=1 marks the tag
+    as an anchor for the recognition profile."""
     conn.execute(
         """
-        INSERT INTO person_tags (photo_id, person_id, present, confidence, origin, box)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO person_tags (photo_id, person_id, present, confidence, origin, box, seed)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(photo_id, person_id) DO UPDATE SET
             confidence = excluded.confidence,
             origin = excluded.origin,
             present = excluded.present,
             box = COALESCE(excluded.box, person_tags.box),
+            seed = MAX(person_tags.seed, excluded.seed),
             updated_at = excluded.created_at
         WHERE excluded.origin != 'model' OR person_tags.origin NOT IN ('user', 'seed')
         """,
-        (photo_id, person_id, int(present), confidence, origin, box),
+        (photo_id, person_id, int(present), confidence, origin, box, int(seed)),
     )
     conn.commit()
 
 
-def confirm_person_tag(conn: sqlite3.Connection, photo_id: int, person_id: int) -> None:
-    """Promote a tag to user-verified ground truth."""
+def confirm_person_tag(
+    conn: sqlite3.Connection,
+    photo_id: int,
+    person_id: int,
+    add_seed: bool = False,
+) -> None:
+    """Promote a tag to user-verified ground truth, optionally marking it
+    as a profile seed."""
     conn.execute(
         "UPDATE person_tags SET confidence = 1.0, origin = 'user', present = 1, "
+        "seed = MAX(seed, ?), "
         "updated_at = ? WHERE photo_id = ? AND person_id = ?",
-        (now_utc(), photo_id, person_id),
+        (int(add_seed), now_utc(), photo_id, person_id),
     )
     conn.commit()
+
+
+def person_tag_row(
+    conn: sqlite3.Connection, photo_id: int, person_id: int
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM person_tags WHERE photo_id = ? AND person_id = ?",
+        (photo_id, person_id),
+    ).fetchone()
 
 
 def untag_person(conn: sqlite3.Connection, photo_id: int, person_id: int) -> None:
@@ -1053,7 +1152,9 @@ def people_list(
              AND t.origin = 'model' AND t.confidence >= ?) AS strong,
             (SELECT COUNT(*) FROM person_tags t JOIN photos p ON p.id = t.photo_id
              WHERE t.person_id = pe.id AND t.present = 1 AND p.deleted_at IS NULL
-             AND t.origin = 'model' AND t.confidence < ?) AS uncertain
+             AND t.origin = 'model' AND t.confidence < ?) AS uncertain,
+            (SELECT COUNT(*) FROM person_tags t WHERE t.person_id = pe.id
+             AND t.seed = 1) AS seeds
         FROM people pe
         ORDER BY pe.name COLLATE NOCASE
         """,
@@ -1091,12 +1192,12 @@ def people_for_photo(conn: sqlite3.Connection, photo_id: int) -> list[sqlite3.Ro
 def person_seed_photo_ids(
     conn: sqlite3.Connection, person_id: int, limit: int = 3
 ) -> list[int]:
-    """Most recent seed photos for a person (anchors for the description)."""
+    """Most recent seed anchors for a person (input for the description)."""
     return [
         r["photo_id"]
         for r in conn.execute(
-            "SELECT photo_id FROM person_tags WHERE person_id = ? AND origin = 'seed' "
-            "ORDER BY created_at DESC, photo_id DESC LIMIT ?",
+            "SELECT photo_id FROM person_tags WHERE person_id = ? AND seed = 1 "
+            "ORDER BY COALESCE(updated_at, created_at) DESC, photo_id DESC LIMIT ?",
             (person_id, limit),
         )
     ]

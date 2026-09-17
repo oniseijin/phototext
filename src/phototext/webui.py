@@ -15,6 +15,7 @@ import secrets
 import shutil
 import sqlite3
 import subprocess
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlsplit
@@ -24,7 +25,7 @@ from . import db
 from . import people as people_mod
 from .config import Config, ensure_noindex
 from .imaging import ImageReadError, crop_jpeg, prepare_image
-from .memes import find_clusters
+from .memes import DUPLICATE_HAMMING_DEFAULT, find_clusters
 
 PAGE_SIZE = 48
 THUMB_EDGE = 480
@@ -169,7 +170,10 @@ def _header(conn: sqlite3.Connection, q: str = "") -> str:
 
 
 def _status_tabs(
-    status: str, memes_active: bool = False, people_active: bool = False
+    status: str,
+    memes_active: bool = False,
+    people_active: bool = False,
+    duplicates_active: bool = False,
 ) -> str:
     parts = []
     for key, label in (
@@ -183,6 +187,8 @@ def _status_tabs(
         parts.append(f"<a{cls} href='/?status={key}'>{label}</a>")
     memes_cls = " class='on'" if memes_active else ""
     parts.append(f"<a{memes_cls} href='/memes'>Memes</a>")
+    dup_cls = " class='on'" if duplicates_active else ""
+    parts.append(f"<a{dup_cls} href='/duplicates'>Duplicates</a>")
     people_cls = " class='on'" if people_active else ""
     parts.append(f"<a{people_cls} href='/people'>People</a>")
     parts.append("<a href='/trash'>Trash</a>")
@@ -256,6 +262,30 @@ def _pager(base: str, page: int, total: int) -> str:
     return f"<div class='pager'>{''.join(parts)}</div>"
 
 
+def _parse_date_params(params: dict) -> tuple[str | None, str | None, str | None]:
+    """(date_from, date_to, year) from query params, ignoring invalid values.
+
+    date_to is widened to the end of its day so same-day photos match.
+    """
+    year = (params.get("year", [""])[0] or "").strip() or None
+    if year is not None and not (year.isdigit() and len(year) == 4):
+        year = None
+    date_from = (params.get("date-from", [""])[0] or "").strip() or None
+    if date_from is not None:
+        try:
+            datetime.strptime(date_from, "%Y-%m-%d")
+        except ValueError:
+            date_from = None
+    date_to = (params.get("date-to", [""])[0] or "").strip() or None
+    if date_to is not None:
+        try:
+            datetime.strptime(date_to, "%Y-%m-%d")
+            date_to += "T23:59:59"
+        except ValueError:
+            date_to = None
+    return date_from, date_to, year
+
+
 def render_list(conn: sqlite3.Connection, params: dict, ctx: dict | None = None) -> bytes:
     q = (params.get("q", [""])[0] or "").strip()
     try:
@@ -263,13 +293,17 @@ def render_list(conn: sqlite3.Connection, params: dict, ctx: dict | None = None)
     except ValueError:
         page = 1
     offset = (page - 1) * PAGE_SIZE
+    date_from, date_to, year = _parse_date_params(params)
     cards = []
     if q:
         try:
             rows, _effective = db.search_photos(
-                conn, q, limit=PAGE_SIZE, offset=offset, highlight=("", "")
+                conn, q, limit=PAGE_SIZE, offset=offset, highlight=("", ""),
+                date_from=date_from, date_to=date_to, year=year,
             )
-            total = db.search_count(conn, q)
+            total = db.search_count(
+                conn, q, date_from=date_from, date_to=date_to, year=year
+            )
         except sqlite3.OperationalError:
             body = (
                 _header(conn)
@@ -279,11 +313,38 @@ def render_list(conn: sqlite3.Connection, params: dict, ctx: dict | None = None)
             )
             return _page("phototext", body)
         note = f"{total} match(es) for '{q}'"
+        if year:
+            note += f" taken in {year}"
+        if date_from or date_to:
+            span = date_from[:10] if date_from else "..."
+            if date_to:
+                span += f" to {date_to[:10]}"
+            note += f" taken {span}"
         if total > len(rows) + offset:
             note += f" — showing {offset + 1}&ndash;{offset + len(rows)}"
         cards = [_card(r, r["text_snip"] or "") for r in rows]
-        base = "/?" + urlencode({"q": q}) + "&"
-        body = _header(conn, q) + f"<main><p class='note'>{esc(note)}</p>"
+        base_parts = {"q": q}
+        if year:
+            base_parts["year"] = year
+        if date_from:
+            base_parts["date-from"] = date_from[:10]
+        if date_to:
+            base_parts["date-to"] = date_to[:10]
+        base = "/?" + urlencode(base_parts) + "&"
+        year_nav = ""
+        years = db.date_taken_histogram(conn)
+        if years:
+            q_enc = urlencode({"q": q})
+            chips = []
+            for y in years:
+                cls = " class='on'" if year == y["year"] else ""
+                chips.append(
+                    f"<a{cls} href='/?{q_enc}&year={y['year']}'>{y['year']} ({y['n']})</a>"
+                )
+            if year:
+                chips.append(f"<a href='/?{q_enc}'>all years</a>")
+            year_nav = f"<nav>{''.join(chips)}</nav>"
+        body = _header(conn, q) + year_nav + f"<main><p class='note'>{esc(note)}</p>"
     else:
         status = params.get("status", ["all"])[0] or "all"
         if status not in ("all", "done", "queued", "error", "processing"):
@@ -298,6 +359,7 @@ def render_list(conn: sqlite3.Connection, params: dict, ctx: dict | None = None)
         rows, total = db.page_photos(
             conn, status=status, has_text=has_text, category=category,
             limit=PAGE_SIZE, offset=offset, show_hidden=show_hidden, person=person,
+            date_from=date_from, date_to=date_to, year=year,
         )
         cards = [_card(r, _snippet(r["text"] or "")) for r in rows]
 
@@ -308,6 +370,13 @@ def render_list(conn: sqlite3.Connection, params: dict, ctx: dict | None = None)
                 "text": text_filter,
                 "person": person,
                 "hidden": "1" if show_hidden else "",
+                "year": year or "",
+                "date-from": (params.get("date-from", [""])[0] or "").strip()
+                if (date_from is not None)
+                else "",
+                "date-to": (params.get("date-to", [""])[0] or "").strip()
+                if (date_to is not None)
+                else "",
             }
             query = urlencode({k: v for k, v in parts.items() if v and v != "all"})
             return f"/?{query}&" if query else "/?"
@@ -351,11 +420,32 @@ def render_list(conn: sqlite3.Connection, params: dict, ctx: dict | None = None)
             cls = " class='on'" if text_filter == value else ""
             text_chips.append(f"<a{cls} href='/?status={status}&text={value}'>{label}</a>")
         body += f"<nav>{''.join(text_chips)}</nav>"
+        years = db.date_taken_histogram(conn)
+        if years:
+            chips = []
+            for y in years:
+                cls = " class='on'" if year == y["year"] else ""
+                chips.append(
+                    f"<a{cls} href='/?status={status}&text={text_filter}"
+                    f"&year={y['year']}'>{y['year']} ({y['n']})</a>"
+                )
+            if year:
+                chips.append(
+                    f"<a href='/?status={status}&text={text_filter}'>all years</a>"
+                )
+            body += f"<nav>{''.join(chips)}</nav>"
         body += f"<main><p class='note'>{total} photo(s) with status '{status}'"
         if category:
             body += f" and category '{esc(category)}'"
         if person:
             body += f" tagged '{esc(person)}'"
+        if year:
+            body += f" taken in {esc(year)}"
+        if date_from or date_to:
+            span = date_from[:10] if date_from else "..."
+            if date_to:
+                span += f" to {date_to[:10]}"
+            body += f" taken {esc(span)}"
         if text_filter != "all":
             body += f" ({'with' if text_filter == 'yes' else 'no'} text)"
         body += "</p>"
@@ -372,6 +462,7 @@ def render_detail(conn: sqlite3.Connection, photo_id: int, ctx: dict | None = No
     locs = db.photo_locations(conn, photo_id)
     rows_meta = [
         ("status", row["status"]),
+        ("taken", row["date_taken"][:16].replace("T", " ") if row["date_taken"] else "?"),
         ("kind", row["text_kind"] or "?"),
         ("category", row["category"] or "?"),
         ("language", row["language"] or "?"),
@@ -545,6 +636,57 @@ def render_memes(conn: sqlite3.Connection, ctx: dict | None = None) -> bytes:
     return _page("memes - phototext", body)
 
 
+def render_duplicates(conn: sqlite3.Connection, ctx: dict | None = None) -> bytes:
+    try:
+        clusters = find_clusters(
+            conn,
+            max_distance=DUPLICATE_HAMMING_DEFAULT,
+            exclude_derivatives=True,
+        )
+    except sqlite3.OperationalError:
+        clusters = []
+    body = _header(conn) + _status_tabs("", duplicates_active=True)
+    if not clusters:
+        note = "no duplicate groups found"
+        try:
+            unhashed = conn.execute(
+                "SELECT COUNT(*) AS n FROM photos WHERE phash IS NULL"
+            ).fetchone()["n"]
+        except sqlite3.OperationalError:
+            unhashed = 0
+        if unhashed:
+            note += (
+                f" — {unhashed} photo(s) have no perceptual hash yet; "
+                "run `phototext duplicates` once to compute them"
+            )
+        body += f"<main><p class='note'>{esc(note)}</p></main>"
+        return _page("duplicates - phototext", body)
+    body += (
+        "<main><p class='note'>" + esc(str(len(clusters))) + " duplicate group(s) "
+        "— resized/re-encoded copies of the same image (perceptual hash within "
+        f"{DUPLICATE_HAMMING_DEFAULT} bits). iCloud preview proxies are excluded. "
+        "The largest file is highlighted; cleaning up is yours to do — files are "
+        "never touched.</p>"
+    )
+    for index, group in enumerate(clusters, 1):
+        biggest = max(group, key=lambda r: r["byte_size"] or 0)
+        cards = ""
+        for r in group[:12]:
+            mark = " <span class='badge ok'>keep (largest)</span>" if r["id"] == biggest["id"] else ""
+            taken = f" <span class='badge'>{esc(r['date_taken'][:10])}</span>" if r["date_taken"] else ""
+            cards += (
+                f"<a class='card' href='/photo/{r['id']}'>"
+                f"<img src='/thumb/{r['id']}' alt='' loading='lazy'>"
+                f"<div class='body'>{esc(str(r['byte_size'] or 0))} bytes{mark}{taken}</div></a>"
+            )
+        body += (
+            f"<p class='muted'>group {index}: {len(group)} photo(s)</p>"
+            f"<div class='cards'>{cards}</div>"
+        )
+    body += "</main>"
+    return _page("duplicates - phototext", body)
+
+
 def render_trash(conn: sqlite3.Connection, ctx: dict | None = None) -> bytes:
     rows = db.trash_list(conn)
     body = _header(conn) + _status_tabs("trash")
@@ -609,13 +751,19 @@ def thumb_bytes(conn: sqlite3.Connection, photo_id: int, thumbs_dir: Path) -> by
 
 
 def _person_action(
-    action: str, photo_id: int, person_id: int, label: str, token: str
+    action: str,
+    photo_id: int,
+    person_id: int,
+    label: str,
+    token: str,
+    extra_fields: str = "",
 ) -> str:
     return (
         f"<form class='act' method='post' action='/person/{action}'>"
         f"<input type='hidden' name='photo_id' value='{photo_id}'>"
         f"<input type='hidden' name='person_id' value='{person_id}'>"
         f"<input type='hidden' name='token' value='{esc(token)}'>"
+        f"{extra_fields}"
         f"<button class='mini'>{esc(label)}</button></form>"
     )
 
@@ -654,6 +802,10 @@ def _person_grid(
             badges += (
                 "<div class='actions'>"
                 + _person_action("confirm", row["id"], person_id, "confirm", ctx["token"])
+                + _person_action(
+                    "confirm", row["id"], person_id, "confirm+seed", ctx["token"],
+                    extra_fields="<input type='hidden' name='seed' value='1'>",
+                )
                 + _person_action("remove", row["id"], person_id, "remove", ctx["token"])
                 + "</div>"
             )
@@ -744,6 +896,7 @@ def render_people(conn: sqlite3.Connection, ctx: dict | None = None) -> bytes:
             f"<strong>{esc(person['name'])}</strong> "
             f"<span class='badge'>{person['tags']} tag(s)</span> "
             f"<span class='badge ok'>{person['confirmed']} confirmed</span> "
+            f"<span class='badge'>{person['seeds']} seed(s)</span> "
             f"<span class='badge'>{person['strong']} confident</span> "
             f"<span class='badge review'>{person['uncertain']} to review</span>"
             f"<div class='muted'>{_snippet(person['description'] or '', 160) or 'no recognition profile yet'}</div>"
@@ -761,12 +914,21 @@ def render_person(
         return None
     threshold = float((ctx or {}).get("min_confidence") or 0.6)
     rows = db.person_tag_rows(conn, person_id)
+    seed_count = conn.execute(
+        "SELECT COUNT(*) AS n FROM person_tags WHERE person_id = ? AND seed = 1",
+        (person_id,),
+    ).fetchone()["n"]
     review = [r for r in rows if r["origin"] == "model" and r["confidence"] < threshold]
     settled = [r for r in rows if r not in review]
     body = _header(conn) + _status_tabs("", people_active=True)
     writable = bool(ctx and ctx.get("writable") and ctx.get("token"))
     body += "<main><p><a class='back' href='/people'>&#8592; all people</a></p>"
     body += f"<h2 style='margin:6px 0'>{esc(person['name'])}</h2>"
+    body += (
+        f"<p class='note'>{seed_count} seed anchor(s) for the recognition profile — "
+        "grow it with <code>confirm+seed</code> on tagged photos, then refresh with "
+        f"<code>phototext people describe {esc(person['name'])}</code></p>"
+    )
     if person["description"]:
         body += f"<p class='muted'>recognition profile</p><pre>{esc(person['description'])}</pre>"
     else:
@@ -974,7 +1136,7 @@ class _Handler(BaseHTTPRequestHandler):
                 )
                 db.tag_person(
                     conn, photo_id, person["id"], 1.0, "seed",
-                    field("box") if box else None,
+                    field("box") if box else None, seed=True,
                 )
                 if self.server.phototext_person_cfg is not None:
                     try:
@@ -987,7 +1149,17 @@ class _Handler(BaseHTTPRequestHandler):
                 return f"/photo/{photo_id}"
             person_id = int_field("person_id")
             if action == "confirm":
-                db.confirm_person_tag(conn, photo_id, person_id)
+                add_seed = field("seed") == "1"
+                db.confirm_person_tag(conn, photo_id, person_id, add_seed=add_seed)
+                if add_seed:
+                    row = db.person_tag_row(conn, photo_id, person_id)
+                    source = db.find_first_existing_location(conn, photo_id)
+                    if row is not None and source is not None:
+                        box = people_mod.parse_box(row["box"]) if row["box"] else None
+                        people_mod.save_seed_crop(
+                            self.server.phototext_db, person_id, photo_id,
+                            Path(source), box,
+                        )
             else:
                 db.untag_person(conn, photo_id, person_id)
             return f"/photo/{photo_id}"
@@ -1038,6 +1210,13 @@ class _Handler(BaseHTTPRequestHandler):
             conn = _open_ro(self.server.phototext_db)
             try:
                 self._send_html(render_memes(conn, ctx))
+            finally:
+                conn.close()
+            return
+        if route == "/duplicates":
+            conn = _open_ro(self.server.phototext_db)
+            try:
+                self._send_html(render_duplicates(conn, ctx))
             finally:
                 conn.close()
             return

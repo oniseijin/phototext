@@ -93,12 +93,14 @@ uv venv .venv && uv pip install -e .
 | `phototext trash` | List trashed photos. |
 | `phototext unscan <source>` | Forget a registered source (by id or path) and photos only seen there. |
 | `phototext memes` | Find near-identical photos (perceptual hash clusters), likely memes. |
-| `phototext people name ID NAME` | Seed a person from a photo (`--box x,y,w,h` to crop the face); the model builds a recognition profile. |
-| `phototext people run` | Tag people across the library — one model call per photo checks every named person. |
+| `phototext duplicates` | Find near-duplicate photos (resized/re-encoded copies), largest file highlighted; `--json`, `--threshold`. |
+| `phototext backfill-dates` | Fill capture dates for photos scanned before they were recorded (`--from-mtime` for files without EXIF). |
+| `phototext people name ID NAME` | Seed a person from a photo (`--box x,y,w,h` to crop the face; without it a lone detected face is auto-adopted); the model builds a recognition profile. |
+| `phototext people run` | Tag people across the library — one model call per photo checks every named person (faceless photos skip the call). |
 | `phototext people list / photos NAME` | People with tag counts; a person's photos with confidence. |
-| `phototext people confirm / remove ID NAME` | Mark a tag correct (ground truth) or remove it. |
+| `phototext people confirm / remove ID NAME` | Mark a tag correct (ground truth) or remove it (`--add-seed` also grows the profile). |
 | `phototext people rename / reset / delete NAME` | Rename; drop model tags (keeps confirmed); delete (`--yes`). |
-| `phototext search --person NAME QUERY` | Full-text search within a person's tagged photos. |
+| `phototext search --person NAME QUERY` | Full-text search within a person's tagged photos (`--year`, `--date-from/--date-to` narrow by capture date). |
 | `phototext migrate` | Apply pending catalog schema migrations (backs up the catalog first). |
 | `phototext serve` | Local web UI: browse photos + recovered text, search box (`--host`, `--port`, `--writable` for hide/delete actions). |
 | `phototext doctor` | Diagnose config, database, Ollama, model, vision support (prints the version first). |
@@ -149,7 +151,7 @@ else is left untouched:
 ```bash
 phototext scan --favorites                       # only favorites/flagged
 phototext scan --album "Trip 2014"               # one album
-phototext scan --date-from 2013 --date-to 2013   # by file date
+phototext scan --date-from 2013 --date-to 2013   # by capture date (EXIF, else file date)
 phototext scan --limit 200                       # first 200 new photos
 phototext scan --ids-file ids.txt                # listed paths or UUIDs
 phototext run --album "Trip 2014"                # scan + process just the slice
@@ -158,7 +160,8 @@ phototext run --album "Trip 2014"                # scan + process just the slice
 Album, favorites, and UUID lookups read the library's own database (Photos
 libraries via `osxphotos`, iPhoto via its `Database/apdb`, schema detected at
 runtime with clear errors if it cannot be parsed). Date and path filters work
-on plain folders too. Photos already queued from earlier scans are still
+on plain folders too; date slices prefer the EXIF capture date and fall back
+to the file date. Photos already queued from earlier scans are still
 processed by `run`.
 
 ## Web UI
@@ -185,6 +188,12 @@ spot) — plus confirm/remove buttons on every person chip and rename/reset/
 delete on the person page. All writes stay behind the session token and
 Origin check.
 
+The list page doubles as a **timeline**: year chips (from EXIF capture
+dates) narrow the grid, and the search bar accepts date narrowing via the
+chips too. A **Duplicates** tab groups resized/re-encoded copies of the
+same photo (iCloud preview proxies excluded) with the largest file marked
+"keep".
+
 ## Long runs and resume
 
 - Ctrl+C (or SIGTERM) stops gracefully after the current photo; a second Ctrl+C
@@ -209,14 +218,26 @@ Origin check.
 - **Memes**: `phototext memes` clusters near-identical photos by perceptual
   hash and flags groups that carry text — the classic re-shared image. The
   web UI has a Memes tab with the same clusters.
+- **Duplicates**: `phototext duplicates` clusters photos whose perceptual
+  hashes are nearly identical (tight threshold) — resized or re-encoded
+  copies of the same image — with the largest file highlighted as the one
+  to keep. Read-only: cleaning up the files stays yours to do.
+- **Capture dates**: photos record their EXIF `DateTimeOriginal` at scan
+  time (`phototext backfill-dates` catches up older catalogs); the web UI
+  browses by year and `search --year/--date-from/--date-to` narrows
+  results.
 - **People**: name a person once and tag them everywhere. On a photo in the
   web UI (writable mode) drag a box around a face and type a name — or
   `phototext people name <photo-id> "Ryan" --box x,y,w,h`. The model writes a
   recognition profile from the seed crop(s), then `phototext people run`
   checks every photo in one call per photo (all people at once, using the
-  fast `person_model`). Tags carry confidence; below `person_min_confidence`
-  they land in a review queue. Confirm/remove in the web UI or via
-  `people confirm/remove`; `people reset` drops model tags but keeps your
+  fast `person_model`). Face detection (macOS Vision) skips photos without
+  faces entirely and matches on close-up face crops otherwise;
+  `people name` without `--box` auto-adopts a lone detected face. Tags carry
+  confidence; below `person_min_confidence` they land in a review queue.
+  Confirm/remove in the web UI or via `people confirm/remove` — `--add-seed`
+  also feeds the confirmed crop back into the recognition profile, refreshed
+  by `people describe`; `people reset` drops model tags but keeps your
   confirmations; `search --person Ryan "invoice"` searches within a person.
   Seed face crops are stored under `<state>/people/`.
 - `--stop-after 2h` bounds a run, e.g. overnight or "while I'm at lunch".
@@ -270,6 +291,7 @@ override it.
 | `prefilter_model` | `gemma3:4b` | The gate model for two-tier mode. |
 | `person_model` | *(prefilter)* | Model for person matching + recognition profiles. |
 | `person_min_confidence` | `0.6` | Model tags below this confidence wait in the review queue. |
+| `face_detection` | `true` | macOS Vision face detection for the people pass (skip faceless photos, match on face crops). |
 | `prefilter_max_edge` | `512` | Image size for gate calls (smaller is faster). |
 | `max_image_pixels` | `357913941` | Hard decode budget per image (~357 MP). Suspected decompression bombs are recorded as errors — deliberately without the `sips` fallback. |
 | `db_path` | `~/.phototext/catalog.db` | SQLite catalog location. |

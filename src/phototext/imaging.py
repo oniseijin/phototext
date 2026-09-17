@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+from datetime import datetime
 from pathlib import Path
 
 from PIL import Image, ImageOps
@@ -17,6 +18,40 @@ register_heif_opener()
 
 class ImageReadError(Exception):
     pass
+
+
+EXIF_EXIFIFD = 0x8769  # the sub-IFD holding DateTimeOriginal (36867)
+EXIF_DATE_TIME_ORIGINAL = 36867
+EXIF_DATE_TIME = 306
+
+
+def read_date_taken(path: Path) -> str | None:
+    """Best EXIF capture date as ISO 'YYYY-MM-DDTHH:MM:SS', or None.
+
+    Reads only headers (Image.open is lazy, getexif parses the metadata
+    segment, no pixel decode). Prefers DateTimeOriginal over the file
+    modification DateTime; tolerates trailing sub-seconds/offsets.
+    """
+    try:
+        with Image.open(path) as im:
+            exif = im.getexif()
+            raw = exif.get(EXIF_DATE_TIME)
+            sub = exif.get_ifd(EXIF_EXIFIFD)
+            if sub and sub.get(EXIF_DATE_TIME_ORIGINAL):
+                raw = sub.get(EXIF_DATE_TIME_ORIGINAL)
+    except Exception:
+        return None
+    if not raw:
+        return None
+    text = str(raw).strip()
+    # "2023:05:01 10:00:00[.123][ +09:00]" -> trim the extras before parsing
+    head = text.split("+")[0].split(".")[0].strip()
+    for sep in ("%Y:%m:%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(head, sep).isoformat()
+        except ValueError:
+            continue
+    return None
 
 
 def sha256_file(path: Path, chunk_size: int = 1 << 20) -> str:

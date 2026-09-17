@@ -8,6 +8,7 @@ import sqlite3
 import sys
 import time
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
@@ -15,7 +16,8 @@ import typer
 
 from . import config, db, people as people_mod, scanner, webui, worker
 from .config import load_config
-from .imaging import test_image_b64
+from .faces import detect_faces, vision_problem
+from .imaging import read_date_taken, test_image_b64
 from .library_meta import norm_path
 from .memes import ensure_hashes, find_clusters
 from .ollama_client import OllamaClient
@@ -68,6 +70,8 @@ TYPICAL WORKFLOWS
   Review uncertain tags: phototext people photos Ryan    (or: serve --writable)
   Confirm / remove:      phototext people confirm 512 Ryan
                           phototext people remove 512 Ryan
+  Grow a profile:        phototext people confirm 512 Ryan --add-seed
+                         phototext people describe Ryan  (rebuild from seeds)
   Start over for one:    phototext people reset Ryan     (keeps confirmed tags)
   Search by person:      phototext search --person Ryan "invoice"
   See categories:        phototext categories
@@ -548,6 +552,15 @@ def search(
     person: Optional[str] = typer.Option(
         None, "--person", help="Only match photos tagged with this person (see `phototext people list`)."
     ),
+    date_from: Optional[str] = typer.Option(
+        None, "--date-from", help="Only photos taken on/after this (YYYY-MM-DD, YYYY-MM, or YYYY)."
+    ),
+    date_to: Optional[str] = typer.Option(
+        None, "--date-to", help="Only photos taken on/before this (YYYY-MM-DD, YYYY-MM, or YYYY)."
+    ),
+    year: Optional[str] = typer.Option(
+        None, "--year", help="Only photos taken in this year (e.g. 2023)."
+    ),
     include_hidden: bool = typer.Option(
         False, "--hidden", help="Include hidden photos in matches."
     ),
@@ -557,12 +570,28 @@ def search(
     conn = db.connect(cfg.db_path)
     joined = " ".join(query)
     highlight = ("\x1b[1m", "\x1b[0m") if sys.stdout.isatty() else ("", "")
+    taken_from = taken_to = None
+    try:
+        if date_from is not None:
+            taken_from = scanner.parse_slice_date(date_from, end=False).isoformat()
+        if date_to is not None:
+            taken_to = scanner.parse_slice_date(date_to, end=True).isoformat()
+    except ValueError as e:
+        typer.echo(f"error: {e}", err=True)
+        raise typer.Exit(2)
+    if year is not None and not (year.isdigit() and len(year) == 4):
+        typer.echo("error: --year must be a 4-digit year, e.g. 2023", err=True)
+        raise typer.Exit(2)
     try:
         rows, effective = db.search_photos(
             conn, joined, limit=limit, highlight=highlight, category=category,
             include_hidden=include_hidden, person=person,
+            date_from=taken_from, date_to=taken_to, year=year,
         )
-        total = db.search_count(conn, joined, include_hidden=include_hidden, person=person)
+        total = db.search_count(
+            conn, joined, include_hidden=include_hidden, person=person,
+            date_from=taken_from, date_to=taken_to, year=year,
+        )
     except sqlite3.OperationalError as e:
         typer.echo(f"error: search failed: {e}", err=True)
         raise typer.Exit(2)
@@ -586,6 +615,63 @@ def search(
         context = (row["context_snip"] or "").strip()
         if context:
             typer.echo(f"    context: {context}")
+
+
+@app.command("backfill-dates")
+def backfill_dates(
+    from_mtime: bool = typer.Option(
+        False,
+        "--from-mtime",
+        help="Also fill photos without EXIF dates from the file modification time.",
+    ),
+) -> None:
+    """Fill date_taken for photos scanned before capture dates were recorded.
+
+    New scans record the EXIF date automatically; this command catches up
+    existing rows. Photos with no readable file are left for a later retry.
+    """
+    cfg = _cfg()
+    conn = db.connect(cfg.db_path)
+    ids = db.photos_missing_date_taken(conn)
+    if not ids:
+        typer.echo("all photos already have a date taken")
+        return
+    typer.echo(f"{len(ids)} photo(s) without a date taken")
+    from_exif = from_file = undated = 0
+    processed = 0
+    for photo_id in ids:
+        source = db.find_first_existing_location(conn, photo_id)
+        value = None
+        via = None
+        if source:
+            value = read_date_taken(Path(source))
+            if value is not None:
+                via = "exif"
+            elif from_mtime:
+                try:
+                    value = (
+                        datetime.fromtimestamp(Path(source).stat().st_mtime)
+                        .isoformat(timespec="seconds")
+                    )
+                    via = "mtime"
+                except OSError:
+                    value = None
+        if value is None or not db.set_date_taken(conn, photo_id, value):
+            undated += 1
+        elif via == "exif":
+            from_exif += 1
+        else:
+            from_file += 1
+        processed += 1
+        if processed % 500 == 0:
+            conn.commit()
+            typer.echo(f"  ... {processed} processed")
+    conn.commit()
+    summary = f"dates recorded: {from_exif} from EXIF"
+    if from_mtime:
+        summary += f", {from_file} from file mtime"
+    summary += f"; {undated} photo(s) still without a date"
+    typer.echo(summary)
 
 
 _EXPORT_FIELDS = [
@@ -935,6 +1021,74 @@ def memes(
             typer.echo(f"    ... and {len(group) - 5} more")
 
 
+@app.command("duplicates")
+def duplicates(
+    threshold: int = typer.Option(
+        4, "--threshold",
+        help="Max hamming distance to treat two photos as duplicates "
+        "(0 = pixel-identical after hashing; keep this small).",
+    ),
+    min_size: int = typer.Option(
+        2, "--min-size", help="Smallest group to report."
+    ),
+    as_json: bool = typer.Option(
+        False, "--json", help="Print groups as JSON instead of text."
+    ),
+) -> None:
+    """Find near-duplicate photos (resaves, resized copies, re-encodes).
+
+    Groups photos by perceptual hash with a tight threshold; iCloud
+    preview proxies are excluded so originals never pair with their own
+    previews. Read-only: files are never touched — hide/delete in the
+    catalog if you want to clean up results.
+    """
+    cfg = _cfg()
+    conn = db.connect(cfg.db_path)
+    computed = ensure_hashes(conn)
+    if computed:
+        typer.echo(f"computed perceptual hashes for {computed} photo(s)")
+    groups = find_clusters(
+        conn, max_distance=threshold, min_size=min_size, exclude_derivatives=True
+    )
+    if not groups:
+        typer.echo("no duplicate groups found")
+        return
+    if as_json:
+        typer.echo(
+            json.dumps(
+                [
+                    [
+                        {
+                            "id": row["id"],
+                            "path": row["path"],
+                            "byte_size": row["byte_size"],
+                            "date_taken": row["date_taken"],
+                        }
+                        for row in group
+                    ]
+                    for group in groups
+                ],
+                indent=2,
+            )
+        )
+        return
+    typer.echo(f"{len(groups)} duplicate group(s):")
+    for group in groups:
+        biggest = max(group, key=lambda r: r["byte_size"] or 0)
+        typer.echo(
+            f"  group: {len(group)} photo(s) - keep [{biggest['id']}] "
+            f"({biggest['byte_size'] or 0} bytes, largest file)"
+        )
+        for row in group[:10]:
+            name = (row["path"] or "").rsplit("/", 1)[-1] or "(no location)"
+            taken = f" taken {row['date_taken'][:10]}" if row["date_taken"] else ""
+            typer.echo(
+                f"    [{row['id']}] {name} ({row['byte_size'] or 0} bytes){taken}"
+            )
+        if len(group) > 10:
+            typer.echo(f"    ... and {len(group) - 10} more")
+
+
 def _load_reprocess_ids(path: Path) -> tuple[list[int], set[str]]:
     ids: list[int] = []
     paths: set[str] = set()
@@ -1051,6 +1205,26 @@ def _person_by_name(conn, name: str):
     return person
 
 
+def _maybe_auto_face_box(cfg, photo_id: int, source: str, box, box_text: str | None):
+    """Without an explicit --box, auto-adopt a lone detected face (Vision)."""
+    if box is not None or not cfg.face_detection:
+        return box_text
+    faces = detect_faces(Path(source), photo_id)
+    if not faces:
+        return box_text  # no faces found: seed on the whole photo as before
+    if len(faces) > 1:
+        typer.echo(
+            f"error: found {len(faces)} faces on photo {photo_id}; pass --box "
+            "x,y,w,h to pick the right one",
+            err=True,
+        )
+        raise typer.Exit(2)
+    x, y, w, h = faces[0]
+    box_text = f"{x},{y},{w},{h}"
+    typer.echo(f"auto-detected a single face at {box_text}")
+    return box_text
+
+
 def _name_seed(cfg, photo_id: int, name: str, box_text: str | None) -> None:
     conn = db.connect(cfg.db_path)
     photo = db.get_photo(conn, photo_id)
@@ -1075,11 +1249,16 @@ def _name_seed(cfg, photo_id: int, name: str, box_text: str | None) -> None:
             err=True,
         )
         raise typer.Exit(2)
+    box_text = _maybe_auto_face_box(cfg, photo_id, source, box, box_text)
+    box = people_mod.parse_box(box_text)
     person = db.upsert_person(conn, name)
     crop = people_mod.save_seed_crop(cfg.db_path, person["id"], photo_id, Path(source), box)
     if crop is None:
         typer.echo("warning: could not save a face crop (unreadable image)", err=True)
-    db.tag_person(conn, photo_id, person["id"], 1.0, "seed", box_text if box else None)
+    db.tag_person(
+        conn, photo_id, person["id"], 1.0, "seed",
+        box_text if box else None, seed=True,
+    )
     typer.echo(f"person '{person['name']}' seeded from photo {photo_id}")
     try:
         description = people_mod.build_description(
@@ -1211,13 +1390,41 @@ def people_photos(
 def people_confirm(
     photo_id: int = typer.Argument(..., help="Photo id."),
     name: str = typer.Argument(..., help="Person name."),
+    add_seed: bool = typer.Option(
+        False,
+        "--add-seed",
+        help="Also add this photo's crop as a seed anchor for the person's "
+        "recognition profile (refresh with `people describe`).",
+    ),
 ) -> None:
     """Mark a tag as correct (ground truth; model runs will not change it)."""
     cfg = _cfg()
     conn = db.connect(cfg.db_path)
     person = _person_by_name(conn, name)
-    db.confirm_person_tag(conn, photo_id, person["id"])
+    if db.person_tag_row(conn, photo_id, person["id"]) is None:
+        db.tag_person(conn, photo_id, person["id"], 1.0, "user")
+    db.confirm_person_tag(conn, photo_id, person["id"], add_seed=add_seed)
     typer.echo(f"confirmed '{person['name']}' on photo {photo_id}")
+    if add_seed:
+        row = db.person_tag_row(conn, photo_id, person["id"])
+        source = db.find_first_existing_location(conn, photo_id)
+        if row is None or source is None:
+            typer.echo(
+                "warning: could not save a seed crop (no readable file)",
+                err=True,
+            )
+        else:
+            box = people_mod.parse_box(row["box"]) if row["box"] else None
+            crop = people_mod.save_seed_crop(
+                cfg.db_path, person["id"], photo_id, Path(source), box
+            )
+            if crop is None:
+                typer.echo("warning: could not save a face crop (unreadable image)", err=True)
+            else:
+                typer.echo(
+                    f"seed anchor added; run `phototext people describe "
+                    f"{person['name']}` to refresh the profile"
+                )
 
 
 @people_app.command("remove")
@@ -1373,6 +1580,12 @@ def doctor() -> None:
     except Exception as e:
         report(False, "vision extraction works", f"{e}; is '{cfg.model}' a vision model?")
     report(shutil.which("sips") is not None, "sips fallback available")
+    face_problem = vision_problem()
+    if cfg.face_detection:
+        report(face_problem is None, "face detection (macOS Vision)",
+                face_problem or "enabled")
+    else:
+        report(True, "face detection (macOS Vision)", "disabled in config")
     if bad:
         raise typer.Exit(1)
 

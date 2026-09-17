@@ -6,6 +6,36 @@ semantic versioning.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-17
+
+### Added
+
+- Photo capture dates (migration 10): new photos record their EXIF
+  `DateTimeOriginal` at scan time; `phototext backfill-dates [--from-mtime]`
+  catches up existing rows. Date slices (`--date-from/--date-to`) prefer the
+  EXIF date and fall back to the file date.
+- Timeline browsing: `phototext search --year/--date-from/--date-to`, web
+  year chips, date filters, and the taken date on photo pages.
+- Near-duplicate finder: `phototext duplicates [--threshold 4] [--json]`
+  clusters resized/re-encoded copies by perceptual hash (iCloud preview
+  proxies excluded) with a keep-the-largest-file hint, plus a web
+  Duplicates tab. Read-only — files are never touched.
+- People feedback loop: `phototext people confirm <photo> <name> --add-seed`
+  (web: `confirm+seed`) grows a person's seed pool from verified tags; the
+  recognition profile rebuilds from those anchors with
+  `phototext people describe`. Person pages show seed counts.
+- Face detection via the macOS Vision framework (`pyobjc` is now a
+  dependency): `people run` skips the model call entirely for photos
+  without faces and matches on close-up face crops otherwise;
+  `phototext people name` without `--box` auto-adopts a lone detected
+  face (and refuses an ambiguous multi-face photo). `doctor` reports
+  Vision availability; `face_detection` in the config turns it off.
+
+### Changed
+
+- `phototext people confirm` now creates the tag when none exists instead
+  of silently doing nothing.
+
 ## [0.2.0] - 2026-09-17
 
 ### Added

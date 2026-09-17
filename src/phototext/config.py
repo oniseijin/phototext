@@ -72,6 +72,11 @@ idle_detection = true
     person_model = ""
     person_min_confidence = 0.6
 
+    # Face detection with the macOS Vision framework, used by the people
+    # matching pass: photos without faces skip the model call entirely and
+    # photos with faces are matched on close-up face crops.
+    face_detection = true
+
     # SQLite catalog location
     db_path = "~/.phototext/catalog.db"
 """
@@ -98,6 +103,7 @@ class Config:
     prefilter_max_edge: int = 512
     person_model: str = ""
     person_min_confidence: float = 0.6
+    face_detection: bool = True
     max_image_pixels: int = 357_913_941
     db_path: Path = DEFAULT_DB_PATH
 

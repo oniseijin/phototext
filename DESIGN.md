@@ -208,7 +208,7 @@ model, `num_ctx`.
   with `var/` data layout, bin wrappers, `--uninstall/--purge/--test`,
   and a `phototext-dev` wrapper for workspace code
 
-### M3 — UI and quality (in progress)
+### M3 — UI and quality (implemented, 0.2.0–0.3.0)
 
 - Local web UI (read-only): browse photos + recovered text, search box
   — **shipped**: `phototext serve` (stdlib http.server, read-only catalog
@@ -221,6 +221,19 @@ model, `num_ctx`.
   — **shipped** as the automatic fallback in `worker._extract_photo`: whole
   image -> anti-loop retry -> 4 overlapping tiles from original resolution,
   merged; `photos.tiled` flag (migration 3), surfaced in results/export/web UI
+- **People identification** — **shipped** (0.2.0): seed crops + recognition
+  profiles + a one-call-per-photo matching pass with a review queue
+  (migration 9), web picker + person pages.
+- **Capture dates** — **shipped** (0.3.0): EXIF `DateTimeOriginal` recorded at
+  scan (migration 10), `backfill-dates`, date-preferring slices, search/web
+  timeline filtering.
+- **Near-duplicate finder** — **shipped** (0.3.0): tight-threshold dhash
+  clustering reusing the meme machinery, derivative-excluded; CLI + web tab.
+- **People feedback loop** — **shipped** (0.3.0): `person_tags.seed` anchors,
+  `confirm --add-seed` / web `confirm+seed`, `people describe` rebuild.
+- **Face detection** — **shipped** (0.3.0): macOS Vision (pyobjc) prefilter
+  and face-crop matching in `people run`, auto-box on `people name`,
+  doctor check.
 
 ### Backlog
 
@@ -234,9 +247,8 @@ model, `num_ctx`.
 - Hard mode: targeted reprocess of a flagged subset (e.g. suspected
   handwriting, empty extractions) with thinking enabled — thinking is too slow
   as a default but might help on genuinely hard photos
-- Text-only mode: a cheap fast vision model gates the full pass ("any visible
-  text?"), so textless photos finish in seconds — only worth it for very
-  large libraries where context descriptions are not wanted
+- ~~Text-only mode~~ — **shipped** as the two-tier gate (`two_tier`, prefilter
+  short-circuits textless photos)
 - ~~Watch mode~~ — **shipped** (`--watch`, `--watch-interval`)
 - ~~Multi-process workers~~ — **shipped** (`--workers N` with claim leases,
   stale-lease recovery, parent-liveness guards; most useful with

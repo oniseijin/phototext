@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import json
 import os
+import random
 import re
 import signal
 import socket
@@ -476,6 +477,7 @@ def main() -> int:
             "ALTER TABLE photos DROP COLUMN hidden; "
             "ALTER TABLE photos DROP COLUMN deleted_at; "
             "ALTER TABLE photos DROP COLUMN derivative; "
+            "ALTER TABLE photos DROP COLUMN date_taken; "
             "DROP TABLE IF EXISTS photo_warnings; "
             "DROP TABLE IF EXISTS person_tags; "
             "DROP TABLE IF EXISTS people; "
@@ -485,12 +487,12 @@ def main() -> int:
         con.close()
         out = cli.run("migrate", "--dry-run")
         check(
-            "pending migration(s): v2, v3, v4, v5, v6, v7, v8, v9" in out,
+            "pending migration(s): v2, v3, v4, v5, v6, v7, v8, v9, v10" in out,
             "dry run reports pending migrations",
         )
         check("dry run: nothing applied" in out, "dry run applies nothing")
         out = cli.run("migrate")
-        check("migrated: v1 -> v9" in out, "migrate applies pending migrations")
+        check("migrated: v1 -> v10" in out, "migrate applies pending migrations")
         check("backup:" in out, "migrate backs up first")
         con = db_open(db_path)
         check(count(con, "SELECT COUNT(*) FROM photos_fts") == 4, "fts rebuilt with 4 rows")
@@ -1184,6 +1186,7 @@ def main() -> int:
             f'model = "{MODEL}"\n'
             f'db_path = "{ppl_dir}/catalog.db"\n'
             "person_min_confidence = 0.6\n"
+            "face_detection = false\n"  # [39] covers faces; keep this pass whole-photo
         )
         c26 = CLI(ppl_cfg)
         ppl_src = work / "peoplefolder"
@@ -1343,6 +1346,21 @@ def main() -> int:
                 ).fetchone()[0] == "user",
                 "web confirm persisted",
             )
+            out = c26.run("people", "confirm", str(green_id), "Sam", "--add-seed")
+            check("seed anchor added" in out, "confirm --add-seed adds a profile seed")
+            check(
+                (ppl_dir / "people" / str(sam_id) / f"seed-{green_id}.jpg").is_file(),
+                "confirmed seed crop saved on disk",
+            )
+            check(
+                con.execute(
+                    "SELECT COUNT(*) FROM person_tags WHERE person_id=? AND seed=1",
+                    (sam_id,),
+                ).fetchone()[0] == 2,
+                "seed pool grows with the confirmed tag",
+            )
+            r = requests.get(f"{wr_base}/person/{sam_id}")
+            check("2 seed anchor(s)" in r.text, "person page shows the seed count")
             r = requests.post(
                 f"{wr_base}/person/remove",
                 data={"photo_id": green_id, "person_id": sam_id, "token": token},
@@ -1454,6 +1472,270 @@ def main() -> int:
     )
     out = c25.run("--profile", "memes", "status")
     check("1 photo" in out, "profile config.toml replaces base config")
+
+    print("\n[37] date taken: EXIF at scan, slices, backfill, search, timeline")
+    port37 = free_port()
+    mock37 = start_mock(port37, mode_file)
+    try:
+        def fresh_cli37(name: str, extra: str = "") -> CLI:
+            cfgp = work / f"config-{name}.toml"
+            cfgp.write_text(
+                f'ollama_url = "http://127.0.0.1:{port37}"\n'
+                f'model = "{MODEL}"\n'
+                f'db_path = "{work}/db-{name}.db"\n' + extra
+            )
+            return CLI(cfgp)
+
+        def make_dated_image(path: Path, taken: str) -> None:
+            exif = Image.Exif()
+            exif.get_ifd(0x8769)[36867] = taken  # DateTimeOriginal
+            exif[306] = taken
+            im = Image.new("RGB", (640, 480), "steelblue")
+            d = ImageDraw.Draw(im)
+            d.text((40, 40), "dated photo", fill="white", font=font())
+            im.save(path, exif=exif)
+
+        date_src = work / "datefolder"
+        date_src.mkdir()
+        make_dated_image(date_src / "a2011.jpg", "2011:03:15 08:00:00")
+        make_dated_image(date_src / "b2023.jpg", "2023:05:01 10:00:00")
+        make_text_image(date_src / "c-noexif.jpg", ["no exif here"])
+        os.utime(date_src / "c-noexif.jpg", (1262304000, 1262304000))  # 2010-01-01
+
+        c37 = fresh_cli37("dates")
+        c37.run("scan", str(date_src))
+        con37 = db_open(work / "db-dates.db")
+
+        def date_of(fragment: str):
+            return con37.execute(
+                "SELECT p.date_taken FROM photos p JOIN locations l ON l.photo_id=p.id "
+                "WHERE l.path LIKE ?", (f"%{fragment}%",),
+            ).fetchone()[0]
+
+        check(date_of("a2011") == "2011-03-15T08:00:00", "EXIF date stored at scan")
+        check(date_of("b2023") == "2023-05-01T10:00:00", "second EXIF date stored")
+        check(date_of("c-noexif") is None, "no EXIF leaves date_taken NULL")
+
+        out = c37.run("backfill-dates", "--from-mtime")
+        check(
+            "dates recorded: 0 from EXIF, 1 from file mtime" in out,
+            "backfill fills the EXIF-less photo from its file mtime",
+        )
+        check(
+            date_of("c-noexif") is not None and date_of("c-noexif").startswith("2010-"),
+            "backfilled mtime date recorded",
+        )
+        out = c37.run("backfill-dates")
+        check("all photos already have a date taken" in out, "backfill is a no-op when done")
+
+        # Date slices prefer the EXIF date: file mtimes are 'now', so a 2023
+        # slice only matches via EXIF.
+        c37b = fresh_cli37("dates-slice")
+        out = c37b.run("scan", str(date_src), "--date-from", "2023", "--date-to", "2023")
+        check("2023-01-01" in out, "slice widens the year to a date range")
+        check("new 1 |" in out, "date slice matches the EXIF date, not the mtime")
+
+        c37.run("run", "--skip-preflight")
+        out = c37.run("search", "MOCK", "--year", "2023")
+        check("1 match(es)" in out, "search --year filters by date taken")
+        out = c37.run("search", "MOCK", "--date-from", "2011", "--date-to", "2011")
+        check("1 match(es)" in out, "search --date-from/--date-to filter by date taken")
+        out = c37.run("search", "MOCK", "--year", "1999")
+        check("no matches" in out, "year with no photos finds nothing")
+        c37.run("search", "MOCK", "--year", "20x3", expect=2)
+
+        web37_port = free_port()
+        proc37 = subprocess.Popen(
+            c37.cmd + ["serve", "--port", str(web37_port)],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        base37 = f"http://127.0.0.1:{web37_port}"
+        up37 = False
+        for _ in range(100):
+            try:
+                up37 = requests.get(base37 + "/", timeout=1).status_code == 200
+                if up37:
+                    break
+            except Exception:
+                time.sleep(0.1)
+        check(up37, "web UI comes up for the timeline")
+        if up37:
+            r = requests.get(base37 + "/")
+            check("2023" in r.text and "2011" in r.text, "year chips render")
+            check("/duplicates" in r.text, "duplicates tab appears in the nav")
+            r = requests.get(base37 + "/?year=2023")
+            check("taken in 2023" in r.text and "b2023" in r.text, "year filter narrows the list")
+            check("a2011" not in r.text, "year filter excludes other years")
+            b_id = con37.execute(
+                "SELECT p.id FROM photos p JOIN locations l ON l.photo_id=p.id "
+                "WHERE l.path LIKE '%b2023%'"
+            ).fetchone()[0]
+            r = requests.get(base37 + f"/photo/{b_id}")
+            check("2023-05-01 10:00" in r.text, "detail page shows the taken date")
+        proc37.terminate()
+        proc37.wait(timeout=10)
+        con37.close()
+    finally:
+        mock37.terminate()
+        mock37.wait()
+
+    print("\n[38] near-duplicate finder")
+    c38 = fresh_cli("dupes")
+
+    def make_noise_image(path: Path, seed: int, size=(600, 400)) -> Image.Image:
+        rng = random.Random(seed)
+        im = Image.new("RGB", size)
+        im.putdata(
+            [(rng.randrange(256), rng.randrange(256), rng.randrange(256))
+             for _ in range(size[0] * size[1])]
+        )
+        return im
+
+    dup_src = work / "dupefolder"
+    dup_src.mkdir()
+    noise = make_noise_image(dup_src / "one.jpg", 7)
+    noise.save(dup_src / "one.jpg", quality=95)
+    noise.resize((300, 200)).save(dup_src / "one-small.jpg", quality=75)
+    make_noise_image(dup_src / "two.jpg", 99).save(dup_src / "two.jpg", quality=95)
+    c38.run("scan", str(dup_src))
+    out = c38.run("duplicates")
+    check("1 duplicate group(s)" in out, "resized copy clusters with its original")
+    check("keep [" in out and "largest file" in out, "keep-largest hint shown")
+    check("one-small.jpg" in out, "duplicate paths listed")
+    out = c38.run("duplicates", "--json")
+    groups = json.loads(out)
+    check(
+        len(groups) == 1 and len(groups[0]) == 2
+        and {g["path"].rsplit("/", 1)[-1] for g in groups[0]} == {"one.jpg", "one-small.jpg"},
+        "json output lists the pair",
+    )
+    web38_port = free_port()
+    proc38 = subprocess.Popen(
+        c38.cmd + ["serve", "--port", str(web38_port)],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+    base38 = f"http://127.0.0.1:{web38_port}"
+    up38 = False
+    for _ in range(100):
+        try:
+            up38 = requests.get(base38 + "/duplicates", timeout=1).status_code == 200
+            if up38:
+                break
+        except Exception:
+            time.sleep(0.1)
+    check(up38, "duplicates tab serves")
+    if up38:
+        r = requests.get(base38 + "/duplicates")
+        check("keep (largest)" in r.text, "web duplicates page marks the keep candidate")
+    proc38.terminate()
+    proc38.wait(timeout=10)
+    out = c38.run("duplicates", "--threshold", "0")
+    check("no duplicate groups found" in out, "threshold 0 finds nothing (distance 1)")
+    con38 = db_open(work / "db-dupes.db")
+    con38.execute(
+        "UPDATE photos SET derivative = 1 WHERE id = (SELECT p.id FROM photos p "
+        "JOIN locations l ON l.photo_id = p.id WHERE l.path LIKE '%one-small%')"
+    )
+    con38.commit()
+    out = c38.run("duplicates")
+    check(
+        "no duplicate groups found" in out,
+        "iCloud preview proxies are excluded from duplicates",
+    )
+    con38.close()
+
+    print("\n[39] face detection: auto-box, crops, and the no-faces skip")
+    port39 = free_port()
+    mock39 = start_mock(port39, mode_file)
+    try:
+        cfg39 = work / "config-faces.toml"
+        cfg39.write_text(
+            f'ollama_url = "http://127.0.0.1:{port39}"\n'
+            f'model = "{MODEL}"\n'
+            f'db_path = "{work}/db-faces.db"\n'
+            "person_min_confidence = 0.6\n"
+            "face_detection = true\n"
+        )
+        c39 = CLI(cfg39)
+        face_src = work / "facefolder"
+        face_src.mkdir()
+        make_person_image(face_src / "red.jpg", "red")
+        make_person_image(face_src / "green.jpg", "lime")
+        make_person_image(face_src / "plain.jpg", "white")
+        c39.run("scan", str(face_src))
+        c39.run("run", "--skip-preflight")
+        con39 = db_open(work / "db-faces.db")
+
+        def fpid_of(name: str) -> int:
+            return con39.execute(
+                "SELECT p.id FROM photos p JOIN locations l ON l.photo_id=p.id "
+                "WHERE l.path LIKE ?", (f"%{name}%",),
+            ).fetchone()[0]
+
+        fred, fgreen, fplain = fpid_of("red.jpg"), fpid_of("green.jpg"), fpid_of("plain.jpg")
+        # Test seam: one face on red and green; plain gets two faces only to
+        # prove the multi-face error, then goes seam-less for the real
+        # no-faces skip below.
+        os.environ["PHOTOTEXT_TEST_FACES"] = (
+            f"{fred}:150,150,250,250;{fgreen}:150,150,250,250;{fplain}:0,0,10,10+50,50,20,20"
+        )
+        out = c39.run("people", "name", str(fred), "Ryan")
+        check(
+            "auto-detected a single face at 150,150,250,250" in out,
+            "people name auto-adopts a lone detected face",
+        )
+        check("person 'Ryan' seeded" in out, "auto-boxed seed created")
+        out = c39.run("people", "name", str(fplain), "Sam", expect=2)
+        check("found 2 faces" in out, "multiple faces require an explicit --box")
+        out = c39.run("people", "name", str(fplain), "Sam", "--box", "10,10,300,300")
+        check("person 'Sam' seeded" in out, "explicit --box still works")
+        os.environ["PHOTOTEXT_TEST_FACES"] = (
+            f"{fred}:150,150,250,250;{fgreen}:150,150,250,250"
+        )
+        out = c39.run("people", "run")
+        check(
+            "macOS Vision face detection on" in out,
+            "run reports face detection is active",
+        )
+        check(
+            "Matching 3 photo(s) against 2 person(s)" in out,
+            "every untagged photo is a candidate",
+        )
+        check(
+            f"photo {fplain}: no faces" in out,
+            "photos without faces are recorded without a model call",
+        )
+        check(
+            "4 tag(s) added (2 below threshold)" in out,
+            "seam face crops drive the mock verdicts",
+        )
+        check("1 marked absent" in out, "only the unseeded person is marked absent")
+        check(
+            con39.execute(
+                "SELECT COUNT(*) FROM person_tags t JOIN people pe ON pe.id=t.person_id "
+                "WHERE t.photo_id=? AND pe.name='Ryan' AND t.present=0",
+                (fplain,),
+            ).fetchone()[0] == 1,
+            "absent row stored for the faceless photo",
+        )
+        check(
+            con39.execute(
+                "SELECT t.present FROM person_tags t JOIN people pe ON pe.id=t.person_id "
+                "WHERE t.photo_id=? AND pe.name='Sam'",
+                (fplain,),
+            ).fetchone()[0] == 1,
+            "seeded ground truth survives the no-faces skip",
+        )
+        out = c39.run("doctor")
+        check(
+            "[PASS] face detection (macOS Vision)" in out,
+            "doctor reports Vision availability",
+        )
+        con39.close()
+    finally:
+        os.environ.pop("PHOTOTEXT_TEST_FACES", None)
+        mock39.terminate()
+        mock39.wait()
 
     print()
     if FAILURES:

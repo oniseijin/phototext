@@ -188,11 +188,12 @@ class OllamaClient:
         content = self._chat(payload)
         return parse_model_json(content), content
 
-    def match_people(self, image_b64: str, people_json: str) -> tuple[dict, str]:
+    def match_people(self, images_b64: list[str], people_json: str) -> tuple[dict, str]:
         """Check which registered people appear in one photo.
 
         One call evaluates every person (the prompt embeds their profiles).
-        Uses the same anti-loop retry as extract().
+        `images_b64` is one whole photo or a few face crops. Uses the same
+        anti-loop retry as extract().
         """
         payload = {
             "model": self.person_model,
@@ -200,7 +201,7 @@ class OllamaClient:
                 {
                     "role": "user",
                     "content": PERSON_MATCH_PROMPT_HEAD + people_json + PERSON_MATCH_PROMPT_TAIL,
-                    "images": [image_b64],
+                    "images": list(images_b64),
                 },
             ],
             "stream": False,

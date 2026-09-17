@@ -115,13 +115,14 @@ PERSON_DESCRIBE_SCHEMA = {
 
 
 PERSON_MATCH_PROMPT_HEAD = (
-    "Decide which of the following people appear in this photo. Respond with "
-    "JSON only.\n"
+    "Decide which of the following people appear in this photo. The image(s) "
+    "show either the whole photo or close-up crops of the faces in it. "
+    "Respond with JSON only.\n"
     "People to look for (person_id with a recognition profile):\n"
 )
 
 PERSON_MATCH_PROMPT_TAIL = (
-    "\nExamine every person in the photo. For each person listed above, add one "
+    "\nExamine every face in the image(s). For each person listed above, add one "
     'entry to "matches": "person_id" (the integer id), "present" (true only if '
     'you are reasonably sure they appear), and "confidence" (0.0 to 1.0). Judge '
     "only what is actually visible; people not in the photo get present=false. "

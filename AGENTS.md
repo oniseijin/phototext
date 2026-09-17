@@ -23,29 +23,34 @@ Guidance for AI coding agents working in this repo.
 ```
 src/phototext/
   cli.py           typer commands; global --config/--db; scan/run slices,
-                   search, export, migrate, serve, reprocess, help,
-                   hide/unhide/delete/restore/purge/trash, unscan,
-                   categories, memes, autocomplete, profiles, people
-                   (name/run/list/photos/confirm/remove/rename/reset/
-                   delete/describe)
+                   search (--person/--year/--date-from/--date-to), export,
+                   migrate, serve, reprocess, help, hide/unhide/delete/
+                   restore/purge/trash, unscan, backfill-dates, categories,
+                   memes, duplicates, autocomplete, profiles, people
+                   (name/run/list/photos/confirm [--add-seed]/remove/rename/
+                   reset/delete/describe)
   config.py        dataclass Config, ~/.phototext/config.toml (TOML) loading
   db.py            SQLite schema, migrations (+ backups), FTS5 sync, queries
-  imaging.py       hashing, decode/downscale/encode, quadrant tiles, sips
-                   fallback, test image
+  faces.py         macOS Vision face detection (display-pixel boxes,
+                   PHOTOTEXT_TEST_FACES seam for e2e, graceful degradation)
+  imaging.py       hashing, decode/downscale/encode, EXIF date read,
+                   quadrant tiles, sips fallback, crop_jpeg, test image
   library_meta.py  album/favorites/UUID -> paths: osxphotos (Photos) or
                    adaptive iPhoto apdb reader
   people.py        person seeds (face crops), recognition profiles, the
-                   `people run` matching pass (one call per photo)
-  memes.py         63-bit dhash, backfill, hamming clustering (union-find)
-                   (warnings capture, bomb guard, deferred/derivative iCloud
-                   inventory live in scanner/db/worker — see invariants)
+                   `people run` matching pass (face prefilter + crops)
+  memes.py         63-bit dhash, backfill, hamming clustering (union-find);
+                   shared by memes view and the duplicates finder
+                   (tight threshold + derivative exclusion)
   ollama_client.py /api/chat + /api/tags + /api/ps, structured output,
                    preflight, two-tier gate call, person describe/match
                    calls, anti-loop retry, parsing
   prompt.py        prompts, response schema, tile merge, normalization
-  scanner.py       source resolution, walk, dedup, fast path, Slice filters
-  webui.py         read-only local web UI (http.server): browse/search/detail,
-                   thumbnails, reveal-in-Finder
+  scanner.py       source resolution, walk, dedup, fast path, EXIF
+                   date_taken at registration, Slice filters
+  webui.py         read-only local web UI (http.server): browse/search/
+                   detail, year timeline, thumbnails, people pages, memes +
+                   duplicates tabs, reveal-in-Finder
   worker.py        run loop: claim/process, retries, budgets, signals
 bin/phototext-dev  dev wrapper: workspace code via repo .venv
 install.sh         installer: snapshot venv, var/ layout, bin wrappers, migrate
@@ -137,6 +142,35 @@ tests/
   to the prefilter); it is standalone like memes, not part of the extraction
   worker. Web person routes go through the same --writable + token + Origin
   gate as the other write actions.
+- **People seeds** (migration 10): `person_tags.seed = 1` marks a tag as a
+  profile anchor; `person_seed_photo_ids` selects by the seed flag, not
+  origin. `people confirm --add-seed` (web: `confirm+seed`) grows the pool
+  and writes the crop; `people describe` rebuilds from it. Migration 10
+  backfills seed=1 onto existing origin='seed' rows — never remove that
+  UPDATE.
+- **Face detection** (`faces.py`, macOS Vision via pyobjc, `face_detection`
+  config, default on): `people run` records absent for *everyone* on
+  faceless photos without a model call (ground-truth rows skipped and not
+  counted), and matches on up to `faces.MAX_FACES` crops instead of whole
+  photos. If Vision is not importable, `run_matching` falls back to
+  whole-photo matching with a warning rather than marking the library
+  absent. `people name` without `--box` auto-adopts a lone face, errors on
+  multiple. Boxes are display-pixel (EXIF-oriented) — same frame as
+  `imaging.crop_jpeg` and the web picker. E2e drives the faces-found path
+  via the `PHOTOTEST_FACES`-style seam `PHOTOTEXT_TEST_FACES` (documented in
+  `faces.py`); real Vision on synthetic images returns no faces, which the
+  suite uses for the skip path.
+- **Date taken** (migration 10): `photos.date_taken` (ISO) is recorded at
+  registration (`imaging.read_date_taken`, EXIF 36867 then 306, header
+  read only). Rescans opportunistically fill NULLs for touched files;
+  `backfill-dates` walks the rest (`--from-mtime` fallback). Date slices
+  prefer date_taken and fall back to mtime. Search/browse filter on it
+  (`--year`, `--date-from/--date-to`, web year chips) — photos without a
+  date fall out of date-filtered results.
+- **Duplicates** reuse `memes.find_clusters` with a tighter default
+  (hamming <= 4) and `exclude_derivatives=True` so iCloud previews never
+  pair with their originals; the memes view keeps derivatives. Read-only
+  like everything else.
 
 ## Testing rules
 
@@ -154,11 +188,16 @@ tests/
   meme clustering + web view, multi-process workers with stale-lease
   recovery, the two-tier gate (categories, gated reprocess), the help
   command, hide/delete/trash + unscan, warnings + the bomb guard,
-  deferred iCloud inventory/promotion, named profiles, and people
+  deferred iCloud inventory/promotion, named profiles, people
   (name/box/seed crop, matching with uncertain review queue, confirm/remove,
-  reset keeping user tags, search filter, web picker + person pages). Run it
+  reset keeping user tags, search filter, web picker + person pages,
+  confirm --add-seed + web confirm+seed), date taken (EXIF at scan,
+  slice preference, backfill, search date filters, web timeline), the
+  near-duplicate finder (CLI + json + web tab + derivative exclusion),
+  and face detection (auto-box, multi-face refusal, face-crop matching,
+  the no-faces skip, ground-truth survival, doctor). Run it
   after any change to scanner/worker/db/ollama_client/cli/library_meta/
-  webui/memes/people/prompt.
+  webui/memes/people/prompt/faces.
 - macOS `realpath` resolves `/var` -> `/private/var` and can normalize path case
   (`Originals` -> `originals`); never assert exact path strings.
 
