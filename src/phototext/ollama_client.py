@@ -1,0 +1,184 @@
+from __future__ import annotations
+
+import json
+
+import requests
+
+from .config import Config
+from .imaging import test_image_b64
+from .prompt import (
+    EXTRACTION_SCHEMA,
+    GATE_SCHEMA,
+    GATE_PROMPT,
+    SYSTEM_PROMPT,
+    USER_PROMPT,
+)
+
+
+class OllamaUnreachable(Exception):
+    pass
+
+
+class OllamaTimeout(Exception):
+    pass
+
+
+class OllamaServerError(Exception):
+    pass
+
+
+class ModelOutputError(Exception):
+    def __init__(self, message: str, content: str | None = None):
+        super().__init__(message)
+        self.content = content
+
+
+def parse_model_json(content: str | None) -> dict:
+    if content:
+        try:
+            value = json.loads(content)
+            if isinstance(value, dict):
+                return value
+        except ValueError:
+            pass
+        start, end = content.find("{"), content.rfind("}")
+        if start != -1 and end > start:
+            try:
+                value = json.loads(content[start : end + 1])
+                if isinstance(value, dict):
+                    return value
+            except ValueError:
+                pass
+    raise ModelOutputError("model did not return usable JSON", content)
+
+
+class OllamaClient:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.base_url = cfg.ollama_url.rstrip("/")
+        self.model = cfg.model
+        self.gate_model = cfg.prefilter_model
+        self.timeout = cfg.request_timeout_s
+
+    def check_connection(self) -> list[str]:
+        try:
+            resp = requests.get(f"{self.base_url}/api/tags", timeout=5)
+            resp.raise_for_status()
+        except requests.RequestException as e:
+            raise OllamaUnreachable(str(e)) from e
+        try:
+            return [m.get("name") or m.get("model") or "" for m in resp.json().get("models", [])]
+        except ValueError as e:
+            raise OllamaServerError(f"invalid response from /api/tags: {resp.text[:200]}") from e
+
+    def loaded_models(self) -> list[str]:
+        """Model names currently loaded in Ollama's memory (/api/ps)."""
+        try:
+            resp = requests.get(f"{self.base_url}/api/ps", timeout=5)
+            resp.raise_for_status()
+        except requests.RequestException as e:
+            raise OllamaUnreachable(str(e)) from e
+        try:
+            return [m.get("name") or m.get("model") or "" for m in resp.json().get("models", [])]
+        except ValueError as e:
+            raise OllamaServerError(f"invalid response from /api/ps: {resp.text[:200]}") from e
+
+    def preflight(self) -> list[str]:
+        try:
+            models = self.check_connection()
+        except OllamaUnreachable as e:
+            return [f"cannot reach Ollama at {self.base_url} ({e}); is `ollama serve` running?"]
+        if self.model not in models:
+            available = ", ".join(sorted(m for m in models if m)) or "none"
+            return [
+                f"model '{self.model}' is not installed in Ollama (available: {available}); "
+                f"run `ollama pull {self.model}` or set 'model' in the config file"
+            ]
+        try:
+            self.extract(test_image_b64())
+        except OllamaUnreachable as e:
+            return [f"cannot reach Ollama at {self.base_url} ({e})"]
+        except (OllamaServerError, ModelOutputError) as e:
+            return [f"model '{self.model}' failed on a test image: {e}; is it a vision model?"]
+        return []
+
+    def extract(self, image_b64: str) -> tuple[dict, str]:
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": USER_PROMPT, "images": [image_b64]},
+            ],
+            "stream": False,
+            "format": EXTRACTION_SCHEMA if self.cfg.structured_output else "json",
+            "think": False,
+            "options": {
+                "temperature": self.cfg.temperature,
+                "num_ctx": self.cfg.num_ctx,
+                "num_predict": self.cfg.max_output_tokens,
+            },
+        }
+        content = self._chat(payload)
+        try:
+            return parse_model_json(content), content
+        except ModelOutputError:
+            # Greedy decoding (temperature 0) can repetition-loop until the
+            # token cap truncates the JSON mid-string. One retry with higher
+            # temperature plus a repetition penalty escapes the loop
+            # (measured: repeat_penalty alone does not).
+            retry_payload = dict(payload)
+            retry_payload["options"] = {
+                **payload["options"],
+                "temperature": 0.7,
+                "repeat_penalty": 1.2,
+            }
+            content = self._chat(retry_payload)
+            return parse_model_json(content), content
+
+    def gate(self, image_b64: str) -> tuple[dict, str]:
+        """Cheap pre-filter: does this photo contain visible text?
+
+        Uses the small `prefilter_model` with a short prompt and a tiny
+        output budget. Raises the same exceptions as extract(); the caller
+        treats failures as "just do the full pass".
+        """
+        payload = {
+            "model": self.gate_model,
+            "messages": [
+                {"role": "user", "content": GATE_PROMPT, "images": [image_b64]},
+            ],
+            "stream": False,
+            "format": GATE_SCHEMA,
+            "think": False,
+            "options": {
+                "temperature": self.cfg.temperature,
+                "num_ctx": self.cfg.num_ctx,
+                "num_predict": 256,
+            },
+        }
+        content = self._chat(payload)
+        return parse_model_json(content), content
+
+    def _chat(self, payload: dict) -> str:
+        try:
+            resp = requests.post(f"{self.base_url}/api/chat", json=payload, timeout=self.timeout)
+        except requests.Timeout as e:
+            raise OllamaTimeout(f"model call exceeded the {self.timeout}s timeout") from e
+        except requests.RequestException as e:
+            raise OllamaUnreachable(str(e)) from e
+        if resp.status_code == 400 and "think" in resp.text.lower():
+            payload.pop("think", None)
+            try:
+                resp = requests.post(
+                    f"{self.base_url}/api/chat", json=payload, timeout=self.timeout
+                )
+            except requests.Timeout as e:
+                raise OllamaTimeout(f"model call exceeded the {self.timeout}s timeout") from e
+            except requests.RequestException as e:
+                raise OllamaUnreachable(str(e)) from e
+        if resp.status_code != 200:
+            raise OllamaServerError(f"HTTP {resp.status_code}: {resp.text[:200]}")
+        try:
+            return resp.json()["message"]["content"]
+        except (ValueError, KeyError, TypeError) as e:
+            raise ModelOutputError(f"unexpected response shape: {resp.text[:200]}") from e

@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "phototext"
+version = "0.1.0"
+description = "Recover text from photos using a local Ollama vision model"
+requires-python = ">=3.11"
+dependencies = [
+    "requests>=2.31",
+    "Pillow>=10.3",
+    "pillow-heif>=0.16",
+    "typer>=0.12",
+    "osxphotos>=0.76",
+]
+
+[project.scripts]
+phototext = "phototext.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/phototext"]

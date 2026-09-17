@@ -1,0 +1,1249 @@
+#!/usr/bin/env python3
+"""Run: .venv/bin/python tests/e2e.py"""
+from __future__ import annotations
+
+import csv
+import json
+import os
+import re
+import signal
+import socket
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import requests
+from PIL import Image, ImageDraw, ImageEnhance, ImageFont, ImageOps
+
+ROOT = Path(__file__).resolve().parent.parent
+try:
+    import phototext  # noqa: F401
+except ImportError:
+    sys.path.insert(0, str(ROOT / "src"))
+
+MODEL = "gemma4:mock"
+FAILURES: list[str] = []
+
+
+def _try_get(url: str):
+    try:
+        resp = requests.get(url, timeout=2)
+        return resp if resp.status_code == 200 else None
+    except Exception:
+        return None
+
+
+def check(cond, msg: str) -> None:
+    if cond:
+        print(f"  ok    {msg}")
+    else:
+        FAILURES.append(msg)
+        print(f"  FAIL  {msg}")
+
+
+def font(size: int = 48):
+    for attempt in (
+        lambda: ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial.ttf", size),
+        lambda: ImageFont.load_default(size=size),
+        lambda: ImageFont.load_default(),
+    ):
+        try:
+            return attempt()
+        except Exception:
+            continue
+    raise RuntimeError("no usable font found")
+
+
+def make_text_image(path: Path, lines: list[str], size=(640, 480)) -> None:
+    im = Image.new("RGB", size, "white")
+    d = ImageDraw.Draw(im)
+    y = 40
+    for line in lines:
+        d.text((40, y), line, fill="black", font=font())
+        y += 64
+    im.save(path)
+
+
+def make_plain_image(path: Path) -> None:
+    gradient = Image.linear_gradient("L").resize((640, 480))
+    ImageOps.colorize(gradient, "navy", "orange").save(path)
+
+
+def build_library(work: Path) -> Path:
+    from pillow_heif import register_heif_opener
+
+    register_heif_opener()
+    lib = work / "Old iPhoto Library.photolibrary"
+    originals = lib / "Originals" / "2013"
+    originals.mkdir(parents=True)
+    make_text_image(originals / "sign.jpg", ["OPEN", "24 HOURS"])
+    make_text_image(originals / "doc.png", ["Invoice #42", "Acme Corp", "Total: $99.50"])
+    make_plain_image(originals / "nature.jpg")
+    im = Image.new("RGB", (480, 640), "beige")
+    d = ImageDraw.Draw(im)
+    d.text((40, 60), "MILK EGGS BREAD", fill="black", font=font())
+    im.save(originals / "note.heic")
+    (originals / "doc-copy.png").write_bytes((originals / "doc.png").read_bytes())
+    (originals / "noextfile").write_bytes((originals / "sign.jpg").read_bytes())
+    (originals / "movie.mov").write_bytes(b"not really a movie")
+    (originals / "edit.aae").write_bytes(b"sidecar")
+    (originals / ".DS_Store").write_bytes(b"junk")
+    build_iphoto_apdb(lib)
+    return lib
+
+
+def build_iphoto_apdb(lib: Path) -> None:
+    apdb = lib / "Database" / "apdb" / "Database"
+    apdb.parent.mkdir(parents=True)
+    con = sqlite3.connect(apdb)
+    con.executescript(
+        """
+        CREATE TABLE RKVersion (uuid TEXT, masterId TEXT, name TEXT, flagged INTEGER);
+        CREATE TABLE RKMaster (uuid TEXT, imagePath TEXT);
+        CREATE TABLE RKAlbum (uuid TEXT, name TEXT);
+        CREATE TABLE RKAlbumVersion (albumId INTEGER, versionId INTEGER);
+        """
+    )
+    for uuid, path in [
+        ("m1", "Originals/2013/sign.jpg"),
+        ("m2", "Originals/2013/doc.png"),
+        ("m3", "Originals/2013/nature.jpg"),
+        ("m4", "Originals/2013/note.heic"),
+        ("m5", "Originals/2013/doc-copy.png"),
+    ]:
+        con.execute("INSERT INTO RKMaster (uuid, imagePath) VALUES (?, ?)", (uuid, path))
+    for uuid, master, name, flagged in [
+        ("V1", "m1", "sign", 0),
+        ("V2", "m2", "doc", 1),
+        ("V3", "m3", "nature", 0),
+        ("V4", "m4", "note", 1),
+        ("V5", "m5", "doc copy", 0),
+    ]:
+        con.execute(
+            "INSERT INTO RKVersion (uuid, masterId, name, flagged) VALUES (?, ?, ?, ?)",
+            (uuid, master, name, flagged),
+        )
+    for uuid, name in [("a1", "Trip"), ("a2", "Party"), ("a3", "Empty")]:
+        con.execute("INSERT INTO RKAlbum (uuid, name) VALUES (?, ?)", (uuid, name))
+    for album_rowid, version_rowid in [(1, 1), (1, 4), (2, 2)]:
+        con.execute(
+            "INSERT INTO RKAlbumVersion (albumId, versionId) VALUES (?, ?)",
+            (album_rowid, version_rowid),
+        )
+    con.commit()
+    con.close()
+
+
+def build_slice_folder(work: Path) -> Path:
+    folder = work / "slicefolder"
+    folder.mkdir()
+    names = ["a2013.jpg", "b2013.jpg", "c2013.jpg", "d2024.jpg", "e2024.jpg", "f2024.jpg"]
+    for name in names:
+        make_text_image(folder / name, [f"slice {name}"])
+    old = time.mktime((2013, 6, 15, 12, 0, 0, 0, 0, -1))
+    new = time.mktime((2024, 6, 15, 12, 0, 0, 0, 0, -1))
+    for name in names[:3]:
+        os.utime(folder / name, (old, old))
+    for name in names[3:]:
+        os.utime(folder / name, (new, new))
+    return folder
+
+
+def free_port() -> int:
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def start_mock(port: int, mode_file: Path, ps_file: Path | None = None) -> subprocess.Popen:
+    cmd = [
+        sys.executable,
+        str(ROOT / "tests" / "mock_ollama.py"),
+        "--model",
+        MODEL,
+        "--port",
+        str(port),
+        "--mode-file",
+        str(mode_file),
+        "--slow-seconds",
+        "3.0",
+    ]
+    if ps_file is not None:
+        cmd += ["--ps-file", str(ps_file)]
+    proc = subprocess.Popen(cmd)
+    for _ in range(100):
+        try:
+            requests.get(f"http://127.0.0.1:{port}/api/tags", timeout=1)
+            return proc
+        except Exception:
+            time.sleep(0.1)
+    raise RuntimeError("mock ollama did not start")
+
+
+class CLI:
+    def __init__(self, config_path: Path):
+        self.cmd = [sys.executable, "-u", "-m", "phototext", "--config", str(config_path)]
+
+    def run(self, *args, expect: int = 0, timeout: int = 180) -> str:
+        proc = subprocess.run(
+            self.cmd + list(args), capture_output=True, text=True, timeout=timeout
+        )
+        out = proc.stdout + proc.stderr
+        check(
+            proc.returncode == expect,
+            f"exit {proc.returncode} == {expect} for: phototext {' '.join(args)}"
+            + ("" if proc.returncode == expect else f"\n      output: {out[-600:]}"),
+        )
+        return out
+
+
+def db_open(db_path: Path) -> sqlite3.Connection:
+    return sqlite3.connect(db_path)
+
+
+def reset_queued(con: sqlite3.Connection) -> None:
+    con.execute(
+        "UPDATE photos SET status='queued', attempts=0, error=NULL, "
+        "started_at=NULL, finished_at=NULL"
+    )
+    con.commit()
+
+
+def count(con: sqlite3.Connection, sql: str, params: tuple = ()) -> int:
+    return con.execute(sql, params).fetchone()[0]
+
+
+def main() -> int:
+    work = Path(tempfile.mkdtemp(prefix="phototext-e2e-"))
+    print(f"workdir: {work}")
+    lib = build_library(work)
+    db_path = work / "catalog.db"
+    mode_file = work / "mode"
+    mode_file.write_text("ok")
+    ps_file = work / "ps"
+    ps_file.write_text("")
+    port = free_port()
+    mock = start_mock(port, mode_file, ps_file)
+    config = work / "config.toml"
+    config.write_text(
+        f'ollama_url = "http://127.0.0.1:{port}"\n'
+        f'model = "{MODEL}"\n'
+        f'db_path = "{db_path}"\n'
+        "max_attempts = 2\n"
+        "transport_retries = 2\n"
+        "transport_backoff_s = 1\n"
+        "request_timeout_s = 20\n"
+    )
+    cli = CLI(config)
+
+    def fresh_cli(name: str, extra: str = "") -> CLI:
+        cfgp = work / f"config-{name}.toml"
+        cfgp.write_text(
+            f'ollama_url = "http://127.0.0.1:{port}"\n'
+            f'model = "{MODEL}"\n'
+            f'db_path = "{work}/db-{name}.db"\n' + extra
+        )
+        return CLI(cfgp)
+
+    try:
+        print("\n[1] scan registers library, dedups by content hash")
+        cli.run("scan", str(lib))
+        con = db_open(db_path)
+        check(count(con, "SELECT COUNT(*) FROM photos") == 4, "4 unique photos")
+        check(count(con, "SELECT COUNT(*) FROM locations") == 6, "6 locations")
+        check(count(con, "SELECT COUNT(*) FROM photos WHERE status='queued'") == 4, "4 queued")
+        check(count(con, "SELECT COUNT(*) FROM sources") == 1, "1 source registered")
+        check(
+            con.execute("SELECT kind FROM sources LIMIT 1").fetchone()[0] == "library",
+            "source kind is library",
+        )
+        con.close()
+
+        print("\n[2] status reports the queue")
+        out = cli.run("status")
+        check("queued 4" in out, "status shows queued 4")
+
+        print("\n[3] run processes the queue end to end")
+        out = cli.run("run")
+        check("Queue drained" in out, "run drains the queue")
+        con = db_open(db_path)
+        check(count(con, "SELECT COUNT(*) FROM photos WHERE status='done'") == 4, "all done")
+        check(
+            count(con, "SELECT COUNT(*) FROM photos WHERE text='MOCK EXTRACTED TEXT'") == 4,
+            "text stored",
+        )
+        check(
+            count(con, "SELECT COUNT(*) FROM photos WHERE model=?", (MODEL,)) == 4,
+            "model recorded",
+        )
+        check(
+            count(con, "SELECT COUNT(*) FROM photos WHERE duration_ms IS NULL OR duration_ms<=0")
+            == 0,
+            "durations recorded",
+        )
+        check(count(con, "SELECT COUNT(*) FROM photos WHERE raw_response IS NULL") == 0, "raw responses stored")
+        con.close()
+
+        print("\n[4] results command shows extractions")
+        out = cli.run("results", "--n", "10")
+        check("MOCK EXTRACTED TEXT" in out, "results shows extracted text")
+        check("originals" in out.lower(), "results shows source path")
+
+        print("\n[5] rescan is a fast no-op")
+        out = cli.run("scan")
+        check("new 0" in out and "unchanged 6" in out, "rescan finds nothing new")
+        con = db_open(db_path)
+        check(count(con, "SELECT COUNT(*) FROM photos") == 4, "still 4 photos")
+        con.close()
+
+        print("\n[6] model failures mark errors, then retry recovers")
+        mode_file.write_text("fail500")
+        con = db_open(db_path)
+        reset_queued(con)
+        con.close()
+        cli.run("run", "--skip-preflight")
+        con = db_open(db_path)
+        check(count(con, "SELECT COUNT(*) FROM photos WHERE status='error'") == 4, "failures marked as error")
+        check(count(con, "SELECT COUNT(*) FROM photos WHERE attempts=1") == 4, "attempts recorded")
+        check(count(con, "SELECT COUNT(*) FROM photos WHERE error LIKE '%mock%'") == 4, "error messages stored")
+        con.close()
+        out = cli.run("retry")
+        check("requeued 4" in out, "retry requeues failures")
+        mode_file.write_text("ok")
+        cli.run("run")
+        con = db_open(db_path)
+        check(count(con, "SELECT COUNT(*) FROM photos WHERE status='done'") == 4, "recovered after retry")
+        con.close()
+
+        print("\n[7] ollama unreachable mid-run requeues and exits nonzero")
+        mock.terminate()
+        mock.wait()
+        con = db_open(db_path)
+        reset_queued(con)
+        con.close()
+        cli.run("run", "--skip-preflight", expect=1)
+        con = db_open(db_path)
+        check(count(con, "SELECT COUNT(*) FROM photos WHERE status='queued'") == 4, "items requeued, nothing lost")
+        con.close()
+        mock = start_mock(port, mode_file, ps_file)
+
+        print("\n[8] interrupted processing rows are recovered on next run")
+        stale = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat(timespec="seconds")
+        fresh = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        con = db_open(db_path)
+        con.execute(
+            "UPDATE photos SET status='done' WHERE id IN (SELECT id FROM photos ORDER BY id LIMIT 2)"
+        )
+        con.execute(
+            "UPDATE photos SET status='processing', started_at=? "
+            "WHERE id IN (SELECT id FROM photos ORDER BY id LIMIT 1 OFFSET 2)",
+            (stale,),
+        )
+        con.execute(
+            "UPDATE photos SET status='processing', started_at=? "
+            "WHERE id IN (SELECT id FROM photos ORDER BY id LIMIT 1 OFFSET 3)",
+            (fresh,),
+        )
+        con.commit()
+        con.close()
+        out = cli.run("run", "--no-scan")
+        check("Recovered 2" in out, "both interrupted items recovered")
+        con = db_open(db_path)
+        check(count(con, "SELECT COUNT(*) FROM photos WHERE status='done'") == 4, "recovered items processed")
+        check(count(con, "SELECT COUNT(*) FROM photos WHERE status='processing'") == 0, "no processing rows remain")
+        con.close()
+
+        print("\n[9] --stop-after budget stops the run cleanly")
+        mode_file.write_text("slow")
+        con = db_open(db_path)
+        reset_queued(con)
+        con.close()
+        cli.run("run", "--skip-preflight", "--stop-after", "4s")
+        con = db_open(db_path)
+        done = count(con, "SELECT COUNT(*) FROM photos WHERE status='done'")
+        queued = count(con, "SELECT COUNT(*) FROM photos WHERE status='queued'")
+        con.close()
+        check(1 <= done <= 3 and queued >= 1, f"budget respected (done={done}, queued={queued})")
+
+        print("\n[10] SIGINT stops gracefully after current photo")
+        con = db_open(db_path)
+        reset_queued(con)
+        con.close()
+        proc = subprocess.Popen(
+            cli.cmd + ["run", "--skip-preflight"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        time.sleep(1.5)
+        proc.send_signal(signal.SIGINT)
+        out, _ = proc.communicate(timeout=60)
+        check(
+            proc.returncode == 0,
+            f"graceful exit (rc={proc.returncode})\n      output: {out[-400:]}",
+        )
+        con = db_open(db_path)
+        check(count(con, "SELECT COUNT(*) FROM photos WHERE status='done'") == 1, "current photo finished")
+        check(count(con, "SELECT COUNT(*) FROM photos WHERE status='queued'") == 3, "remaining stay queued")
+        con.close()
+        mode_file.write_text("ok")
+
+        print("\n[11] doctor passes against the mock, fails on a dead server")
+        cli.run("doctor")
+        bad_port = free_port()
+        bad_config = work / "bad-config.toml"
+        bad_config.write_text(
+            f'ollama_url = "http://127.0.0.1:{bad_port}"\nmodel = "{MODEL}"\ndb_path = "{db_path}"\n'
+        )
+        cli = CLI(bad_config)
+        cli.run("doctor", expect=1)
+        cli = CLI(config)
+
+        print("\n[12] parse_duration")
+        from phototext.worker import parse_duration
+
+        check(parse_duration("45") == 45.0, "plain seconds")
+        check(parse_duration("90m") == 5400.0, "minutes")
+        check(parse_duration("2h") == 7200.0, "hours")
+        check(parse_duration("1h30m") == 5400.0, "compound")
+        try:
+            parse_duration("nope")
+            check(False, "rejects garbage")
+        except ValueError:
+            check(True, "rejects garbage")
+
+        from phototext.prompt import normalize_result
+
+        collapsed = normalize_result(
+            {
+                "has_text": True,
+                "text": "happy\n\n\n\n\n\n\nend\n\n\n",
+                "context": "x",
+                "text_kind": "document",
+                "language": "en",
+            }
+        )
+        check(collapsed["text"] == "happy\n\nend", "newline runs are collapsed")
+
+        print("\n[13] sips fallback works")
+        from phototext.imaging import _sips_to_jpeg
+
+        converted = _sips_to_jpeg(lib / "Originals" / "2013" / "sign.jpg")
+        check(converted is not None and converted.stat().st_size > 0, "sips converts to jpeg")
+        if converted is not None:
+            converted.unlink(missing_ok=True)
+
+        print("\n[14] full-text search over recovered text")
+        out = cli.run("run")
+        check("Queue drained" in out, "remaining queue drained first")
+        out = cli.run("search", "MOCK")
+        check("4 match(es)" in out, "search finds all done photos")
+        check("MOCK EXTRACTED TEXT" in out, "search shows a text snippet")
+        out = cli.run("search", '"EXTRACTED TEXT"')
+        check("4 match(es)" in out, "phrase search works")
+        out = cli.run("search", "zzznothing")
+        check("no matches" in out, "no-match message")
+        out = cli.run("search", "total:$99")
+        check("no matches" in out, "invalid fts syntax falls back to a phrase")
+
+        print("\n[15] migrate command backs up and applies pending migrations")
+        out = cli.run("migrate")
+        check("up to date" in out, "migrate is a no-op when current")
+        con = db_open(db_path)
+        con.executescript(
+            "DROP TABLE photos_fts; DROP TRIGGER photos_fts_ai; "
+            "DROP TRIGGER photos_fts_ad; DROP TRIGGER photos_fts_au; "
+            "ALTER TABLE photos DROP COLUMN tiled; "
+            "ALTER TABLE photos DROP COLUMN phash; "
+            "ALTER TABLE photos DROP COLUMN gated; "
+            "ALTER TABLE photos DROP COLUMN category; "
+            "ALTER TABLE photos DROP COLUMN hidden; "
+            "ALTER TABLE photos DROP COLUMN deleted_at; "
+            "ALTER TABLE photos DROP COLUMN derivative; "
+            "DROP TABLE IF EXISTS photo_warnings; "
+            "DELETE FROM schema_version WHERE version >= 2;"
+        )
+        con.commit()
+        con.close()
+        out = cli.run("migrate", "--dry-run")
+        check(
+            "pending migration(s): v2, v3, v4, v5, v6, v7, v8" in out,
+            "dry run reports pending migrations",
+        )
+        check("dry run: nothing applied" in out, "dry run applies nothing")
+        out = cli.run("migrate")
+        check("migrated: v1 -> v8" in out, "migrate applies pending migrations")
+        check("backup:" in out, "migrate backs up first")
+        con = db_open(db_path)
+        check(count(con, "SELECT COUNT(*) FROM photos_fts") == 4, "fts rebuilt with 4 rows")
+        con.close()
+        out = cli.run("search", "MOCK")
+        check("4 match(es)" in out, "search works after migrate")
+
+        print("\n[16] export jsonl/csv")
+        out = cli.run("export")
+        lines = [line for line in out.strip().splitlines() if line.strip()]
+        check(len(lines) == 4, "jsonl has 4 records")
+        records = [json.loads(line) for line in lines]
+        check(
+            all(r["text"] == "MOCK EXTRACTED TEXT" for r in records), "jsonl text field"
+        )
+        check(all(r["paths"] for r in records), "jsonl includes paths")
+        check(all(r["status"] == "done" for r in records), "jsonl status field")
+        out = cli.run("export", "--format", "csv")
+        rows = list(csv.reader(out.strip().splitlines()))
+        check(
+            rows[0][0] == "id" and "text" in rows[0] and "context" in rows[0],
+            "csv header",
+        )
+        check(len(rows) == 5, "csv has 4 records + header")
+        check(
+            rows[1][rows[0].index("text")] == "MOCK EXTRACTED TEXT", "csv text cell"
+        )
+        out = cli.run("export", "--status", "error")
+        check(out.strip() == "", "export --status error is empty when none")
+        outfile = work / "export.jsonl"
+        cli.run("export", "--output", str(outfile))
+        check(
+            len(outfile.read_text().strip().splitlines()) == 4, "export --output writes file"
+        )
+
+        print("\n[17] slice scans on a folder (dates, limit, ids-file)")
+        folder = build_slice_folder(work)
+        c2 = fresh_cli("datedb")
+        out = c2.run("scan", str(folder), "--date-from", "2013", "--date-to", "2013")
+        check("new 3" in out and "slice-skipped 3" in out, "date slice queues only 2013")
+        out = c2.run("scan", "--date-from", "2024")
+        check("new 3" in out, "open-ended year slice queues 2024")
+        c3 = fresh_cli("limitdb")
+        out = c3.run("scan", str(folder), "--limit", "2")
+        check("new 2" in out, "limit caps newly queued photos")
+        ids = work / "ids.txt"
+        ids.write_text(f"{folder / 'a2013.jpg'}\n{folder / 'd2024.jpg'}\n")
+        c4 = fresh_cli("idsdb")
+        out = c4.run("scan", str(folder), "--ids-file", str(ids))
+        check("new 2" in out, "ids-file with paths queues exactly those")
+        c5 = fresh_cli("badslice")
+        out = c5.run("scan", str(folder), "--album", "Trip", expect=2)
+        check("photo libraries" in out, "album on a folder errors")
+        out = c5.run("scan", str(folder), "--favorites", expect=2)
+        check("photo libraries" in out, "favorites on a folder errors")
+
+        print("\n[18] slice scans on the library (album/favorites/uuid via apdb)")
+        c6 = fresh_cli("albumdb")
+        out = c6.run("scan", str(lib), "--album", "Trip")
+        check("new 2" in out, "album slice queues Trip members")
+        con = db_open(work / "db-albumdb.db")
+        check(count(con, "SELECT COUNT(*) FROM photos") == 2, "album queued exactly 2 photos")
+        con.close()
+        out = c6.run("scan", str(lib), "--album", "Nope", expect=2)
+        check("not found" in out, "unknown album errors")
+        c7 = fresh_cli("favdb")
+        out = c7.run("scan", str(lib), "--favorites")
+        check("new 2" in out, "favorites slice queues flagged photos")
+        uuidfile = work / "uuids.txt"
+        uuidfile.write_text("v3\n")
+        c8 = fresh_cli("uuiddb")
+        out = c8.run("scan", str(lib), "--ids-file", str(uuidfile))
+        check("new 1" in out, "ids-file with a uuid resolves via the library db")
+        uuidfile2 = work / "uuids2.txt"
+        uuidfile2.write_text("v3\nDEADBEEF\n")
+        c9 = fresh_cli("unknownuuid")
+        out = c9.run("scan", str(lib), "--ids-file", str(uuidfile2), expect=2)
+        check("not found in this library" in out, "unknown uuid errors")
+
+        print("\n[19] run applies slice filters to its scan phase")
+        c10 = fresh_cli("rundb")
+        out = c10.run("scan", str(lib), "--album", "Empty")
+        check("new 0" in out, "empty album queues nothing")
+        con = db_open(work / "db-rundb.db")
+        check(count(con, "SELECT COUNT(*) FROM sources") == 1, "source registered")
+        con.close()
+        out = c10.run("run", "--album", "Trip", "--skip-preflight")
+        check("Queue drained" in out, "run drains the slice queue")
+        con = db_open(work / "db-rundb.db")
+        check(
+            count(con, "SELECT COUNT(*) FROM photos WHERE status='done'") == 2,
+            "run processed exactly the album slice",
+        )
+        con.close()
+
+        print("\n[20] serve: read-only web UI")
+        web_port = free_port()
+        proc = subprocess.Popen(
+            cli.cmd + ["serve", "--port", str(web_port)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        base = f"http://127.0.0.1:{web_port}"
+        up = False
+        for _ in range(100):
+            try:
+                up = requests.get(base + "/", timeout=1).status_code == 200
+                if up:
+                    break
+            except Exception:
+                time.sleep(0.1)
+        check(up, "web UI comes up")
+        if up:
+            r = requests.get(base + "/")
+            check("4 photos" in r.text, "list page shows catalog counts")
+            check("/thumb/1" in r.text, "cards reference thumbnails")
+            r = requests.get(base + "/?q=MOCK")
+            check("4 match(es) for" in r.text, "web search finds matches")
+            check("MOCK EXTRACTED TEXT" in r.text, "web search shows snippets")
+            r = requests.get(base + "/?q=zzznothing")
+            check("0 match(es)" in r.text, "web search with no hits")
+            r = requests.get(base + "/photo/1")
+            check(r.status_code == 200 and "recovered text" in r.text, "detail page renders")
+            check(
+                "Old iPhoto Library.photolibrary" in r.text and ">library<" in r.text,
+                "detail shows the source library for each location",
+            )
+            check("reveal in Finder" in r.text, "detail offers reveal-in-Finder links")
+            r = requests.get(base + "/thumb/1")
+            check(
+                r.status_code == 200
+                and r.headers["Content-Type"] == "image/jpeg"
+                and len(r.content) > 100,
+                "thumbnail served",
+            )
+            r = requests.get(base + "/image/1")
+            check(
+                r.status_code == 200 and int(r.headers["Content-Length"]) > 100,
+                "original image served",
+            )
+            check(requests.get(base + "/photo/99999").status_code == 404, "unknown photo 404s")
+            check(requests.get(base + "/thumb/abc").status_code == 404, "non-numeric id 404s")
+            check(
+                requests.get(base + "/photo/../../etc/passwd").status_code == 404,
+                "path traversal is rejected",
+            )
+            check(
+                requests.get(base + "/reveal/1?loc=999999").status_code == 404,
+                "reveal with unknown location 404s",
+            )
+            check(
+                requests.get(base + "/reveal/99999?loc=1").status_code == 404,
+                "reveal for unknown photo 404s",
+            )
+            check(
+                requests.get(base + "/reveal/2?loc=1").status_code == 404,
+                "reveal cannot use another photo's location",
+            )
+        proc.terminate()
+        proc.wait(timeout=10)
+        c11 = fresh_cli("nosuchdb")
+        proc2 = subprocess.Popen(
+            c11.cmd + ["serve"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        out2, _ = proc2.communicate(timeout=30)
+        check(proc2.returncode == 2, "serve errors on a missing catalog")
+
+        print("\n[21] idle detection pauses while another model is loaded")
+        c12 = fresh_cli("idledb", "idle_poll_s = 1\n")
+        idle_folder = work / "idlefolder"
+        idle_folder.mkdir()
+        make_text_image(idle_folder / "one.jpg", ["idle one"])
+        make_text_image(idle_folder / "two.jpg", ["idle two"])
+        c12.run("scan", str(idle_folder))
+        ps_file.write_text("othermodel:7b\n")
+        runlog = work / "idle-run.log"
+        with open(runlog, "w") as logf:
+            idle_proc = subprocess.Popen(
+                c12.cmd + ["run", "--skip-preflight"],
+                stdout=logf,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+        paused = False
+        for _ in range(100):
+            if "paused: other model" in runlog.read_text():
+                paused = True
+                break
+            time.sleep(0.2)
+        check(paused, "run pauses while a foreign model is loaded")
+        ps_file.write_text("")
+        idle_proc.wait(timeout=60)
+        check(idle_proc.returncode == 0, "run finishes after the pause clears")
+        log = runlog.read_text()
+        check("resumed: Ollama is free" in log, "run reports resuming")
+        con = db_open(work / "db-idledb.db")
+        check(
+            count(con, "SELECT COUNT(*) FROM photos WHERE status='done'") == 2,
+            "paused run still processes everything",
+        )
+        reset_queued(con)
+        con.close()
+        ps_file.write_text("othermodel:7b\n")
+        out = c12.run("run", "--no-idle-detection", "--skip-preflight")
+        check("paused: other model" not in out, "--no-idle-detection skips the pause")
+        check("Queue drained" in out, "run drains without pausing")
+        ps_file.write_text("")
+
+        print("\n[22] repetition-loop salvage and bounded timeouts")
+        c13 = fresh_cli("loopdb")
+        loop_folder = work / "loopfolder"
+        loop_folder.mkdir()
+        make_text_image(loop_folder / "one.jpg", ["loop one"])
+        make_text_image(loop_folder / "two.jpg", ["loop two"])
+        c13.run("scan", str(loop_folder))
+        mode_file.write_text("junkonce")
+        out = c13.run("run", "--skip-preflight")
+        con = db_open(work / "db-loopdb.db")
+        check(
+            count(con, "SELECT COUNT(*) FROM photos WHERE status='done'") == 2,
+            "truncated-JSON output is salvaged by the anti-loop retry",
+        )
+        con.close()
+        mode_file.write_text("ok")
+
+        c14 = fresh_cli("timeoutdb", "request_timeout_s = 1\nmax_attempts = 2\n")
+        c14.run("scan", str(loop_folder))
+        mode_file.write_text("slow")
+        out = c14.run("run", "--skip-preflight")
+        con = db_open(work / "db-timeoutdb.db")
+        check(
+            count(con, "SELECT COUNT(*) FROM photos WHERE status='error'") == 2,
+            "request timeouts mark photos as errors after bounded attempts",
+        )
+        check(
+            count(con, "SELECT COUNT(*) FROM photos WHERE error LIKE '%timeout%'") == 2,
+            "timeout errors are recorded",
+        )
+        con.close()
+        mode_file.write_text("ok")
+
+        print("\n[23] tiling fallback for photos the single pass cannot parse")
+        c15 = fresh_cli("tiledb")
+        tile_folder = work / "tilefolder"
+        tile_folder.mkdir()
+        make_text_image(tile_folder / "dense.jpg", ["DENSE RECEIPT LINE ONE", "TOTAL DUE 99"])
+        make_text_image(tile_folder / "plain.jpg", ["plain photo"])
+        c15.run("scan", str(tile_folder))
+        mode_file.write_text("junkfirst2")
+        out = c15.run("run", "--skip-preflight")
+        check("(tiled)" in out, "dense photo falls back to quadrant tiling")
+        con = db_open(work / "db-tiledb.db")
+        check(
+            count(con, "SELECT COUNT(*) FROM photos WHERE tiled=1 AND status='done'") == 1,
+            "tiling recorded and completed",
+        )
+        check(
+            count(con, "SELECT COUNT(*) FROM photos WHERE status='done'") == 2,
+            "the plain photo still extracts normally",
+        )
+        check(
+            count(con, "SELECT COUNT(*) FROM photos WHERE raw_response LIKE '%tile boundary%'") == 1,
+            "tiled raw responses are kept with boundaries",
+        )
+        con.close()
+        mode_file.write_text("ok")
+
+        print("\n[24] reprocess selections")
+        out = c15.run("reprocess", "--tiled")
+        check("requeued 1" in out, "reprocess --tiled selects the tiled photo")
+        out = c15.run("run", "--skip-preflight", "--limit", "5")
+        check("Queue drained" in out, "requeued photo reprocessed")
+        con = db_open(work / "db-tiledb.db")
+        con.execute("UPDATE photos SET has_text=0 WHERE id=1")
+        con.execute("UPDATE photos SET status='error' WHERE id=2")
+        con.commit()
+        con.close()
+        out = c15.run("reprocess", "--no-text")
+        check("requeued 1" in out, "reprocess --no-text selects no-text photos")
+        out = c15.run("reprocess", "--errors")
+        check("requeued 1" in out, "reprocess --errors selects failed photos")
+        idsfile = work / "reprocess-ids.txt"
+        idsfile.write_text(f"2\n{tile_folder / 'dense.jpg'}\n")
+        out = c15.run("reprocess", "--ids-file", str(idsfile))
+        check("requeued 2" in out, "reprocess --ids-file accepts ids and paths")
+        c15.run("reprocess", expect=2)
+        out = c15.run("run", "--skip-preflight")
+        check("Queue drained" in out, "reprocess queue drains")
+
+        print("\n[25] watch mode picks up new photos as they appear")
+        c16 = fresh_cli("watchdb")
+        watch_folder = work / "watchfolder"
+        watch_folder.mkdir()
+        make_text_image(watch_folder / "a.jpg", ["watch a"])
+        make_text_image(watch_folder / "b.jpg", ["watch b"])
+        c16.run("scan", str(watch_folder))
+        watchlog = work / "watch-run.log"
+        with open(watchlog, "w") as logf:
+            watch_proc = subprocess.Popen(
+                c16.cmd
+                + ["run", "--watch", "--watch-interval", "1", "--skip-preflight"],
+                stdout=logf,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+
+        def wait_for(predicate, tries: int = 100) -> bool:
+            for _ in range(tries):
+                if predicate():
+                    return True
+                time.sleep(0.2)
+            return False
+
+        con = db_open(work / "db-watchdb.db")
+        drained = wait_for(
+            lambda: count(con, "SELECT COUNT(*) FROM photos WHERE status='done'") == 2
+        )
+        check(drained, "watch mode processes the initial queue")
+        make_text_image(watch_folder / "c.jpg", ["watch c"])
+        picked_up = wait_for(
+            lambda: count(con, "SELECT COUNT(*) FROM photos WHERE status='done'") == 3
+        )
+        check(picked_up, "watch mode picks up and processes a new photo")
+        con.close()
+        watch_proc.terminate()
+        watch_proc.wait(timeout=30)
+        log = watchlog.read_text()
+        check("Watching 1 source(s)" in log, "watch mode announces watching")
+        check("watch: 1 new photo(s) queued" in log, "watch mode reports new arrivals")
+
+        print("\n[26] meme identification via perceptual hash")
+        c17 = fresh_cli("memedb")
+        meme_folder = work / "memefolder"
+        meme_folder.mkdir()
+        make_text_image(meme_folder / "m1.jpg", ["WHEN THE CODE WORKS"])
+        im = Image.open(meme_folder / "m1.jpg").crop((4, 4, 636, 476))
+        ImageEnhance.Brightness(im).enhance(1.05).save(meme_folder / "m2.jpg")
+        Image.effect_noise((640, 480), 100).convert("RGB").save(meme_folder / "other.jpg")
+        c17.run("scan", str(meme_folder))
+        c17.run("run", "--skip-preflight")
+        con = db_open(work / "db-memedb.db")
+        check(
+            count(con, "SELECT COUNT(*) FROM photos WHERE phash IS NOT NULL") == 3,
+            "perceptual hashes computed at scan time",
+        )
+        con.close()
+        out = c17.run("memes")
+        check("1 meme-like group" in out, "memes finds the near-identical pair")
+        check("MOCK EXTRACTED TEXT" in out, "group text snippet is shown")
+        check("other.jpg" not in out, "unrelated photos are not grouped")
+        meme_port = free_port()
+        meme_proc = subprocess.Popen(
+            c17.cmd + ["serve", "--port", str(meme_port)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        meme_base = f"http://127.0.0.1:{meme_port}"
+        if wait_for(lambda: _try_get(meme_base + "/memes") is not None, tries=50):
+            r = _try_get(meme_base + "/memes")
+            check("1 meme-like group" in r.text, "web UI shows meme groups")
+            r = _try_get(meme_base + "/")
+            check("Memes" in r.text, "web UI links the Memes tab")
+        else:
+            check(False, "memes web page comes up")
+        meme_proc.terminate()
+        meme_proc.wait(timeout=10)
+
+        print("\n[27] multi-process workers with stale-lease recovery")
+        c18 = fresh_cli("workdb")
+        work_folder = work / "workfolder"
+        work_folder.mkdir()
+        for name in ("w1.jpg", "w2.jpg", "w3.jpg", "w4.jpg"):
+            make_text_image(work_folder / name, [f"worker {name}"])
+        c18.run("scan", str(work_folder))
+        out = c18.run("run", "--workers", "2", "--skip-preflight")
+        check("All workers finished." in out, "multi-worker run completes")
+        check("[w1]" in out and "[w2]" in out, "worker output is prefixed")
+        con = db_open(work / "db-workdb.db")
+        check(
+            count(con, "SELECT COUNT(*) FROM photos WHERE status='done'") == 4,
+            "both workers processed the queue",
+        )
+        stale = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat(timespec="seconds")
+        con.execute(
+            "UPDATE photos SET status='processing', started_at=? "
+            "WHERE id IN (SELECT id FROM photos ORDER BY id LIMIT 1)",
+            (stale,),
+        )
+        con.commit()
+        con.close()
+        out = c18.run("run", "--workers", "2", "--skip-preflight", "--no-scan")
+        check("reclaimed 1 stale" in out, "stale worker leases are reclaimed")
+        con = db_open(work / "db-workdb.db")
+        check(
+            count(con, "SELECT COUNT(*) FROM photos WHERE status='done'") == 4,
+            "reclaimed photo is reprocessed",
+        )
+        con.close()
+        c18.run("run", "--workers", "2", "--limit", "2", expect=2)
+
+        print("\n[28] two-tier gate: textless photos finish at the cheap tier")
+        c19 = fresh_cli("gatedb", 'two_tier = true\nprefilter_model = "gemma3:mock"\n')
+        gate_folder = work / "gatefolder"
+        gate_folder.mkdir()
+        make_text_image(gate_folder / "g1.jpg", ["gate one"])
+        make_text_image(gate_folder / "g2.jpg", ["gate two"])
+        c19.run("scan", str(gate_folder))
+        out = c19.run("run", "--skip-preflight")
+        check("(gated)" not in out, "text photos skip the gate tier")
+        con = db_open(work / "db-gatedb.db")
+        check(
+            count(con, "SELECT COUNT(*) FROM photos WHERE gated=1") == 0,
+            "gate says has_text -> full pass",
+        )
+        check(
+            count(con, "SELECT COUNT(*) FROM photos WHERE category='document'") == 2,
+            "full pass fills category",
+        )
+        con.close()
+        mode_file.write_text("gatenotext")
+        c20 = fresh_cli("gatedb2", 'two_tier = true\nprefilter_model = "gemma3:mock"\n')
+        c20.run("scan", str(gate_folder))
+        out = c20.run("run", "--skip-preflight")
+        check("(gated)" in out, "textless photos finish at the gate tier")
+        con = db_open(work / "db-gatedb2.db")
+        check(
+            count(con, "SELECT COUNT(*) FROM photos WHERE gated=1 AND has_text=0") == 2,
+            "gate tier recorded and textless",
+        )
+        check(
+            count(con, "SELECT COUNT(*) FROM photos WHERE model='gemma3:mock'") == 2,
+            "gate model recorded for gated photos",
+        )
+        check(
+            count(con, "SELECT COUNT(*) FROM photos WHERE category='scene'") == 2,
+            "gate fills category",
+        )
+        con.close()
+        out = c20.run("reprocess", "--gated")
+        check("requeued 2" in out, "reprocess --gated re-selects gate-tier photos")
+        mode_file.write_text("ok")
+        out = c20.run("run", "--skip-preflight")
+        con = db_open(work / "db-gatedb2.db")
+        check(
+            count(con, "SELECT COUNT(*) FROM photos WHERE gated=0 AND model='gemma4:mock'") == 2,
+            "reprocessed photos upgrade to the full model",
+        )
+        con.close()
+        out = c20.run("categories")
+        check("document" in out, "categories lists what the models assigned")
+        gate_port = free_port()
+        gate_proc = subprocess.Popen(
+            c20.cmd + ["serve", "--port", str(gate_port)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        gate_base = f"http://127.0.0.1:{gate_port}"
+        if wait_for(lambda: _try_get(gate_base + "/") is not None, tries=50):
+            r = _try_get(gate_base + "/?category=document")
+            check("2 photo(s) with status 'all'" in r.text, "web category filter works")
+            r = _try_get(gate_base + "/?text=no")
+            check("0 photo(s)" in r.text, "web text filter works")
+        else:
+            check(False, "gate web UI comes up")
+        gate_proc.terminate()
+        gate_proc.wait(timeout=10)
+
+        print("\n[29] help command")
+        out = cli.run("--version")
+        check(
+            re.search(r"^phototext \d+\.\d+", out) is not None,
+            "--version prints the version",
+        )
+        out = cli.run("help")
+        check("GETTING STARTED" in out, "help prints the usage guide")
+        out = cli.run("help", "search")
+        check("search [OPTIONS] {query}" in out, "help for a command shows its help")
+        cli.run("help", "nosuchcmd", expect=2)
+        out = c19.run("search", "MOCK", "--category", "document")
+        check("2 match(es)" in out, "search filters by category")
+        out = c19.run("search", "MOCK", "--category", "scene")
+        check("no matches" in out, "search category filter excludes others")
+
+        print("\n[30] hide, delete, and the trash bin")
+        c21 = fresh_cli("hidedb")
+        hide_folder = work / "hidefolder"
+        hide_folder.mkdir()
+        make_text_image(hide_folder / "h1.jpg", ["hide one"])
+        make_text_image(hide_folder / "h2.jpg", ["hide two"])
+        c21.run("scan", str(hide_folder))
+        c21.run("run", "--skip-preflight")
+        out = c21.run("hide", "1")
+        check("hid 1" in out, "hide command works")
+        out = c21.run("search", "MOCK")
+        check("1 match(es)" in out, "hidden photos are excluded from search")
+        out = c21.run("search", "MOCK", "--hidden")
+        check("2 match(es)" in out, "search --hidden includes hidden photos")
+        out = c21.run("unhide", "1")
+        check("unhid 1" in out, "unhide restores visibility")
+        out = c21.run("delete", "2")
+        check("moved 1" in out, "delete moves to the trash")
+        out = c21.run("trash")
+        check("[2]" in out, "trash lists deleted photos")
+        out = c21.run("search", "MOCK")
+        check("1 match(es)" in out, "deleted photos are excluded")
+        out = c21.run("scan", str(hide_folder))
+        check("new 0" in out, "rescan does not resurrect deleted photos (tombstone)")
+        out = c21.run("restore", "2")
+        check("restored 1" in out, "restore brings photos back")
+        out = c21.run("search", "MOCK")
+        check("2 match(es)" in out, "restored photo is searchable again")
+        make_text_image(hide_folder / "h3.jpg", ["hide three"])
+        c21.run("scan", str(hide_folder))
+        out = c21.run("delete", "3")
+        check("moved 1" in out, "a queued photo can be deleted")
+        out = c21.run("run", "--skip-preflight")
+        check("Nothing to process" in out, "deleted queued photo is not processed")
+        con = db_open(work / "db-hidedb.db")
+        check(
+            count(con, "SELECT COUNT(*) FROM photos WHERE status='done'") == 2,
+            "done count unchanged after deleting queued photo",
+        )
+        con.close()
+        out = c21.run("purge", "3")
+        check("purged 1" in out, "purge forgets permanently")
+        con = db_open(work / "db-hidedb.db")
+        check(count(con, "SELECT COUNT(*) FROM photos") == 2, "purged row gone")
+        con.close()
+        out = c21.run("scan", str(hide_folder))
+        check("new 1" in out, "rescan re-adds purged photos")
+        out = c21.run("status")
+        check("[1] [folder]" in out, "status lists source ids")
+        hide_port = free_port()
+        hide_proc = subprocess.Popen(
+            c21.cmd + ["serve", "--port", str(hide_port)],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        hide_base = f"http://127.0.0.1:{hide_port}"
+        if wait_for(lambda: _try_get(hide_base + "/") is not None, tries=50):
+            r = requests.post(f"{hide_base}/delete/1", data={"token": "x"}, timeout=5)
+            check(r.status_code == 404, "read-only server rejects write actions")
+            detail = _try_get(hide_base + "/photo/1")
+            check("name='token'" not in detail.text, "read-only server hides action forms")
+        else:
+            check(False, "read-only serve comes up")
+        hide_proc.terminate()
+        hide_proc.wait(timeout=10)
+        wr_port = free_port()
+        wr_proc = subprocess.Popen(
+            c21.cmd + ["serve", "--port", str(wr_port), "--writable"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        wr_base = f"http://127.0.0.1:{wr_port}"
+        if wait_for(lambda: _try_get(wr_base + "/photo/1") is not None, tries=50):
+            detail = _try_get(wr_base + "/photo/1")
+            m = re.search(r"name='token' value='([0-9a-f]+)'", detail.text)
+            check(m is not None, "writable server embeds the token")
+            if m:
+                token = m.group(1)
+                r = requests.post(
+                    f"{wr_base}/delete/1", data={"token": token}, timeout=5,
+                    allow_redirects=False,
+                )
+                check(r.status_code == 303, "tokened delete redirects")
+                con = db_open(work / "db-hidedb.db")
+                check(
+                    count(con, "SELECT COUNT(*) FROM photos WHERE deleted_at IS NOT NULL") == 1,
+                    "web delete lands in the trash",
+                )
+                con.close()
+                r = requests.post(f"{wr_base}/delete/2", data={"token": "bad"}, timeout=5)
+                check(r.status_code == 403, "wrong token is rejected")
+                r = requests.post(f"{wr_base}/delete/2", timeout=5)
+                check(r.status_code == 403, "missing token is rejected")
+        else:
+            check(False, "writable serve comes up")
+        wr_proc.terminate()
+        wr_proc.wait(timeout=10)
+
+        print("\n[31] unscan removes a source and its unique photos")
+        c22 = fresh_cli("unscandb")
+        hide_src = work / "unscan-shared"
+        hide_src.mkdir()
+        (hide_src / "dup.jpg").write_bytes((hide_folder / "h1.jpg").read_bytes())
+        c22.run("scan", str(hide_src))
+        unscan_folder = work / "unscanfolder"
+        unscan_folder.mkdir()
+        (unscan_folder / "dup.jpg").write_bytes((hide_folder / "h1.jpg").read_bytes())
+        make_text_image(unscan_folder / "unique.jpg", ["only here"])
+        out = c22.run("scan", str(unscan_folder))
+        check("new 1" in out, "duplicate content dedups across sources")
+        con = db_open(work / "db-unscandb.db")
+        check(count(con, "SELECT COUNT(*) FROM photos") == 2, "two photos registered")
+        con.close()
+        out = c22.run("unscan", str(unscan_folder))
+        check("forgotten 1" in out, "unscan forgets photos only seen there")
+        con = db_open(work / "db-unscandb.db")
+        check(count(con, "SELECT COUNT(*) FROM photos") == 1, "shared photo survives")
+        check(count(con, "SELECT COUNT(*) FROM sources") == 1, "source unregistered")
+        con.close()
+        c22.run("unscan", "99", expect=2)
+
+        print("\n[32] warnings and the decompression-bomb guard")
+        c23 = fresh_cli("bombdb", "max_image_pixels = 1000\n")
+        bomb_folder = work / "bombfolder"
+        bomb_folder.mkdir()
+        make_text_image(bomb_folder / "big.jpg", ["looks innocent"])
+        out = c23.run("scan", str(bomb_folder))
+        check("new 1" in out, "oversized photo still registers at scan time")
+        out = c23.run("run", "--skip-preflight")
+        con = db_open(work / "db-bombdb.db")
+        check(
+            count(con, "SELECT COUNT(*) FROM photos WHERE status='error' "
+                       "AND error LIKE '%pixels%'") == 1,
+            "pixel budget exceeded is a recorded error (no sips fallback)",
+        )
+        con.close()
+        con = db_open(work / "db-bombdb.db")
+        db_ok = con.execute("SELECT id FROM photos LIMIT 1").fetchone()[0]
+        con.close()
+        from phototext import db as dbmod
+
+        con = db_open(work / "db-bombdb.db")
+        con.row_factory = None
+        dbmod.record_warning(con, db_ok, "TestWarning", "first")
+        dbmod.record_warning(con, db_ok, "TestWarning", "first")
+        con.commit()
+        rows = con.execute(
+            "SELECT COUNT(*) FROM photo_warnings WHERE photo_id=?", (db_ok,)
+        ).fetchone()[0]
+        check(rows == 1, "warnings are deduped per photo+kind+message")
+        con.close()
+        out = c23.run("results", "--status", "error")
+        check("warning: TestWarning" in out, "results shows recorded warnings")
+        out = c23.run("status")
+        check("warnings: 1" in out, "status counts warnings")
+
+        print("\n[33] deferred photos (iCloud inventory, promotion)")
+        c24 = fresh_cli("deferdb")
+        defer_folder = work / "deferfolder"
+        defer_folder.mkdir()
+        make_text_image(defer_folder / "real.jpg", ["real file"])
+        c24.run("scan", str(defer_folder))
+        con = db_open(work / "db-deferdb.db")
+        con.row_factory = None
+        photo_id = con.execute("SELECT id FROM photos LIMIT 1").fetchone()[0]
+        digest = con.execute("SELECT sha256 FROM photos WHERE id=?", (photo_id,)).fetchone()[0]
+        dbmod.ensure_deferred_photo(con, 1, "CLOUD-1", None, False)
+        dbmod.ensure_deferred_photo(con, 1, "CLOUD-2", str(defer_folder / "real.jpg"), True)
+        con.commit()
+        check(
+            con.execute("SELECT COUNT(*) FROM photos WHERE status='deferred'").fetchone()[0] == 1,
+            "cloud-only photo without preview is deferred",
+        )
+        check(
+            con.execute("SELECT COUNT(*) FROM photos WHERE status='queued' AND derivative=1").fetchone()[0] == 1,
+            "cloud-only photo with preview is queued and flagged",
+        )
+        con.close()
+        out = c24.run("run", "--skip-preflight")
+        check("deferred 1" in out or "queued 1" in out, "run reports deferred photos separately")
+        con = db_open(work / "db-deferdb.db")
+        con.row_factory = None
+        check(
+            con.execute("SELECT COUNT(*) FROM photos WHERE status='deferred'").fetchone()[0] == 1,
+            "deferred photos are never claimed",
+        )
+        kept = con.execute("SELECT id FROM photos WHERE sha256=?", (digest,)).fetchone()[0]
+        promoted = dbmod.promote_deferred(
+            con, "CLOUD-1", digest, 123, 1, str(defer_folder / "real.jpg"), 1,
+        )
+        con.commit()
+        check(
+            con.execute("SELECT COUNT(*) FROM photos WHERE sha256 LIKE 'deferred:%'").fetchone()[0] == 1,
+            "promotion collapses the deferred row into the content row",
+        )
+        con.close()
+    finally:
+        mock.terminate()
+        mock.wait()
+
+    print("\n[34] shell autocomplete install")
+    sandbox = work / "home34"
+    sandbox.mkdir()
+    old_home = os.environ.get("HOME")
+    os.environ["HOME"] = str(sandbox)
+    try:
+        out = c24.run("autocomplete", "zsh")
+        check(
+            (sandbox / ".zfunc" / "_phototext").is_file(),
+            "zsh completion script written",
+        )
+        zshrc = (sandbox / ".zshrc").read_text()
+        check("zfunc" in zshrc and "compinit" in zshrc, "zshrc wires fpath + compinit")
+        c24.run("autocomplete", "zsh")
+        check(
+            sandbox.joinpath(".zshrc").read_text().count("fpath+=~/.zfunc") == 1,
+            "re-running does not duplicate rc lines",
+        )
+        out = c24.run("autocomplete", "bash")
+        check(
+            (sandbox / ".bash_completions" / "phototext.sh").is_file(),
+            "bash completion script written",
+        )
+        check(
+            ".bash_completions/phototext.sh" in (sandbox / ".bashrc").read_text(),
+            "bashrc sources the completion script",
+        )
+        c24.run("autocomplete", "nosuchshell", expect=2)
+        console = Path(sys.executable).parent / "phototext"
+        proc = subprocess.run(
+            [str(console)],
+            env={**os.environ, "_PHOTOTEXT_COMPLETE": "complete_bash",
+                 "COMP_WORDS": "phototext sc", "COMP_CWORD": "1"},
+            capture_output=True, text=True, timeout=60,
+        )
+        check(
+            proc.stdout.strip() == "scan",
+            f"completion runtime answers with matching commands (got: {proc.stdout.strip()!r})",
+        )
+    finally:
+        if old_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = old_home
+
+    print("\n[35] named profiles")
+    c25 = fresh_cli("profdb")
+    prof_src = work / "proffolder"
+    prof_src.mkdir()
+    make_text_image(prof_src / "one.jpg", ["profile text"])
+    c25.run("--profile", "memes", "scan", str(prof_src))
+    prof_db = work / "profiles" / "memes" / "catalog.db"
+    check(prof_db.is_file(), "profile catalog created under profiles/<name>/")
+    con = db_open(prof_db)
+    check(count(con, "SELECT COUNT(*) FROM photos") == 1, "profile catalog has the photo")
+    con.close()
+    out = c25.run("status")
+    check("0 photo" in out, "default catalog untouched by profile scan")
+    out = c25.run("--profile", "memes", "status")
+    check("1 photo" in out, "profile status sees its photos")
+    out = c25.run("profiles")
+    check("memes" in out and "1 photo" in out, "profiles lists profile with counts")
+    c25.run("--profile", "../evil", "status", expect=2)
+    (work / "profiles" / "memes" / "config.toml").write_text(
+        f'ollama_url = "http://127.0.0.1:{port}"\nmodel = "{MODEL}"\n'
+    )
+    out = c25.run("--profile", "memes", "status")
+    check("1 photo" in out, "profile config.toml replaces base config")
+
+    print()
+    if FAILURES:
+        print(f"{len(FAILURES)} FAILURE(S):")
+        for f in FAILURES:
+            print(f"  - {f}")
+        return 1
+    print("ALL TESTS PASSED")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

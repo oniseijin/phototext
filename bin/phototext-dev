@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Run the workspace copy of phototext via the repo dev venv (.venv).
+# Uses the default dev state (~/.phototext), never the installed var/ layout.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+if [ ! -x "$ROOT/.venv/bin/phototext" ]; then
+  echo "phototext-dev: $ROOT/.venv/bin/phototext is missing." >&2
+  echo "create it with:  cd \"$ROOT\" && uv venv .venv && uv pip install -e ." >&2
+  exit 1
+fi
+exec "$ROOT/.venv/bin/phototext" "$@"
