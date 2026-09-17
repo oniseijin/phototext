@@ -4,6 +4,32 @@ All notable changes to phototext are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 semantic versioning.
 
+## [Unreleased]
+
+## [0.2.0] - 2026-09-17
+
+### Added
+
+- People identification and tagging (migration 9). Name a person from one
+  photo — in the web UI by dragging a box around a face, or
+  `phototext people name <photo-id> <name> --box x,y,w,h` — and the model
+  builds a recognition profile from the seed crop(s).
+- `phototext people run`: a matching pass that evaluates every photo
+  against all registered people in a single model call per photo
+  (defaults to the fast `person_model`, i.e. the prefilter). Resumable;
+  absent verdicts are remembered so re-runs only cover new ground.
+- Confidence + review queue: model tags below `person_min_confidence`
+  (0.6) are flagged for review; confirm or remove them in the web UI or
+  via `phototext people confirm/remove`. Confirmed and seed tags are
+  ground truth the model never overwrites.
+- `phototext people list/photos/rename/reset/delete/describe` management
+  commands; `reset` drops model tags but keeps seeds and confirmations.
+- Web UI People tab: person cards with face crops, per-person pages with
+  the review queue, and (with `--writable`) the face-box picker, tag
+  chips with confirm/remove, and rename/reset/delete — all behind the
+  existing session-token + Origin gate. `?person=` filter and
+  `phototext search --person NAME` narrow results to a person.
+
 ## [0.1.0] - 2026-09-17
 
 Initial release.

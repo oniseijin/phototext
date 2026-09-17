@@ -73,6 +73,16 @@ def make_plain_image(path: Path) -> None:
     ImageOps.colorize(gradient, "navy", "orange").save(path)
 
 
+def make_person_image(path: Path, color: str) -> None:
+    im = Image.new("RGB", (640, 480), color)
+    d = ImageDraw.Draw(im)
+    d.text(
+        (40, 40), "person photo",
+        fill="black" if color == "white" else "white", font=font(),
+    )
+    im.save(path)
+
+
 def build_library(work: Path) -> Path:
     from pillow_heif import register_heif_opener
 
@@ -467,18 +477,20 @@ def main() -> int:
             "ALTER TABLE photos DROP COLUMN deleted_at; "
             "ALTER TABLE photos DROP COLUMN derivative; "
             "DROP TABLE IF EXISTS photo_warnings; "
+            "DROP TABLE IF EXISTS person_tags; "
+            "DROP TABLE IF EXISTS people; "
             "DELETE FROM schema_version WHERE version >= 2;"
         )
         con.commit()
         con.close()
         out = cli.run("migrate", "--dry-run")
         check(
-            "pending migration(s): v2, v3, v4, v5, v6, v7, v8" in out,
+            "pending migration(s): v2, v3, v4, v5, v6, v7, v8, v9" in out,
             "dry run reports pending migrations",
         )
         check("dry run: nothing applied" in out, "dry run applies nothing")
         out = cli.run("migrate")
-        check("migrated: v1 -> v8" in out, "migrate applies pending migrations")
+        check("migrated: v1 -> v9" in out, "migrate applies pending migrations")
         check("backup:" in out, "migrate backs up first")
         con = db_open(db_path)
         check(count(con, "SELECT COUNT(*) FROM photos_fts") == 4, "fts rebuilt with 4 rows")
@@ -1162,6 +1174,214 @@ def main() -> int:
             "promotion collapses the deferred row into the content row",
         )
         con.close()
+
+        print("\n[36] people: name, match, review, reset, search, web UI")
+        ppl_dir = work / "peopledir"
+        ppl_dir.mkdir()
+        ppl_cfg = work / "config-peopledb.toml"
+        ppl_cfg.write_text(
+            f'ollama_url = "http://127.0.0.1:{port}"\n'
+            f'model = "{MODEL}"\n'
+            f'db_path = "{ppl_dir}/catalog.db"\n'
+            "person_min_confidence = 0.6\n"
+        )
+        c26 = CLI(ppl_cfg)
+        ppl_src = work / "peoplefolder"
+        ppl_src.mkdir()
+        make_person_image(ppl_src / "red.jpg", "red")
+        make_person_image(ppl_src / "green.jpg", "lime")  # bright green: mock keys on g>150
+        make_person_image(ppl_src / "plain.jpg", "white")
+        c26.run("scan", str(ppl_src))
+        c26.run("run", "--skip-preflight")
+        con = db_open(ppl_dir / "catalog.db")
+        con.row_factory = None
+
+        def pid_of(name: str) -> int:
+            return con.execute(
+                "SELECT p.id FROM photos p JOIN locations l ON l.photo_id = p.id "
+                "WHERE l.path LIKE ?", (f"%{name}%",),
+            ).fetchone()[0]
+
+        red_id, green_id, plain_id = pid_of("red.jpg"), pid_of("green.jpg"), pid_of("plain.jpg")
+        out = c26.run("people", "name", str(red_id), "Ryan", "--box", "200,100,240,260")
+        check("person 'Ryan' seeded" in out, "people name creates a seed")
+        check("MOCK PERSON PROFILE" in out, "recognition profile built from the seed crop")
+        ryan_id = con.execute("SELECT id FROM people WHERE name='Ryan'").fetchone()[0]
+        check(
+            (ppl_dir / "people" / str(ryan_id) / f"seed-{red_id}.jpg").is_file(),
+            "seed face crop saved on disk",
+        )
+        check(
+            con.execute(
+                "SELECT COUNT(*) FROM person_tags WHERE person_id=? AND origin='seed' "
+                "AND box='200,100,240,260'", (ryan_id,),
+            ).fetchone()[0] == 1,
+            "seed tag stored with its box",
+        )
+        c26.run("people", "name", str(red_id), "Ryan", "--box", "junk", expect=2)
+        out = c26.run("people", "name", str(red_id), "Sam", "--box", "10,10,300,300")
+        check("person 'Sam' seeded" in out, "second person seeded on the same photo")
+        sam_id = con.execute("SELECT id FROM people WHERE name='Sam'").fetchone()[0]
+        out = c26.run("people", "list")
+        check("Ryan" in out and "Sam" in out, "people list shows both people")
+        out = c26.run("people", "photos", "Ryan")
+        check(f"[{red_id}]" in out and "seed" in out, "people photos shows the seed")
+        c26.run("people", "photos", "NoSuchPerson", expect=2)
+
+        out = c26.run("people", "run")
+        check("Matching 2 photo(s) against 2 person(s)" in out, "run evaluates the untagged photos")
+        check("2 tag(s) added (2 below threshold)" in out, "green tagged below threshold for both")
+        check("2 marked absent" in out, "plain recorded absent for both people")
+        green_conf = con.execute(
+            "SELECT confidence FROM person_tags WHERE photo_id=? AND person_id=?",
+            (green_id, ryan_id),
+        ).fetchone()[0]
+        check(abs(green_conf - 0.45) < 0.01, "green tag carries the model confidence")
+        check(
+            con.execute(
+                "SELECT COUNT(*) FROM person_tags WHERE photo_id=? AND present=0",
+                (plain_id,),
+            ).fetchone()[0] == 2,
+            "absent rows recorded for both people",
+        )
+        out = c26.run("people", "run")
+        check("nothing to do" in out, "re-run skips fully evaluated photos")
+        out = c26.run("people", "photos", "Ryan")
+        check("review" in out, "uncertain tag flagged for review")
+        out = c26.run("people", "confirm", str(green_id), "Ryan")
+        check("confirmed 'Ryan'" in out, "confirm promotes the tag to ground truth")
+        out = c26.run("people", "reset", "Ryan")
+        check("cleared 1 model tag(s)" in out, "reset drops model tags, keeps seeds and confirmed")
+        out = c26.run("people", "run", "--person", "Ryan")
+        check("Matching 1 photo(s)" in out, "reset photos become candidates again")
+        out = c26.run("search", "MOCK", "--person", "Ryan")
+        check("2 match(es)" in out, "search --person finds the tagged photos")
+        out = c26.run("search", "MOCK", "--person", "Sam")
+        check("2 match(es)" in out, "search --person Sam matches seed + model tag")
+        out = c26.run("people", "remove", str(green_id), "Ryan")
+        check("removed 'Ryan'" in out, "remove deletes a tag")
+        out = c26.run("search", "MOCK", "--person", "Ryan")
+        check("1 match(es)" in out, "search reflects the removed tag")
+        out = c26.run("people", "rename", "Ryan", "Ry")
+        check("renamed 'Ryan' -> 'Ry'" in out, "rename works")
+        c26.run("people", "rename", "Ry", "Sam", expect=2)
+
+        web_port = free_port()
+        proc = subprocess.Popen(
+            c26.cmd + ["serve", "--port", str(web_port), "--writable"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        wr_base = f"http://127.0.0.1:{web_port}"
+        up = False
+        for _ in range(100):
+            try:
+                up = requests.get(wr_base + "/", timeout=1).status_code == 200
+                if up:
+                    break
+            except Exception:
+                time.sleep(0.1)
+        check(up, "writable web UI comes up for people")
+        if up:
+            detail = requests.get(f"{wr_base}/photo/{red_id}")
+            m = re.search(r"name='token' value='([0-9a-f]+)'", detail.text)
+            token = m.group(1) if m else ""
+            check("pickimg" in detail.text, "detail page embeds the face-box picker")
+            check("drag a box around a face" in detail.text, "detail page explains the picker")
+            check("Ry &mdash; seed" in detail.text or "Ry — seed" in detail.text,
+                  "detail page shows the person chip")
+            r = requests.get(f"{wr_base}/people")
+            check("Ry" in r.text and "Sam" in r.text, "people page lists people")
+            r = requests.get(f"{wr_base}/person/{sam_id}")
+            check("review queue" in r.text, "person page shows the review queue")
+            check("reset model tags" in r.text, "person page offers reset/rename/delete")
+            r = requests.get(f"{wr_base}/face/{ryan_id}/{red_id}")
+            check(
+                r.status_code == 200 and r.headers["Content-Type"] == "image/jpeg",
+                "seed face crop is served",
+            )
+            check(requests.get(f"{wr_base}/person/999").status_code == 404,
+                  "unknown person 404s")
+            r = requests.post(
+                f"{wr_base}/person/tag",
+                data={"photo_id": plain_id, "name": "Web Person",
+                      "box": "5,5,120,120", "token": token},
+                timeout=30, allow_redirects=False,
+            )
+            check(r.status_code == 303, "web tag creates a person (redirects)")
+            web_id = None
+            try:
+                web_id = con.execute(
+                    "SELECT id FROM people WHERE name='Web Person'"
+                ).fetchone()[0]
+            except TypeError:
+                pass
+            check(web_id is not None, "web tag persisted the person")
+            if web_id is not None:
+                check(
+                    con.execute(
+                        "SELECT COUNT(*) FROM person_tags WHERE person_id=? "
+                        "AND origin='seed' AND box='5,5,120,120'", (web_id,),
+                    ).fetchone()[0] == 1,
+                    "web tag stored the seed and box",
+                )
+                check(
+                    con.execute(
+                        "SELECT description FROM people WHERE id=?", (web_id,),
+                    ).fetchone()[0] is not None,
+                    "web tag built a recognition profile via Ollama",
+                )
+            r = requests.post(
+                f"{wr_base}/person/confirm",
+                data={"photo_id": green_id, "person_id": sam_id, "token": token},
+                timeout=5, allow_redirects=False,
+            )
+            check(r.status_code == 303, "web confirm redirects")
+            check(
+                con.execute(
+                    "SELECT origin FROM person_tags WHERE photo_id=? AND person_id=?",
+                    (green_id, sam_id),
+                ).fetchone()[0] == "user",
+                "web confirm persisted",
+            )
+            r = requests.post(
+                f"{wr_base}/person/remove",
+                data={"photo_id": green_id, "person_id": sam_id, "token": token},
+                timeout=5, allow_redirects=False,
+            )
+            check(r.status_code == 303 and con.execute(
+                "SELECT COUNT(*) FROM person_tags WHERE photo_id=? AND person_id=?",
+                (green_id, sam_id),
+            ).fetchone()[0] == 0, "web remove persisted")
+            r = requests.post(
+                f"{wr_base}/person/rename",
+                data={"person_id": web_id, "name": "Web Renamed", "token": token},
+                timeout=5, allow_redirects=False,
+            )
+            check(r.status_code == 303 and con.execute(
+                "SELECT COUNT(*) FROM people WHERE name='Web Renamed'"
+            ).fetchone()[0] == 1, "web rename persisted")
+            r = requests.post(
+                f"{wr_base}/person/tag",
+                data={"photo_id": plain_id, "name": "Nope"},
+                timeout=5, allow_redirects=False,
+            )
+            check(r.status_code == 403, "missing token rejected")
+            r = requests.post(
+                f"{wr_base}/person/reset",
+                data={"person_id": "", "token": token},
+                timeout=5, allow_redirects=False,
+            )
+            check(r.status_code == 400, "bad person id is a 400")
+            r = requests.get(f"{wr_base}/?person={requests.utils.quote('Sam')}")
+            check("tagged 'Sam'" in r.text, "list page filters by person")
+        proc.terminate()
+        proc.wait(timeout=10)
+        con.close()
+        c26.run("people", "delete", "Web Renamed", expect=2)
+        out = c26.run("people", "delete", "Web Renamed", "--yes")
+        check("deleted person 'Web Renamed'" in out, "people delete removes a person")
+        out = c26.run("people", "list")
+        check("Web Renamed" not in out and "Sam" in out, "deleted person gone, others remain")
     finally:
         mock.terminate()
         mock.wait()

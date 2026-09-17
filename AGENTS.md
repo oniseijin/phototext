@@ -25,18 +25,23 @@ src/phototext/
   cli.py           typer commands; global --config/--db; scan/run slices,
                    search, export, migrate, serve, reprocess, help,
                    hide/unhide/delete/restore/purge/trash, unscan,
-                   categories, memes, autocomplete, profiles
+                   categories, memes, autocomplete, profiles, people
+                   (name/run/list/photos/confirm/remove/rename/reset/
+                   delete/describe)
   config.py        dataclass Config, ~/.phototext/config.toml (TOML) loading
   db.py            SQLite schema, migrations (+ backups), FTS5 sync, queries
   imaging.py       hashing, decode/downscale/encode, quadrant tiles, sips
                    fallback, test image
   library_meta.py  album/favorites/UUID -> paths: osxphotos (Photos) or
                    adaptive iPhoto apdb reader
+  people.py        person seeds (face crops), recognition profiles, the
+                   `people run` matching pass (one call per photo)
   memes.py         63-bit dhash, backfill, hamming clustering (union-find)
                    (warnings capture, bomb guard, deferred/derivative iCloud
                    inventory live in scanner/db/worker — see invariants)
   ollama_client.py /api/chat + /api/tags + /api/ps, structured output,
-                   preflight, two-tier gate call, anti-loop retry, parsing
+                   preflight, two-tier gate call, person describe/match
+                   calls, anti-loop retry, parsing
   prompt.py        prompts, response schema, tile merge, normalization
   scanner.py       source resolution, walk, dedup, fast path, Slice filters
   webui.py         read-only local web UI (http.server): browse/search/detail,
@@ -122,6 +127,16 @@ tests/
 - **Watch mode** (`--watch`) re-scans registered sources on an interval using
   the fast path (mtime/size) and queues new photos; the time budget still
   bounds the run.
+- **People** (migration 9): `people` + `person_tags` (present, confidence,
+  origin 'seed'|'user'|'model', box). Seed/user rows are ground truth —
+  `db.tag_person`'s upsert never lets a model row overwrite them. Model
+  matches below `person_min_confidence` stay as a review queue (they are
+  stored, just flagged); absent verdicts are recorded with present=0 so
+  re-runs skip them. Seed face crops live in `<db_dir>/people/<id>/`. The
+  matching pass is one call per photo for all people (person model defaults
+  to the prefilter); it is standalone like memes, not part of the extraction
+  worker. Web person routes go through the same --writable + token + Origin
+  gate as the other write actions.
 
 ## Testing rules
 
@@ -139,8 +154,11 @@ tests/
   meme clustering + web view, multi-process workers with stale-lease
   recovery, the two-tier gate (categories, gated reprocess), the help
   command, hide/delete/trash + unscan, warnings + the bomb guard,
-  deferred iCloud inventory/promotion, and named profiles. Run it after any change to
-  scanner/worker/db/ollama_client/cli/library_meta/webui/memes.
+  deferred iCloud inventory/promotion, named profiles, and people
+  (name/box/seed crop, matching with uncertain review queue, confirm/remove,
+  reset keeping user tags, search filter, web picker + person pages). Run it
+  after any change to scanner/worker/db/ollama_client/cli/library_meta/
+  webui/memes/people/prompt.
 - macOS `realpath` resolves `/var` -> `/private/var` and can normalize path case
   (`Originals` -> `originals`); never assert exact path strings.
 

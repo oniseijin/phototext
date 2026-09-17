@@ -13,7 +13,7 @@ from typing import List, Optional
 
 import typer
 
-from . import config, db, scanner, webui, worker
+from . import config, db, people as people_mod, scanner, webui, worker
 from .config import load_config
 from .imaging import test_image_b64
 from .library_meta import norm_path
@@ -30,6 +30,11 @@ app = typer.Typer(
     help="Recover text from photos using a local Ollama vision model.\n\n"
     "Run `phototext help` for a usage guide with typical workflows.",
 )
+people_app = typer.Typer(
+    no_args_is_help=True,
+    help="Identify people in photos and tag them across the library.",
+)
+app.add_typer(people_app, name="people")
 
 USAGE_GUIDE = """\
 phototext — recover text from photos using a local Ollama vision model
@@ -56,6 +61,15 @@ TYPICAL WORKFLOWS
   Redo failures:         phototext retry && phototext run
   Redo dense photos:     phototext reprocess --tiled --model <tag>
   Find memes:            phototext memes
+  Tag a person:          phototext people name 512 "Ryan" --box 300,150,400,400
+                          (box = face region in pixels; omit for the whole photo)
+  Tag people everywhere: phototext people run --stop-after 4h
+                          (one pass checks every named person per photo)
+  Review uncertain tags: phototext people photos Ryan    (or: serve --writable)
+  Confirm / remove:      phototext people confirm 512 Ryan
+                          phototext people remove 512 Ryan
+  Start over for one:    phototext people reset Ryan     (keeps confirmed tags)
+  Search by person:      phototext search --person Ryan "invoice"
   See categories:        phototext categories
   Export results:        phototext export --format csv --output results.csv
   Browse in a browser:   phototext serve
@@ -445,6 +459,13 @@ def status() -> None:
     n_warnings = db.warnings_count(conn)
     if n_warnings:
         typer.echo(f"warnings: {n_warnings}")
+    people_rows = db.people_list(conn, cfg.person_min_confidence)
+    if people_rows:
+        typer.echo(
+            f"people:   {len(people_rows)} person(s), "
+            f"{sum(p['tags'] for p in people_rows)} tag(s) "
+            f"({sum(p['uncertain'] for p in people_rows)} to review)"
+        )
     avg = db.avg_recent_duration_ms(conn)
     if avg:
         queued = counts.get("queued", 0)
@@ -524,6 +545,9 @@ def search(
     category: Optional[str] = typer.Option(
         None, "--category", help="Only match photos with this category (see `phototext categories`)."
     ),
+    person: Optional[str] = typer.Option(
+        None, "--person", help="Only match photos tagged with this person (see `phototext people list`)."
+    ),
     include_hidden: bool = typer.Option(
         False, "--hidden", help="Include hidden photos in matches."
     ),
@@ -536,9 +560,9 @@ def search(
     try:
         rows, effective = db.search_photos(
             conn, joined, limit=limit, highlight=highlight, category=category,
-            include_hidden=include_hidden,
+            include_hidden=include_hidden, person=person,
         )
-        total = db.search_count(conn, joined, include_hidden=include_hidden)
+        total = db.search_count(conn, joined, include_hidden=include_hidden, person=person)
     except sqlite3.OperationalError as e:
         typer.echo(f"error: search failed: {e}", err=True)
         raise typer.Exit(2)
@@ -1013,10 +1037,256 @@ def serve(
     """Serve the read-only local web UI: browse photos, recovered text, and search."""
     cfg = _cfg()
     try:
-        webui.serve(cfg.db_path, host=host, port=port, writable=writable)
+        webui.serve(cfg.db_path, host=host, port=port, writable=writable, person_cfg=cfg)
     except FileNotFoundError as e:
         typer.echo(f"error: {e}", err=True)
         raise typer.Exit(2)
+
+
+def _person_by_name(conn, name: str):
+    person = db.get_person_by_name(conn, name)
+    if person is None:
+        typer.echo(f"error: no person named '{name}' (see `phototext people list`)", err=True)
+        raise typer.Exit(2)
+    return person
+
+
+def _name_seed(cfg, photo_id: int, name: str, box_text: str | None) -> None:
+    conn = db.connect(cfg.db_path)
+    photo = db.get_photo(conn, photo_id)
+    if photo is None or photo["deleted_at"]:
+        typer.echo(f"error: no photo with id {photo_id}", err=True)
+        raise typer.Exit(2)
+    if not name.strip() or len(name) > people_mod.PERSON_MAX_NAME:
+        typer.echo(
+            f"error: name must be 1-{people_mod.PERSON_MAX_NAME} characters", err=True
+        )
+        raise typer.Exit(2)
+    try:
+        box = people_mod.parse_box(box_text)
+    except ValueError as e:
+        typer.echo(f"error: {e}", err=True)
+        raise typer.Exit(2)
+    source = db.find_first_existing_location(conn, photo_id)
+    if source is None:
+        typer.echo(
+            f"error: photo {photo_id} has no readable file on disk "
+            "(moved, deleted, or iCloud-only)",
+            err=True,
+        )
+        raise typer.Exit(2)
+    person = db.upsert_person(conn, name)
+    crop = people_mod.save_seed_crop(cfg.db_path, person["id"], photo_id, Path(source), box)
+    if crop is None:
+        typer.echo("warning: could not save a face crop (unreadable image)", err=True)
+    db.tag_person(conn, photo_id, person["id"], 1.0, "seed", box_text if box else None)
+    typer.echo(f"person '{person['name']}' seeded from photo {photo_id}")
+    try:
+        description = people_mod.build_description(
+            conn, cfg.db_path, person["id"], cfg
+        )
+    except Exception as e:
+        typer.echo(
+            f"warning: could not build a recognition profile yet ({e}); "
+            "retry with `phototext people describe "
+            f"{person['name']}` or `phototext people run`",
+            err=True,
+        )
+        return
+    typer.echo(f"recognition profile: {description}")
+
+
+@people_app.command("name")
+def people_name(
+    photo_id: int = typer.Argument(..., help="Photo id to seed the person from."),
+    name: str = typer.Argument(..., help="Person name (existing name adds a seed)."),
+    box: Optional[str] = typer.Option(
+        None, "--box", help="Face region 'x,y,w,h' in original pixels; omit for the whole photo."
+    ),
+) -> None:
+    """Name a person on a photo. Repeat with more photos to add seeds."""
+    _name_seed(_cfg(), photo_id, name, box)
+
+
+@people_app.command("describe")
+def people_describe(
+    name: str = typer.Argument(..., help="Person name."),
+) -> None:
+    """Rebuild a person's recognition profile from their seed photos."""
+    cfg = _cfg()
+    conn = db.connect(cfg.db_path)
+    person = _person_by_name(conn, name)
+    try:
+        description = people_mod.build_description(
+            conn, cfg.db_path, person["id"], cfg
+        )
+    except Exception as e:
+        typer.echo(f"error: {e}", err=True)
+        raise typer.Exit(1)
+    typer.echo(f"recognition profile: {description}")
+
+
+@people_app.command("run")
+def people_run(
+    model: Optional[str] = typer.Option(
+        None, "--model", help="Override the person matching model for this run."
+    ),
+    person: Optional[List[str]] = typer.Option(
+        None, "--person", help="Only match this person (repeatable)."
+    ),
+    stop_after: Optional[str] = typer.Option(
+        None, "--stop-after", help="Stop after a duration, e.g. 45s, 90m, 2h, 1h30m."
+    ),
+    limit: Optional[int] = typer.Option(
+        None, "--limit", help="Evaluate at most N photos this run."
+    ),
+) -> None:
+    """Tag people across the library (one model call per photo, all people)."""
+    cfg = _cfg()
+    if limit is not None and limit < 1:
+        typer.echo("error: --limit must be at least 1", err=True)
+        raise typer.Exit(2)
+    try:
+        code = people_mod.run_matching(
+            cfg, model=model, person_names=person, stop_after=stop_after, limit=limit
+        )
+    except ValueError as e:
+        typer.echo(f"error: {e}", err=True)
+        raise typer.Exit(2)
+    raise typer.Exit(code)
+
+
+@people_app.command("list")
+def people_list() -> None:
+    """List people with their tag counts."""
+    cfg = _cfg()
+    conn = db.connect(cfg.db_path)
+    people = db.people_list(conn, cfg.person_min_confidence)
+    if not people:
+        typer.echo(
+            "no people yet — start with: phototext people name <photo-id> <name> --box x,y,w,h"
+        )
+        return
+    for person in people:
+        typer.echo(
+            f"  [{person['id']}] {person['name']}: {person['tags']} tag(s) — "
+            f"{person['confirmed']} confirmed, {person['strong']} confident, "
+            f"{person['uncertain']} to review"
+        )
+        if not person["description"]:
+            typer.echo("        no recognition profile yet (run `phototext people run`)")
+
+
+@people_app.command("photos")
+def people_photos(
+    name: str = typer.Argument(..., help="Person name."),
+    limit: int = typer.Option(50, "--limit", help="Maximum photos to show."),
+) -> None:
+    """Show a person's tagged photos with confidence."""
+    cfg = _cfg()
+    conn = db.connect(cfg.db_path)
+    person = _person_by_name(conn, name)
+    rows = db.person_tag_rows(conn, person["id"])
+    if not rows:
+        typer.echo(f"no visible photos tagged '{person['name']}'")
+        return
+    typer.echo(
+        f"{len(rows)} photo(s) tagged '{person['name']}' "
+        f"(threshold {cfg.person_min_confidence:.2f}):"
+    )
+    for row in rows[:limit]:
+        mark = row["origin"]
+        if row["origin"] == "model":
+            mark = (
+                f"model {row['confidence']:.2f}"
+                + ("  <-- review" if row["confidence"] < cfg.person_min_confidence else "")
+            )
+        name_of = (row["path"] or "").rsplit("/", 1)[-1] or "(no location)"
+        typer.echo(f"  [{row['id']}] {mark:<14} {name_of}")
+    if len(rows) > limit:
+        typer.echo(f"  ... and {len(rows) - limit} more")
+
+
+@people_app.command("confirm")
+def people_confirm(
+    photo_id: int = typer.Argument(..., help="Photo id."),
+    name: str = typer.Argument(..., help="Person name."),
+) -> None:
+    """Mark a tag as correct (ground truth; model runs will not change it)."""
+    cfg = _cfg()
+    conn = db.connect(cfg.db_path)
+    person = _person_by_name(conn, name)
+    db.confirm_person_tag(conn, photo_id, person["id"])
+    typer.echo(f"confirmed '{person['name']}' on photo {photo_id}")
+
+
+@people_app.command("remove")
+def people_remove(
+    photo_id: int = typer.Argument(..., help="Photo id."),
+    name: str = typer.Argument(..., help="Person name."),
+) -> None:
+    """Remove a person tag from a photo."""
+    cfg = _cfg()
+    conn = db.connect(cfg.db_path)
+    person = _person_by_name(conn, name)
+    db.untag_person(conn, photo_id, person["id"])
+    typer.echo(f"removed '{person['name']}' from photo {photo_id}")
+
+
+@people_app.command("rename")
+def people_rename(
+    old: str = typer.Argument(..., help="Current name."),
+    new: str = typer.Argument(..., help="New name."),
+) -> None:
+    """Rename a person (tags move with them)."""
+    cfg = _cfg()
+    conn = db.connect(cfg.db_path)
+    person = _person_by_name(conn, old)
+    if not new.strip() or len(new) > people_mod.PERSON_MAX_NAME:
+        typer.echo(
+            f"error: name must be 1-{people_mod.PERSON_MAX_NAME} characters", err=True
+        )
+        raise typer.Exit(2)
+    if db.get_person_by_name(conn, new) is not None:
+        typer.echo(f"error: a person named '{new}' already exists", err=True)
+        raise typer.Exit(2)
+    db.rename_person(conn, person["id"], new)
+    typer.echo(f"renamed '{person['name']}' -> '{new.strip()}'")
+
+
+@people_app.command("reset")
+def people_reset(
+    name: str = typer.Argument(..., help="Person name."),
+) -> None:
+    """Reset a person's model tags (keeps seeds and confirmed tags)."""
+    cfg = _cfg()
+    conn = db.connect(cfg.db_path)
+    person = _person_by_name(conn, name)
+    n = db.reset_person_tags(conn, person["id"])
+    typer.echo(f"cleared {n} model tag(s) for '{person['name']}'")
+
+
+@people_app.command("delete")
+def people_delete(
+    name: str = typer.Argument(..., help="Person name."),
+    yes: bool = typer.Option(False, "--yes", help="Actually delete (safety flag)."),
+) -> None:
+    """Delete a person and all their tags (seed crops are removed too)."""
+    cfg = _cfg()
+    conn = db.connect(cfg.db_path)
+    person = _person_by_name(conn, name)
+    if not yes:
+        n_tags = conn.execute(
+            "SELECT COUNT(*) FROM person_tags WHERE person_id = ?", (person["id"],)
+        ).fetchone()[0]
+        typer.echo(
+            f"refusing to delete '{person['name']}' without --yes "
+            f"({n_tags} tag(s) would be removed)"
+        )
+        raise typer.Exit(2)
+    db.delete_person(conn, person["id"])
+    shutil.rmtree(people_mod.person_dir(cfg.db_path) / str(person["id"]), ignore_errors=True)
+    typer.echo(f"deleted person '{person['name']}'")
 
 
 @app.command()

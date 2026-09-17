@@ -21,8 +21,9 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 from urllib.request import pathname2url
 
 from . import db
-from .config import ensure_noindex
-from .imaging import ImageReadError, prepare_image
+from . import people as people_mod
+from .config import Config, ensure_noindex
+from .imaging import ImageReadError, crop_jpeg, prepare_image
 from .memes import find_clusters
 
 PAGE_SIZE = 48
@@ -124,6 +125,24 @@ button.mini:hover { background: #2a2f39; }
 .tbody { flex: 1; font-size: 13px; }
 .note { color: #9aa4b2; margin: 12px 0; }
 a.back { color: #8ab4f8; text-decoration: none; }
+.pickwrap { position: relative; display: inline-block; }
+.pickwrap img { cursor: crosshair; }
+.selbox { position: absolute; border: 2px solid #8ab4f8; background: rgba(138,180,248,.18);
+          display: none; pointer-events: none; }
+.tagform { display: flex; gap: 6px; margin-top: 10px; max-width: 420px; }
+.tagform input[type=text] { flex: 1; }
+.people { margin: 6px 0 10px; }
+.chipline { margin: 4px 0; }
+.chipline .badge { font-size: 12px; padding: 2px 8px; }
+.badge.review { background: #4a3a14; color: #ffd27d; }
+.face { width: 72px; height: 72px; object-fit: cover; border-radius: 8px; background: #0d0e11;
+        display: block; }
+.pcard { display: flex; gap: 14px; align-items: center; background: #1c2027; border-radius: 8px;
+         padding: 12px; margin-bottom: 10px; text-decoration: none; color: inherit; }
+.pcard .pbody { flex: 1; }
+.wideform { display: flex; gap: 6px; margin: 8px 0; max-width: 420px; }
+.wideform input[type=text] { flex: 1; padding: 6px 10px; border-radius: 6px;
+                            border: 1px solid #2a2f39; background: #14161a; color: #e6e6e6; }
 """
 
 
@@ -149,7 +168,9 @@ def _header(conn: sqlite3.Connection, q: str = "") -> str:
     )
 
 
-def _status_tabs(status: str, memes_active: bool = False) -> str:
+def _status_tabs(
+    status: str, memes_active: bool = False, people_active: bool = False
+) -> str:
     parts = []
     for key, label in (
         ("all", "All"),
@@ -162,6 +183,8 @@ def _status_tabs(status: str, memes_active: bool = False) -> str:
         parts.append(f"<a{cls} href='/?status={key}'>{label}</a>")
     memes_cls = " class='on'" if memes_active else ""
     parts.append(f"<a{memes_cls} href='/memes'>Memes</a>")
+    people_cls = " class='on'" if people_active else ""
+    parts.append(f"<a{people_cls} href='/people'>People</a>")
     parts.append("<a href='/trash'>Trash</a>")
     return f"<nav>{''.join(parts)}</nav>"
 
@@ -266,6 +289,7 @@ def render_list(conn: sqlite3.Connection, params: dict, ctx: dict | None = None)
         if status not in ("all", "done", "queued", "error", "processing"):
             status = "all"
         category = (params.get("category", [""])[0] or "").strip() or None
+        person = (params.get("person", [""])[0] or "").strip() or None
         text_filter = params.get("text", ["all"])[0] or "all"
         if text_filter not in ("all", "yes", "no"):
             text_filter = "all"
@@ -273,7 +297,7 @@ def render_list(conn: sqlite3.Connection, params: dict, ctx: dict | None = None)
         show_hidden = params.get("hidden", [""])[0] == "1"
         rows, total = db.page_photos(
             conn, status=status, has_text=has_text, category=category,
-            limit=PAGE_SIZE, offset=offset, show_hidden=show_hidden,
+            limit=PAGE_SIZE, offset=offset, show_hidden=show_hidden, person=person,
         )
         cards = [_card(r, _snippet(r["text"] or "")) for r in rows]
 
@@ -282,6 +306,7 @@ def render_list(conn: sqlite3.Connection, params: dict, ctx: dict | None = None)
                 "status": status,
                 "category": category,
                 "text": text_filter,
+                "person": person,
                 "hidden": "1" if show_hidden else "",
             }
             query = urlencode({k: v for k, v in parts.items() if v and v != "all"})
@@ -293,6 +318,19 @@ def render_list(conn: sqlite3.Connection, params: dict, ctx: dict | None = None)
             "<a href='/'>hide hidden</a>" if show_hidden else "<a href='/?hidden=1'>show hidden</a>"
         )
         body += f"<nav>{hidden_chip}</nav>"
+        people_rows = db.people_list(
+            conn, float((ctx or {}).get("min_confidence") or 0.6)
+        )
+        if people_rows:
+            chips = [
+                f"<a{cls} href='/?status={esc(status)}&text={text_filter}"
+                f"&person={esc(p['name'])}'>{esc(p['name'])}</a>"
+                for p in people_rows
+                for cls in (" class='on'" if person == p["name"] else "",)
+            ]
+            if person:
+                chips.append(f"<a href='/?status={esc(status)}&text={text_filter}'>all people</a>")
+            body += f"<nav>{''.join(chips)}</nav>"
         cats = [
             r["category"]
             for r in conn.execute(
@@ -316,6 +354,8 @@ def render_list(conn: sqlite3.Connection, params: dict, ctx: dict | None = None)
         body += f"<main><p class='note'>{total} photo(s) with status '{status}'"
         if category:
             body += f" and category '{esc(category)}'"
+        if person:
+            body += f" tagged '{esc(person)}'"
         if text_filter != "all":
             body += f" ({'with' if text_filter == 'yes' else 'no'} text)"
         body += "</p>"
@@ -397,13 +437,56 @@ def render_detail(conn: sqlite3.Connection, photo_id: int, ctx: dict | None = No
     text = row["text"] or ""
     context = row["context"] or ""
     raw = row["raw_response"] or ""
+    threshold = float((ctx or {}).get("min_confidence") or 0.6)
+    tags = db.people_for_photo(conn, photo_id)
+    writable = bool(ctx and ctx.get("writable") and ctx.get("token"))
+    people_section = ""
+    if tags:
+        chips = []
+        for t in tags:
+            if t["origin"] == "seed":
+                label = f"{t['name']} — seed"
+            elif t["origin"] == "user":
+                label = f"{t['name']} — confirmed"
+            else:
+                pct = f"{t['confidence'] * 100:.0f}%"
+                label = f"{t['name']} — {pct}" + (
+                    " (review)" if t["confidence"] < threshold else ""
+                )
+            chip = f"<a class='badge' href='/person/{t['person_id']}'>{esc(label)}</a>"
+            if writable:
+                chip += (
+                    _person_action("confirm", photo_id, t["person_id"], "✓", ctx["token"])
+                    + _person_action("remove", photo_id, t["person_id"], "✕", ctx["token"])
+                )
+            chips.append(f"<div class='chipline'>{chip}</div>")
+        people_section = (
+            "<p class='muted'>people</p><div class='people'>" + "".join(chips) + "</div>"
+        )
     body = _header(conn) + "<main><p><a class='back' href='/'>&#8592; back to photos</a></p>"
     if actions:
         body += f"<div class='actions'>{actions}</div>"
     body += f"<div class='detail'>"
-    body += f"<img src='/image/{photo_id}' alt='photo {photo_id}'>"
+    if writable:
+        body += (
+            "<div class='pickwrap'>"
+            f"<img id='pickimg' src='/image/{photo_id}' alt='photo {photo_id}'>"
+            "<div id='selbox' class='selbox'></div></div>"
+            "<form class='tagform' method='post' action='/person/tag'>"
+            f"<input type='hidden' name='photo_id' value='{photo_id}'>"
+            f"<input type='hidden' name='token' value='{esc(ctx['token'])}'>"
+            "<input type='hidden' name='box' id='boxfield' value=''>"
+            "<input type='text' name='name' placeholder=\"person's name\" maxlength='60'>"
+            "<button>tag person</button></form>"
+            "<p class='muted' id='boxhint'>drag a box around a face on the photo, "
+            "then enter a name (no box = whole photo)</p>"
+            f"<script>{_PICKER_JS}</script>"
+        )
+    else:
+        body += f"<img src='/image/{photo_id}' alt='photo {photo_id}'>"
     body += "<div class='meta'>"
     body += f"<table>{meta}</table>"
+    body += people_section
     if text:
         body += f"<p class='muted'>recovered text</p><pre>{esc(text)}</pre>"
     if context:
@@ -525,6 +608,207 @@ def thumb_bytes(conn: sqlite3.Connection, photo_id: int, thumbs_dir: Path) -> by
     return data
 
 
+def _person_action(
+    action: str, photo_id: int, person_id: int, label: str, token: str
+) -> str:
+    return (
+        f"<form class='act' method='post' action='/person/{action}'>"
+        f"<input type='hidden' name='photo_id' value='{photo_id}'>"
+        f"<input type='hidden' name='person_id' value='{person_id}'>"
+        f"<input type='hidden' name='token' value='{esc(token)}'>"
+        f"<button class='mini'>{esc(label)}</button></form>"
+    )
+
+
+def _origin_badge(row, threshold: float) -> str:
+    origin = row["origin"]
+    if origin == "seed":
+        return "<span class='badge ok'>seed</span>"
+    if origin == "user":
+        return "<span class='badge ok'>confirmed</span>"
+    confidence = row["confidence"]
+    pct = f"{confidence * 100:.0f}%"
+    if confidence < threshold:
+        return f"<span class='badge review'>{pct} review</span>"
+    return f"<span class='badge'>{pct}</span>"
+
+
+def _person_grid(
+    rows, ctx: dict | None, threshold: float, person_id: int, with_actions: bool
+) -> str:
+    writable = bool(ctx and ctx.get("writable") and ctx.get("token")) and with_actions
+    cards = []
+    for row in rows:
+        name = (row["path"] or "").rsplit("/", 1)[-1] or "(no location)"
+        snippet = _snippet(row["text"] or "")
+        badges = (
+            f"<span class='badge'>{esc(row['status'])}</span>"
+            f"{_origin_badge(row, threshold)}"
+        )
+        if snippet:
+            badges += f"<div class='snippet'>{esc(snippet)}</div>"
+        else:
+            badges += "<div class='snippet'><span class='muted'>(no text)</span></div>"
+        badges += f"<div class='path'>{esc(name)}</div>"
+        if writable:
+            badges += (
+                "<div class='actions'>"
+                + _person_action("confirm", row["id"], person_id, "confirm", ctx["token"])
+                + _person_action("remove", row["id"], person_id, "remove", ctx["token"])
+                + "</div>"
+            )
+        cards.append(
+            f"<div class='card'>"
+            f"<a href='/photo/{row['id']}'><img src='/thumb/{row['id']}' "
+            f"alt='{esc(name)}' loading='lazy'></a>"
+            f"<div class='body'>{badges}</div></div>"
+        )
+    if not cards:
+        return "<p class='note'>none</p>"
+    return "<div class='cards'>" + "".join(cards) + "</div>"
+
+
+_PICKER_JS = """
+(function () {
+  var img = document.getElementById('pickimg');
+  if (!img) return;
+  var box = document.getElementById('selbox');
+  var field = document.getElementById('boxfield');
+  var hint = document.getElementById('boxhint');
+  var start = null;
+  function pos(e) {
+    var r = img.getBoundingClientRect();
+    return [e.clientX - r.left, e.clientY - r.top, r];
+  }
+  img.addEventListener('mousedown', function (e) {
+    e.preventDefault();
+    start = pos(e);
+    box.style.display = 'block';
+    box.style.left = start[0] + 'px';
+    box.style.top = start[1] + 'px';
+    box.style.width = '0px';
+    box.style.height = '0px';
+  });
+  window.addEventListener('mousemove', function (e) {
+    if (!start) return;
+    var p = pos(e);
+    var x = Math.min(start[0], p[0]), y = Math.min(start[1], p[1]);
+    var w = Math.abs(p[0] - start[0]), h = Math.abs(p[1] - start[1]);
+    box.style.left = x + 'px'; box.style.top = y + 'px';
+    box.style.width = w + 'px'; box.style.height = h + 'px';
+  });
+  window.addEventListener('mouseup', function (e) {
+    if (!start) return;
+    var p = pos(e);
+    var x = Math.min(start[0], p[0]), y = Math.min(start[1], p[1]);
+    var w = Math.abs(p[0] - start[0]), h = Math.abs(p[1] - start[1]);
+    start = null;
+    if (w < 8 || h < 8) { box.style.display = 'none'; field.value = ''; return; }
+    var r = img.getBoundingClientRect();
+    var sx = img.naturalWidth / r.width, sy = img.naturalHeight / r.height;
+    field.value = [Math.round(x * sx), Math.round(y * sy),
+                   Math.round(w * sx), Math.round(h * sy)].join(',');
+    if (hint) hint.textContent = 'box set (drag again to change it) — now enter a name';
+  });
+})();
+"""
+
+
+def render_people(conn: sqlite3.Connection, ctx: dict | None = None) -> bytes:
+    threshold = float((ctx or {}).get("min_confidence") or 0.6)
+    people = db.people_list(conn, threshold)
+    body = _header(conn) + _status_tabs("", people_active=True)
+    if not people:
+        body += (
+            "<main><p class='note'>no people yet. Open a photo, drag a box around "
+            "a face, and give the person a name (needs a writable server: "
+            "<code>phototext serve --writable</code>), or use "
+            "<code>phototext people name <photo-id> <name> --box x,y,w,h</code>.</p></main>"
+        )
+        return _page("people - phototext", body)
+    body += f"<main><p class='note'>{len(people)} person(s)</p>"
+    for person in people:
+        seeds = db.person_seed_photo_ids(conn, person["id"], 1)
+        face = f"/face/{person['id']}/{seeds[0]}" if seeds else ""
+        if not face and person["tags"]:
+            top = db.person_tag_rows(conn, person["id"])
+            if top:
+                face = f"/thumb/{top[0]['id']}"
+        img = (
+            f"<img class='face' src='{face}' alt='' loading='lazy'>"
+            if face
+            else "<div class='face'></div>"
+        )
+        body += (
+            f"<a class='pcard' href='/person/{person['id']}'>{img}<div class='pbody'>"
+            f"<strong>{esc(person['name'])}</strong> "
+            f"<span class='badge'>{person['tags']} tag(s)</span> "
+            f"<span class='badge ok'>{person['confirmed']} confirmed</span> "
+            f"<span class='badge'>{person['strong']} confident</span> "
+            f"<span class='badge review'>{person['uncertain']} to review</span>"
+            f"<div class='muted'>{_snippet(person['description'] or '', 160) or 'no recognition profile yet'}</div>"
+            f"</div></a>"
+        )
+    body += "</main>"
+    return _page("people - phototext", body)
+
+
+def render_person(
+    conn: sqlite3.Connection, person_id: int, ctx: dict | None = None
+) -> bytes | None:
+    person = db.get_person(conn, person_id)
+    if person is None:
+        return None
+    threshold = float((ctx or {}).get("min_confidence") or 0.6)
+    rows = db.person_tag_rows(conn, person_id)
+    review = [r for r in rows if r["origin"] == "model" and r["confidence"] < threshold]
+    settled = [r for r in rows if r not in review]
+    body = _header(conn) + _status_tabs("", people_active=True)
+    writable = bool(ctx and ctx.get("writable") and ctx.get("token"))
+    body += "<main><p><a class='back' href='/people'>&#8592; all people</a></p>"
+    body += f"<h2 style='margin:6px 0'>{esc(person['name'])}</h2>"
+    if person["description"]:
+        body += f"<p class='muted'>recognition profile</p><pre>{esc(person['description'])}</pre>"
+    else:
+        body += (
+            "<p class='note'>no recognition profile yet — it is built automatically by "
+            f"<code>phototext people run</code> or <code>phototext people describe "
+            f"{esc(person['name'])}</code></p>"
+        )
+    if writable:
+        token = ctx["token"]
+        body += (
+            "<div class='actions'>"
+            "<form class='act wideform' method='post' action='/person/rename'>"
+            f"<input type='hidden' name='person_id' value='{person_id}'>"
+            f"<input type='hidden' name='token' value='{esc(token)}'>"
+            "<input type='text' name='name' placeholder='new name' maxlength='60'>"
+            "<button class='mini'>rename</button></form>"
+            "<form class='act' method='post' action='/person/reset'>"
+            f"<input type='hidden' name='person_id' value='{person_id}'>"
+            f"<input type='hidden' name='token' value='{esc(token)}'>"
+            "<button class='mini'>reset model tags</button></form>"
+            "<form class='act' method='post' action='/person/delete'"
+            " onsubmit=\"return confirm('Delete this person and all their tags?')\">"
+            f"<input type='hidden' name='person_id' value='{person_id}'>"
+            f"<input type='hidden' name='token' value='{esc(token)}'>"
+            "<button class='mini'>delete person</button></form>"
+            "</div>"
+        )
+    body += (
+        f"<p class='note'>{len(rows)} tagged photo(s): {len(settled)} settled, "
+        f"{len(review)} to review (model confidence below {threshold:.2f})</p>"
+    )
+    if review:
+        body += "<p class='muted'>review queue — confirm or remove each</p>"
+        body += _person_grid(review, ctx, threshold, person_id, with_actions=True)
+    if settled:
+        body += "<p class='muted'>tagged photos</p>"
+        body += _person_grid(settled, ctx, threshold, person_id, with_actions=True)
+    body += "</main>"
+    return _page(f"{person['name']} - phototext", body)
+
+
 class _Server(ThreadingHTTPServer):
     daemon_threads = True
 
@@ -536,12 +820,17 @@ class _Server(ThreadingHTTPServer):
         thumbs_dir: Path,
         writable: bool = False,
         token: str | None = None,
+        person_cfg: Config | None = None,
     ):
         super().__init__(address, handler)
         self.phototext_db = db_path
         self.phototext_thumbs = thumbs_dir
         self.phototext_writable = writable
         self.phototext_token = token
+        self.phototext_person_cfg = person_cfg
+        self.phototext_min_confidence = (
+            person_cfg.person_min_confidence if person_cfg else 0.6
+        )
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -599,10 +888,10 @@ class _Handler(BaseHTTPRequestHandler):
             self._not_found("server is read-only (restart with --writable to enable actions)")
             return
         match = re.match(r"^/(hide|unhide|delete|restore|purge)/(\d+)$", route)
-        if match is None:
+        person_match = re.match(r"^/person/(tag|confirm|remove|rename|reset|delete)$", route)
+        if match is None and person_match is None:
             self._not_found()
             return
-        action, photo_id = match.group(1), int(match.group(2))
         length = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(length).decode("utf-8", "replace") if length else ""
         fields = parse_qs(body)
@@ -618,27 +907,113 @@ class _Handler(BaseHTTPRequestHandler):
                 return
         conn = db.connect(self.server.phototext_db)
         try:
-            if action == "hide":
-                db.hide_photos(conn, [photo_id], hidden=True)
-                dest = f"/photo/{photo_id}"
-            elif action == "unhide":
-                db.hide_photos(conn, [photo_id], hidden=False)
-                dest = f"/photo/{photo_id}"
-            elif action == "delete":
-                db.trash_photos(conn, [photo_id])
-                dest = f"/photo/{photo_id}"
-            elif action == "restore":
-                db.restore_photos(conn, [photo_id])
-                dest = f"/photo/{photo_id}"
+            if match is not None:
+                action, photo_id = match.group(1), int(match.group(2))
+                if action == "hide":
+                    db.hide_photos(conn, [photo_id], hidden=True)
+                    dest = f"/photo/{photo_id}"
+                elif action == "unhide":
+                    db.hide_photos(conn, [photo_id], hidden=False)
+                    dest = f"/photo/{photo_id}"
+                elif action == "delete":
+                    db.trash_photos(conn, [photo_id])
+                    dest = f"/photo/{photo_id}"
+                elif action == "restore":
+                    db.restore_photos(conn, [photo_id])
+                    dest = f"/photo/{photo_id}"
+                else:
+                    db.purge_photos(conn, [photo_id])
+                    dest = "/trash"
             else:
-                db.purge_photos(conn, [photo_id])
-                dest = "/trash"
+                try:
+                    dest = self._handle_person_post(conn, person_match.group(1), fields)
+                except ValueError as e:
+                    self._send(400, f"bad request: {esc(e)}".encode(), "text/plain")
+                    return
         finally:
             conn.close()
         self.send_response(303)
         self.send_header("Location", dest)
         self.send_header("Content-Length", "0")
         self.end_headers()
+
+    def _handle_person_post(
+        self, conn: sqlite3.Connection, action: str, fields: dict
+    ) -> str:
+        def field(name: str) -> str:
+            return (fields.get(name, [""])[0] or "").strip()
+
+        def int_field(name: str) -> int:
+            try:
+                return int(field(name))
+            except ValueError:
+                raise ValueError(f"{name} must be an integer") from None
+
+        if action in ("tag", "confirm", "remove"):
+            photo_id = int_field("photo_id")
+            if action == "tag":
+                name = field("name")
+                if not name or len(name) > people_mod.PERSON_MAX_NAME:
+                    raise ValueError(
+                        f"name must be 1-{people_mod.PERSON_MAX_NAME} characters"
+                    )
+                photo = db.get_photo(conn, photo_id)
+                if photo is None or photo["deleted_at"]:
+                    raise ValueError(f"no photo with id {photo_id}")
+                box = people_mod.parse_box(field("box"))
+                source = db.find_first_existing_location(conn, photo_id)
+                if source is None:
+                    raise ValueError(
+                        f"photo {photo_id} has no readable file on disk "
+                        "(moved, deleted, or iCloud-only)"
+                    )
+                person = db.upsert_person(conn, name)
+                people_mod.save_seed_crop(
+                    self.server.phototext_db, person["id"], photo_id,
+                    Path(source), box,
+                )
+                db.tag_person(
+                    conn, photo_id, person["id"], 1.0, "seed",
+                    field("box") if box else None,
+                )
+                if self.server.phototext_person_cfg is not None:
+                    try:
+                        people_mod.build_description(
+                            conn, self.server.phototext_db, person["id"],
+                            self.server.phototext_person_cfg,
+                        )
+                    except Exception:
+                        pass  # person exists; the profile is built by people run
+                return f"/photo/{photo_id}"
+            person_id = int_field("person_id")
+            if action == "confirm":
+                db.confirm_person_tag(conn, photo_id, person_id)
+            else:
+                db.untag_person(conn, photo_id, person_id)
+            return f"/photo/{photo_id}"
+        person_id = int_field("person_id")
+        if action == "rename":
+            name = field("name")
+            if not name or len(name) > people_mod.PERSON_MAX_NAME:
+                raise ValueError(
+                    f"name must be 1-{people_mod.PERSON_MAX_NAME} characters"
+                )
+            if db.get_person_by_name(conn, name) is not None:
+                raise ValueError(f"a person named '{name}' already exists")
+            db.rename_person(conn, person_id, name)
+            return f"/person/{person_id}"
+        if action == "reset":
+            db.reset_person_tags(conn, person_id)
+            return f"/person/{person_id}"
+        person = db.get_person(conn, person_id)
+        if person is None:
+            raise ValueError(f"no person with id {person_id}")
+        db.delete_person(conn, person_id)
+        shutil.rmtree(
+            people_mod.person_dir(self.server.phototext_db) / str(person_id),
+            ignore_errors=True,
+        )
+        return "/people"
 
     def _route(self) -> None:
         parsed = urlsplit(self.path)
@@ -647,6 +1022,7 @@ class _Handler(BaseHTTPRequestHandler):
         ctx = {
             "writable": self.server.phototext_writable,
             "token": self.server.phototext_token,
+            "min_confidence": self.server.phototext_min_confidence,
         }
         if route in ("", "/"):
             if "q" in params and not params["q"][0].strip():
@@ -665,12 +1041,27 @@ class _Handler(BaseHTTPRequestHandler):
             finally:
                 conn.close()
             return
+        if route == "/people":
+            conn = _open_ro(self.server.phototext_db)
+            try:
+                self._send_html(render_people(conn, ctx))
+            finally:
+                conn.close()
+            return
         if route == "/trash":
             conn = _open_ro(self.server.phototext_db)
             try:
                 self._send_html(render_trash(conn, ctx))
             finally:
                 conn.close()
+            return
+        person_match = re.match(r"^/person/(\d+)$", route)
+        face_match = re.match(r"^/face/(\d+)/(\d+)$", route)
+        if person_match is not None:
+            self._route_person(int(person_match.group(1)), ctx)
+            return
+        if face_match is not None:
+            self._route_face(int(face_match.group(1)), int(face_match.group(2)))
             return
         for prefix, handler in (
             ("/photo/", self._route_photo),
@@ -686,6 +1077,67 @@ class _Handler(BaseHTTPRequestHandler):
                 handler(int(tail), params, ctx)
                 return
         self._not_found()
+
+    def _route_person(self, person_id: int, ctx: dict) -> None:
+        conn = _open_ro(self.server.phototext_db)
+        try:
+            body = render_person(conn, person_id, ctx)
+        finally:
+            conn.close()
+        if body is None:
+            self._not_found(f"person {person_id} not found")
+        else:
+            self._send_html(body)
+
+    def _route_face(self, person_id: int, photo_id: int) -> None:
+        db_path = self.server.phototext_db
+        conn = _open_ro(db_path)
+        try:
+            person = db.get_person(conn, person_id)
+            tagged = conn.execute(
+                "SELECT 1 FROM person_tags WHERE photo_id = ? AND person_id = ?",
+                (photo_id, person_id),
+            ).fetchone()
+        finally:
+            conn.close()
+        if person is None or tagged is None:
+            self._not_found("no face crop for this person and photo")
+            return
+        crop = people_mod.seed_crop_path(db_path, person_id, photo_id)
+        if crop.exists():
+            try:
+                self._send(200, crop.read_bytes(), "image/jpeg")
+                return
+            except OSError:
+                pass
+        conn = _open_ro(db_path)
+        try:
+            row = conn.execute(
+                "SELECT box FROM person_tags WHERE photo_id = ? AND person_id = ?",
+                (photo_id, person_id),
+            ).fetchone()
+            box = people_mod.parse_box(row["box"]) if row and row["box"] else None
+            path = _first_existing(conn, photo_id)
+        finally:
+            conn.close()
+        if path is None:
+            self._not_found("no face crop")
+            return
+        try:
+            if box is not None:
+                data = crop_jpeg(path, box, max_edge=people_mod.PERSON_SEED_EDGE)
+            else:
+                data = prepare_image(path, max_edge=people_mod.PERSON_SEED_EDGE)
+        except ImageReadError:
+            self._not_found("no face crop")
+            return
+        try:
+            crop.parent.mkdir(parents=True, exist_ok=True)
+            ensure_noindex(crop.parent)
+            crop.write_bytes(data)
+        except OSError:
+            pass
+        self._send(200, data, "image/jpeg")
 
     def _route_photo(self, photo_id: int, params: dict, ctx: dict) -> None:
         conn = _open_ro(self.server.phototext_db)
@@ -766,6 +1218,7 @@ def serve(
     host: str = "127.0.0.1",
     port: int = 8765,
     writable: bool = False,
+    person_cfg: Config | None = None,
 ) -> None:
     db_path = Path(db_path).expanduser()
     if not db_path.exists():
@@ -776,9 +1229,11 @@ def serve(
     thumbs_dir.mkdir(parents=True, exist_ok=True)
     ensure_noindex(thumbs_dir)
     token = secrets.token_hex(16) if writable else None
-    httpd = _Server((host, port), _Handler, db_path, thumbs_dir, writable, token)
+    httpd = _Server(
+        (host, port), _Handler, db_path, thumbs_dir, writable, token, person_cfg
+    )
     actual_host, actual_port = httpd.server_address[:2]
-    mode = "read-only" if not writable else "read-write (hide/delete/restore/purge enabled)"
+    mode = "read-only" if not writable else "read-write (hide/delete/restore/purge + people enabled)"
     print(f"phototext web UI: http://{actual_host}:{actual_port}  ({mode}; Ctrl+C to stop)")
     if host not in ("127.0.0.1", "localhost", "::1"):
         print("warning: serving on a non-loopback address; anyone who can reach this "

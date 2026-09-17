@@ -91,6 +91,98 @@ GATE_SCHEMA = {
 }
 
 
+PERSON_DESCRIBE_PROMPT = (
+    "These image(s) all show the same person. Study how they look and respond "
+    "with JSON only.\n"
+    'In "description", write a concise but specific visual recognition profile '
+    "of the person — face shape, hair, skin, build, and any distinguishing "
+    "features or typical style — detailed enough to pick them out of other "
+    "casual photos. Do not mention any name, do not guess exact ages, and do "
+    "not describe clothing unless it is clearly their habitual style."
+)
+
+PERSON_DESCRIBE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "description": {
+            "type": "string",
+            "description": "visual recognition profile, 2-6 sentences",
+            "maxLength": 1500,
+        },
+    },
+    "required": ["description"],
+}
+
+
+PERSON_MATCH_PROMPT_HEAD = (
+    "Decide which of the following people appear in this photo. Respond with "
+    "JSON only.\n"
+    "People to look for (person_id with a recognition profile):\n"
+)
+
+PERSON_MATCH_PROMPT_TAIL = (
+    "\nExamine every person in the photo. For each person listed above, add one "
+    'entry to "matches": "person_id" (the integer id), "present" (true only if '
+    'you are reasonably sure they appear), and "confidence" (0.0 to 1.0). Judge '
+    "only what is actually visible; people not in the photo get present=false. "
+    "Include every listed person_id exactly once."
+)
+
+PERSON_MATCH_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "matches": {
+            "type": "array",
+            "description": "one entry per listed person",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "person_id": {"type": "integer"},
+                    "present": {"type": "boolean"},
+                    "confidence": {"type": "number"},
+                },
+                "required": ["person_id", "present", "confidence"],
+            },
+        }
+    },
+    "required": ["matches"],
+}
+
+
+def normalize_person_matches(raw: dict, valid_ids: set[int]) -> list[dict]:
+    """Coerce a match response into known person ids with clamped confidence."""
+    out: list[dict] = []
+    seen: set[int] = set()
+    items = raw.get("matches")
+    if not isinstance(items, list):
+        items = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        try:
+            person_id = int(item.get("person_id"))
+        except (TypeError, ValueError):
+            continue
+        if person_id not in valid_ids or person_id in seen:
+            continue
+        present = item.get("present")
+        if not isinstance(present, bool):
+            present = bool(present)
+        try:
+            confidence = float(item.get("confidence"))
+        except (TypeError, ValueError):
+            confidence = 1.0 if present else 0.0
+        out.append(
+            {
+                "person_id": person_id,
+                "present": present,
+                "confidence": min(1.0, max(0.0, confidence)),
+            }
+        )
+        seen.add(person_id)
+    return out
+
+
 def merge_tile_results(results: list[dict]) -> dict:
     """Merge quadrant extractions (TL, TR, BL, BR order) into one result."""
     with_text = [

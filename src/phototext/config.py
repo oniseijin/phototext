@@ -65,6 +65,13 @@ idle_detection = true
     prefilter_model = "gemma3:4b"
     prefilter_max_edge = 512
 
+    # People: name a person on one photo, then `phototext people run` tags
+    # them across the library. Matching uses this model (empty = the
+    # prefilter model above); model tags below person_min_confidence are
+    # kept in a review queue instead of being trusted.
+    person_model = ""
+    person_min_confidence = 0.6
+
     # SQLite catalog location
     db_path = "~/.phototext/catalog.db"
 """
@@ -89,6 +96,8 @@ class Config:
     two_tier: bool = False
     prefilter_model: str = "gemma3:4b"
     prefilter_max_edge: int = 512
+    person_model: str = ""
+    person_min_confidence: float = 0.6
     max_image_pixels: int = 357_913_941
     db_path: Path = DEFAULT_DB_PATH
 

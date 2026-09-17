@@ -1,9 +1,45 @@
 #!/usr/bin/env python3
 import argparse
+import base64
+import io
 import json
+import re
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+
+def _sample_image_color(img_b64: str) -> tuple[int, int, int] | None:
+    try:
+        from PIL import Image
+
+        im = Image.open(io.BytesIO(base64.b64decode(img_b64))).convert("RGB")
+        return im.getpixel((im.width // 2, int(im.height * 0.75)))
+    except Exception:
+        return None
+
+
+def _person_match_response(payload: dict) -> dict:
+    """Deterministic by image content: reddish -> confident match, greenish ->
+    uncertain match (0.45), anything else -> absent."""
+    prompt = payload["messages"][-1].get("content") or ""
+    ids = [int(m) for m in re.findall(r'"person_id"\s*:\s*(\d+)', prompt)]
+    images = payload["messages"][-1].get("images") or []
+    present, confidence = False, 0.05
+    if images:
+        rgb = _sample_image_color(images[0])
+        if rgb is not None:
+            r, g, b = rgb
+            if r > 150 and g < 110 and b < 110:
+                present, confidence = True, 0.9
+            elif g > 150 and r < 110 and b < 110:
+                present, confidence = True, 0.45
+    return {
+        "matches": [
+            {"person_id": pid, "present": present, "confidence": confidence}
+            for pid in ids
+        ]
+    }
 
 
 def build_handler(model: str, mode_file: Path, slow_seconds: float, ps_file: Path | None):
@@ -61,6 +97,46 @@ def build_handler(model: str, mode_file: Path, slow_seconds: float, ps_file: Pat
             if mode != last_mode["mode"]:
                 last_mode["mode"] = mode
                 chat_calls["n"] = 0
+            # Person calls are dispatched by their response schema before the
+            # model-tag check (people use the prefilter/person model).
+            fmt = payload.get("format")
+            if isinstance(fmt, dict):
+                props = fmt.get("properties") or {}
+                if "matches" in props:
+                    self._json(
+                        200,
+                        {
+                            "model": payload.get("model"),
+                            "created_at": "2026-01-01T00:00:00Z",
+                            "message": {
+                                "role": "assistant",
+                                "content": json.dumps(_person_match_response(payload)),
+                            },
+                            "done": True,
+                        },
+                    )
+                    return
+                if "description" in props and "context" not in props:
+                    self._json(
+                        200,
+                        {
+                            "model": payload.get("model"),
+                            "created_at": "2026-01-01T00:00:00Z",
+                            "message": {
+                                "role": "assistant",
+                                "content": json.dumps(
+                                    {
+                                        "description": (
+                                            "MOCK PERSON PROFILE: short dark hair, "
+                                            "red jacket, sturdy build"
+                                        )
+                                    }
+                                ),
+                            },
+                            "done": True,
+                        },
+                    )
+                    return
             if payload.get("model") != model:
                 # gate call (two-tier prefilter uses a different model tag)
                 gate_has_text = mode != "gatenotext"

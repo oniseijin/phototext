@@ -93,6 +93,12 @@ uv venv .venv && uv pip install -e .
 | `phototext trash` | List trashed photos. |
 | `phototext unscan <source>` | Forget a registered source (by id or path) and photos only seen there. |
 | `phototext memes` | Find near-identical photos (perceptual hash clusters), likely memes. |
+| `phototext people name ID NAME` | Seed a person from a photo (`--box x,y,w,h` to crop the face); the model builds a recognition profile. |
+| `phototext people run` | Tag people across the library — one model call per photo checks every named person. |
+| `phototext people list / photos NAME` | People with tag counts; a person's photos with confidence. |
+| `phototext people confirm / remove ID NAME` | Mark a tag correct (ground truth) or remove it. |
+| `phototext people rename / reset / delete NAME` | Rename; drop model tags (keeps confirmed); delete (`--yes`). |
+| `phototext search --person NAME QUERY` | Full-text search within a person's tagged photos. |
 | `phototext migrate` | Apply pending catalog schema migrations (backs up the catalog first). |
 | `phototext serve` | Local web UI: browse photos + recovered text, search box (`--host`, `--port`, `--writable` for hide/delete actions). |
 | `phototext doctor` | Diagnose config, database, Ollama, model, vision support (prints the version first). |
@@ -116,7 +122,7 @@ Useful `run` options:
 | `--two-tier` | Check each photo with the cheap prefilter model first; textless photos finish there in seconds with a short description and category. |
 
 Global options: `--config PATH` to use a specific config file, `--db PATH` to use a
-specific catalog.
+specific catalog, `--profile NAME` to switch to an alternate catalog.
 
 ## iPhoto / Photos libraries
 
@@ -171,6 +177,14 @@ even inside a `.photolibrary`/`.photoslibrary` package. It binds to loopback
 only, opens the catalog read-only (`mode=ro` + `query_only`), and never
 writes to the library. Ctrl+C stops it.
 
+There is also a **People** tab: person cards with face crops, and per-person
+pages with a review queue for uncertain model tags. With `serve --writable`
+the photo page grows a face-box picker — drag a rectangle around a face,
+type a name, and the person is seeded (recognition profile built on the
+spot) — plus confirm/remove buttons on every person chip and rename/reset/
+delete on the person page. All writes stay behind the session token and
+Origin check.
+
 ## Long runs and resume
 
 - Ctrl+C (or SIGTERM) stops gracefully after the current photo; a second Ctrl+C
@@ -195,6 +209,16 @@ writes to the library. Ctrl+C stops it.
 - **Memes**: `phototext memes` clusters near-identical photos by perceptual
   hash and flags groups that carry text — the classic re-shared image. The
   web UI has a Memes tab with the same clusters.
+- **People**: name a person once and tag them everywhere. On a photo in the
+  web UI (writable mode) drag a box around a face and type a name — or
+  `phototext people name <photo-id> "Ryan" --box x,y,w,h`. The model writes a
+  recognition profile from the seed crop(s), then `phototext people run`
+  checks every photo in one call per photo (all people at once, using the
+  fast `person_model`). Tags carry confidence; below `person_min_confidence`
+  they land in a review queue. Confirm/remove in the web UI or via
+  `people confirm/remove`; `people reset` drops model tags but keeps your
+  confirmations; `search --person Ryan "invoice"` searches within a person.
+  Seed face crops are stored under `<state>/people/`.
 - `--stop-after 2h` bounds a run, e.g. overnight or "while I'm at lunch".
 - Re-running `run` only processes what is still queued; already-done photos are
   never re-processed.
@@ -244,6 +268,8 @@ override it.
 | `lease_timeout_s` | `3600` | Multi-worker runs: reclaim photos from dead workers after this long. |
 | `two_tier` | `false` | Cheap prefilter model gates the full pass; textless photos finish at the gate. |
 | `prefilter_model` | `gemma3:4b` | The gate model for two-tier mode. |
+| `person_model` | *(prefilter)* | Model for person matching + recognition profiles. |
+| `person_min_confidence` | `0.6` | Model tags below this confidence wait in the review queue. |
 | `prefilter_max_edge` | `512` | Image size for gate calls (smaller is faster). |
 | `max_image_pixels` | `357913941` | Hard decode budget per image (~357 MP). Suspected decompression bombs are recorded as errors — deliberately without the `sips` fallback. |
 | `db_path` | `~/.phototext/catalog.db` | SQLite catalog location. |

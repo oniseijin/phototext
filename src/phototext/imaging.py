@@ -124,6 +124,66 @@ def _encode_tiles(
     return [_encode(im.crop(box), max_edge, jpeg_quality) for box in boxes]
 
 
+def crop_jpeg(
+    path: Path,
+    box: tuple[int, int, int, int],
+    max_edge: int = 512,
+    jpeg_quality: int = 85,
+    margin: float = 0.2,
+    max_pixels: int = DEFAULT_MAX_PIXELS,
+) -> bytes:
+    """JPEG crop of a region (x, y, w, h) in original-image pixels.
+
+    A little margin is added around the box so the crop keeps hair, chin,
+    and shoulders — enough context to re-recognize a face. Coordinates are
+    relative to the EXIF-oriented image (what a browser displays).
+    """
+    try:
+        with Image.open(path) as im:
+            _bomb_check(im, max_pixels)
+            return _encode_crop(im, box, max_edge, jpeg_quality, margin)
+    except ImageReadError:
+        raise
+    except Exception as first_error:
+        converted = _sips_to_jpeg(path)
+        if converted is None:
+            raise ImageReadError(f"{type(first_error).__name__}: {first_error}") from first_error
+        try:
+            with Image.open(converted) as im:
+                _bomb_check(im, max_pixels)
+                return _encode_crop(im, box, max_edge, jpeg_quality, margin)
+        except ImageReadError:
+            raise
+        except Exception as second_error:
+            raise ImageReadError(f"{type(second_error).__name__}: {second_error}") from second_error
+        finally:
+            converted.unlink(missing_ok=True)
+
+
+def _encode_crop(
+    im: Image.Image,
+    box: tuple[int, int, int, int],
+    max_edge: int,
+    jpeg_quality: int,
+    margin: float,
+) -> bytes:
+    im = ImageOps.exif_transpose(im)
+    if im.mode != "RGB":
+        im = im.convert("RGB")
+    width, height = im.size
+    x, y, w, h = box
+    x, y = max(0, int(x)), max(0, int(y))
+    w, h = max(1, int(w)), max(1, int(h))
+    dx, dy = int(w * margin), int(h * margin)
+    left = max(0, x - dx)
+    top = max(0, y - dy)
+    right = min(width, x + w + dx)
+    bottom = min(height, y + h + dy)
+    if right <= left or bottom <= top:
+        raise ImageReadError(f"crop box {box} is outside the {width}x{height} image")
+    return _encode(im.crop((left, top, right, bottom)), max_edge, jpeg_quality)
+
+
 def test_image_b64() -> str:
     buf = io.BytesIO()
     Image.new("RGB", (16, 16), (200, 40, 40)).save(buf, format="PNG")

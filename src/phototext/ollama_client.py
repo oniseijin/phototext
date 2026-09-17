@@ -10,6 +10,11 @@ from .prompt import (
     EXTRACTION_SCHEMA,
     GATE_SCHEMA,
     GATE_PROMPT,
+    PERSON_DESCRIBE_PROMPT,
+    PERSON_DESCRIBE_SCHEMA,
+    PERSON_MATCH_PROMPT_HEAD,
+    PERSON_MATCH_PROMPT_TAIL,
+    PERSON_MATCH_SCHEMA,
     SYSTEM_PROMPT,
     USER_PROMPT,
 )
@@ -58,6 +63,7 @@ class OllamaClient:
         self.base_url = cfg.ollama_url.rstrip("/")
         self.model = cfg.model
         self.gate_model = cfg.prefilter_model
+        self.person_model = cfg.person_model or cfg.prefilter_model
         self.timeout = cfg.request_timeout_s
 
     def check_connection(self) -> list[str]:
@@ -158,6 +164,66 @@ class OllamaClient:
         }
         content = self._chat(payload)
         return parse_model_json(content), content
+
+    def describe_person(self, images_b64: list[str]) -> tuple[dict, str]:
+        """Build a recognition profile for one person from seed crops."""
+        payload = {
+            "model": self.person_model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": PERSON_DESCRIBE_PROMPT,
+                    "images": list(images_b64),
+                },
+            ],
+            "stream": False,
+            "format": PERSON_DESCRIBE_SCHEMA if self.cfg.structured_output else "json",
+            "think": False,
+            "options": {
+                "temperature": self.cfg.temperature,
+                "num_ctx": self.cfg.num_ctx,
+                "num_predict": 700,
+            },
+        }
+        content = self._chat(payload)
+        return parse_model_json(content), content
+
+    def match_people(self, image_b64: str, people_json: str) -> tuple[dict, str]:
+        """Check which registered people appear in one photo.
+
+        One call evaluates every person (the prompt embeds their profiles).
+        Uses the same anti-loop retry as extract().
+        """
+        payload = {
+            "model": self.person_model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": PERSON_MATCH_PROMPT_HEAD + people_json + PERSON_MATCH_PROMPT_TAIL,
+                    "images": [image_b64],
+                },
+            ],
+            "stream": False,
+            "format": PERSON_MATCH_SCHEMA if self.cfg.structured_output else "json",
+            "think": False,
+            "options": {
+                "temperature": self.cfg.temperature,
+                "num_ctx": self.cfg.num_ctx,
+                "num_predict": 700,
+            },
+        }
+        content = self._chat(payload)
+        try:
+            return parse_model_json(content), content
+        except ModelOutputError:
+            retry_payload = dict(payload)
+            retry_payload["options"] = {
+                **payload["options"],
+                "temperature": 0.7,
+                "repeat_penalty": 1.2,
+            }
+            content = self._chat(retry_payload)
+            return parse_model_json(content), content
 
     def _chat(self, payload: dict) -> str:
         try:
