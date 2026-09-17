@@ -94,6 +94,7 @@ class ScanStats:
     slice_skipped: int = 0
     deferred: int = 0
     previews: int = 0
+    bad_names: int = 0
 
     def update(self, other: "ScanStats") -> None:
         for field in (
@@ -105,6 +106,7 @@ class ScanStats:
             "slice_skipped",
             "deferred",
             "previews",
+            "bad_names",
         ):
             setattr(self, field, getattr(self, field) + getattr(other, field))
 
@@ -309,6 +311,15 @@ def scan_source(
     queued_new = 0
     for image_path in _iter_image_files(root, walk_errors):
         stats.images_found += 1
+        try:
+            str(image_path).encode("utf-8")
+        except UnicodeEncodeError:
+            # Mangled filename (lone surrogates) — SQLite cannot store it and
+            # a strict-UTF-8 terminal cannot print it; skip like unreadable files.
+            stats.bad_names += 1
+            if not quiet:
+                print(f"  skipped unencodable filename: {ascii(str(image_path))}")
+            continue
         try:
             st = image_path.stat()
         except OSError:

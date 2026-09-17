@@ -1737,6 +1737,55 @@ def main() -> int:
         mock39.terminate()
         mock39.wait()
 
+    print("\n[40] surrogates: unencodable filenames and model output")
+    port40 = free_port()
+    mock40 = start_mock(port40, mode_file)
+    try:
+        cfg40 = work / "config-surrogates.toml"
+        cfg40.write_text(
+            f'ollama_url = "http://127.0.0.1:{port40}"\n'
+            f'model = "{MODEL}"\n'
+            f'db_path = "{work}/db-surrogates.db"\n'
+        )
+        c40 = CLI(cfg40)
+        sur_src = work / "surrogatefolder"
+        sur_src.mkdir()
+        make_person_image(sur_src / "good.jpg", "white")
+        out = c40.run("scan", str(sur_src))
+        check("unencodable-names" not in out, "clean scan reports no bad names")
+        # APFS refuses to create invalid-UTF-8 filenames, so exercise the
+        # skip guard with a stubbed walker (mangled names can still arrive
+        # from old HFS+ libraries or external disks).
+        import phototext.scanner as scanner_mod
+
+        bad_name = sur_src / "bad\udced\udca0\udcbe.jpg"
+        real_iter = scanner_mod._iter_image_files
+        scanner_mod._iter_image_files = lambda root, errs: iter([bad_name])
+        try:
+            con40 = db_open(work / "db-surrogates.db")
+            stats40 = scanner_mod.scan_source(con40, str(sur_src), 1, quiet=True)
+        finally:
+            scanner_mod._iter_image_files = real_iter
+        check(stats40.bad_names == 1, "mangled filename is skipped and counted")
+        check(
+            count(con40, "SELECT COUNT(*) FROM photos") == 1,
+            "bad-name file is not registered",
+        )
+        mode_file.write_text("surrogate")
+        out = c40.run("run")
+        check("Queue drained" in out, "run survives unpaired-surrogate model output")
+        check(
+            count(con40, "SELECT COUNT(*) FROM photos WHERE status='done'") == 1,
+            "photo completes despite the bad escape",
+        )
+        text40 = con40.execute("SELECT text FROM photos LIMIT 1").fetchone()[0]
+        check("\ufffd" in text40, "lone surrogate sanitized to U+FFFD in stored text")
+        con40.close()
+    finally:
+        mode_file.write_text("ok")
+        mock40.terminate()
+        mock40.wait()
+
     print()
     if FAILURES:
         print(f"{len(FAILURES)} FAILURE(S):")

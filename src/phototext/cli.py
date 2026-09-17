@@ -23,7 +23,9 @@ from .memes import ensure_hashes, find_clusters
 from .ollama_client import OllamaClient
 
 try:
-    sys.stdout.reconfigure(line_buffering=True)
+    # line_buffering: piped overnight runs show live progress; backslashreplace:
+    # a mangled filename or odd model character must never kill a run
+    sys.stdout.reconfigure(line_buffering=True, errors="backslashreplace")
 except Exception:
     pass
 
@@ -345,6 +347,8 @@ def scan(
         )
         if stats.slice_skipped:
             line += f" | slice-skipped {stats.slice_skipped}"
+        if stats.bad_names:
+            line += f" | unencodable-names {stats.bad_names}"
         if stats.deferred:
             line += f" | awaiting download {stats.deferred}"
         if stats.previews:

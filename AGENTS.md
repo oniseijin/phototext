@@ -195,9 +195,17 @@ tests/
   slice preference, backfill, search date filters, web timeline), the
   near-duplicate finder (CLI + json + web tab + derivative exclusion),
   and face detection (auto-box, multi-face refusal, face-crop matching,
-  the no-faces skip, ground-truth survival, doctor). Run it
+  the no-faces skip, ground-truth survival, doctor), and surrogate hardening
+  (unpaired-surrogate model output sanitized at parse time, unencodable
+  filenames skipped and counted). APFS refuses to create invalid-UTF-8
+  filenames, so the scanner skip guard is exercised via the stubbed-walker
+  check in e2e section [40] while the model-output path runs end-to-end
+  against the mock's `surrogate` mode. Run it
   after any change to scanner/worker/db/ollama_client/cli/library_meta/
   webui/memes/people/prompt/faces.
+- Model output is sanitized for unpaired surrogates at the single parse
+  choke point (`ollama_client.parse_model_json`); never parse model JSON
+  outside it.
 - macOS `realpath` resolves `/var` -> `/private/var` and can normalize path case
   (`Originals` -> `originals`); never assert exact path strings.
 

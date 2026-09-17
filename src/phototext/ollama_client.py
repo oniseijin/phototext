@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 import requests
 
@@ -38,12 +39,34 @@ class ModelOutputError(Exception):
         self.content = content
 
 
+_SURROGATE_RE = re.compile("[\ud800-\udfff]")
+
+
+def _clean_surrogates(value):
+    """Replace unpaired surrogates in model output with U+FFFD.
+
+    Models sometimes emit an unpaired surrogate escape (half of an emoji).
+    json.loads accepts it, but the resulting str cannot be stored in SQLite
+    (strict UTF-8) and would kill the run, so scrub every string here —
+    the single parse choke point for all model calls. Properly paired
+    escapes are combined into the real character by json.loads itself and
+    never match.
+    """
+    if isinstance(value, str):
+        return _SURROGATE_RE.sub("\ufffd", value)
+    if isinstance(value, list):
+        return [_clean_surrogates(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _clean_surrogates(item) for key, item in value.items()}
+    return value
+
+
 def parse_model_json(content: str | None) -> dict:
     if content:
         try:
             value = json.loads(content)
             if isinstance(value, dict):
-                return value
+                return _clean_surrogates(value)
         except ValueError:
             pass
         start, end = content.find("{"), content.rfind("}")
@@ -51,7 +74,7 @@ def parse_model_json(content: str | None) -> dict:
             try:
                 value = json.loads(content[start : end + 1])
                 if isinstance(value, dict):
-                    return value
+                    return _clean_surrogates(value)
             except ValueError:
                 pass
     raise ModelOutputError("model did not return usable JSON", content)

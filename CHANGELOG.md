@@ -6,6 +6,25 @@ semantic versioning.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-09-18
+
+### Fixed
+
+- A run could exit with `'utf-8' codec can't encode character ... surrogates
+  not allowed` when the model emitted an unpaired surrogate escape (half an
+  emoji) in its JSON: the escape survived parsing but cannot be stored in
+  SQLite. Model output is now sanitized at parse time (lone surrogates
+  become U+FFFD) and the same bug can no longer kill an overnight run.
+- Files with unencodable (mangled) filenames are skipped with a warning and
+  counted in the scan summary (`unencodable-names`) instead of aborting the
+  scan.
+
+### Changed
+
+- The progress console now replaces unencodable characters instead of
+  crashing on them, so a stray filename or model character cannot end a
+  piped run.
+
 ## [0.3.0] - 2026-09-17
 
 ### Added

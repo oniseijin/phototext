@@ -176,6 +176,26 @@ def build_handler(model: str, mode_file: Path, slow_seconds: float, ps_file: Pat
                     return
             if mode == "slow":
                 time.sleep(slow_seconds)
+            if mode == "surrogate":
+                # Raw JSON text carrying an unpaired surrogate escape (half an
+                # emoji): json.loads materializes a lone \ud83e that would
+                # crash strict-UTF-8 storage if not sanitized.
+                content = (
+                    '{"has_text": true, "text": "half an emoji \\ud83e lands here '
+                    'and stays in the stored text", "context": "A mock photo used '
+                    'by the surrogate test.", "text_kind": "document", '
+                    '"language": "en", "category": "document"}'
+                )
+                self._json(
+                    200,
+                    {
+                        "model": model,
+                        "created_at": "2026-01-01T00:00:00Z",
+                        "message": {"role": "assistant", "content": content},
+                        "done": True,
+                    },
+                )
+                return
             content = json.dumps(
                 {
                     "has_text": True,
