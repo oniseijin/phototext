@@ -234,6 +234,20 @@ model, `num_ctx`.
 - **Face detection** — **shipped** (0.3.0): macOS Vision (pyobjc) prefilter
   and face-crop matching in `people run`, auto-box on `people name`,
   doctor check.
+- **Hidden view + card toggles** — **shipped** (0.3.3–0.3.4): web hidden-only
+  view, per-card hide/unhide, filters that compose instead of replacing
+  each other.
+- **Offload demote + asset map** — **shipped** (0.4.0): `photo_assets`
+  (source, uuid -> photo) survives iCloud Optimize Storage; `demote_offloaded`
+  keeps processed rows when originals are evicted (never requeues, no
+  duplicate `deferred:` rows), relinks the Photos preview derivative,
+  `photos.offloaded` + web badge, `promote_deferred` clears it;
+  `cache-previews` backfills the web caches as eviction insurance.
+- **Library hidden sync** — **shipped** (0.4.0): `photos.hidden_origin`
+  (NULL | 'library' | 'user'); the library's hidden flag imports and unimports
+  in both directions, phototext's own hide/unhide verdicts always win
+  (migration backfills existing hiddens as 'user'); iPhoto apdb hidden
+  import best-effort via the adaptive reader.
 
 ### Backlog
 

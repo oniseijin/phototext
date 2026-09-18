@@ -132,6 +132,18 @@ MIGRATIONS: dict[int, str] = {
     ALTER TABLE person_tags ADD COLUMN seed INTEGER NOT NULL DEFAULT 0;
     UPDATE person_tags SET seed = 1 WHERE origin = 'seed';
     """,
+    11: """
+    CREATE TABLE photo_assets (
+        source_id INTEGER NOT NULL,
+        uuid TEXT NOT NULL,
+        photo_id INTEGER NOT NULL REFERENCES photos(id),
+        PRIMARY KEY (source_id, uuid)
+    );
+    ALTER TABLE photos ADD COLUMN offloaded INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE photos ADD COLUMN hidden_origin TEXT;
+    UPDATE photos SET hidden_origin = 'user'
+    WHERE hidden = 1 AND hidden_origin IS NULL;
+    """,
 }
 
 
@@ -247,6 +259,8 @@ def remove_source(conn: sqlite3.Connection, source_id: int) -> dict:
         "SELECT COUNT(*) AS n FROM locations WHERE source_id = ?", (source_id,)
     ).fetchone()["n"]
     conn.execute("DELETE FROM locations WHERE source_id = ?", (source_id,))
+    if _table_exists(conn, "photo_assets"):
+        conn.execute("DELETE FROM photo_assets WHERE source_id = ?", (source_id,))
     if _table_exists(conn, "photo_warnings"):
         conn.execute(
             "DELETE FROM photo_warnings WHERE photo_id IN "
@@ -418,7 +432,8 @@ def hide_photos(
         return 0
     marks = ",".join("?" for _ in photo_ids)
     cur = conn.execute(
-        f"UPDATE photos SET hidden = ? WHERE id IN ({marks}) AND deleted_at IS NULL",
+        f"UPDATE photos SET hidden = ?, hidden_origin = 'user' "
+        f"WHERE id IN ({marks}) AND deleted_at IS NULL",
         [int(hidden)] + photo_ids,
     )
     conn.commit()
@@ -468,6 +483,7 @@ def purge_photos(conn: sqlite3.Connection, photo_ids: list[int]) -> int:
         )
     if _table_exists(conn, "person_tags"):
         conn.execute(f"DELETE FROM person_tags WHERE photo_id IN ({marks})", photo_ids)
+    conn.execute(f"DELETE FROM photo_assets WHERE photo_id IN ({marks})", photo_ids)
     conn.execute(f"DELETE FROM locations WHERE photo_id IN ({marks})", photo_ids)
     cur = conn.execute(f"DELETE FROM photos WHERE id IN ({marks})", photo_ids)
     conn.commit()
@@ -520,20 +536,29 @@ def ensure_deferred_photo(
     uuid: str,
     path: str | None,
     derivative: bool,
-) -> None:
+    hidden: bool = False,
+) -> int:
     """Register an iCloud-only photo so the inventory is complete.
 
     Identity is 'deferred:<uuid>' until real content exists locally. Photos
     with a preview derivative are queued for best-effort extraction
-    (flagged `derivative`); the rest wait as status='deferred'.
+    (flagged `derivative`); the rest wait as status='deferred'. A library
+    hidden flag imports into phototext's hidden (origin 'library').
+    Returns the photo id.
     """
     key = deferred_key(uuid)
     row = conn.execute("SELECT id FROM photos WHERE sha256 = ?", (key,)).fetchone()
     if row is None:
         cur = conn.execute(
-            "INSERT INTO photos (sha256, byte_size, status, derivative) "
-            "VALUES (?, 0, ?, ?)",
-            (key, "queued" if derivative else "deferred", int(derivative)),
+            "INSERT INTO photos (sha256, byte_size, status, derivative, hidden, "
+            "hidden_origin) VALUES (?, 0, ?, ?, ?, ?)",
+            (
+                key,
+                "queued" if derivative else "deferred",
+                int(derivative),
+                int(hidden),
+                "library" if hidden else None,
+            ),
         )
         photo_id = cur.lastrowid
     else:
@@ -545,6 +570,7 @@ def ensure_deferred_photo(
             "ON CONFLICT(source_id, path) DO UPDATE SET photo_id = excluded.photo_id",
             (photo_id, source_id, path),
         )
+    return photo_id
 
 
 def promote_deferred(
@@ -587,10 +613,10 @@ def promote_deferred(
             "ON CONFLICT(sha256) DO NOTHING",
             (sha256, byte_size),
         )
-        row = conn.execute(
-            "SELECT id FROM photos WHERE sha256 = ?", (sha256,)
-        ).fetchone()
+        row = conn.execute("SELECT id FROM photos WHERE sha256 = ?", (sha256,)).fetchone()
         photo_id = row["id"]
+    # The original is back on disk: this photo is no longer offloaded.
+    conn.execute("UPDATE photos SET offloaded = 0 WHERE id = ?", (photo_id,))
     conn.execute(
         "INSERT INTO locations (photo_id, source_id, path, mtime, size) "
         "VALUES (?, ?, ?, ?, ?) "
@@ -599,6 +625,99 @@ def promote_deferred(
         (photo_id, source_id, path, mtime, byte_size),
     )
     return photo_id
+
+
+def record_asset(
+    conn: sqlite3.Connection, source_id: int, uuid: str, photo_id: int
+) -> None:
+    """Remember which photo a Photos-library asset (by UUID) maps to.
+
+    This is the identity link that survives iCloud offloading: when the
+    original disappears we can still find the already-processed photo.
+    """
+    conn.execute(
+        "INSERT INTO photo_assets (source_id, uuid, photo_id) VALUES (?, ?, ?) "
+        "ON CONFLICT(source_id, uuid) DO UPDATE SET photo_id = excluded.photo_id",
+        (source_id, uuid.strip().lower(), photo_id),
+    )
+
+
+def asset_photo_id(
+    conn: sqlite3.Connection, source_id: int, uuid: str
+) -> int | None:
+    row = conn.execute(
+        "SELECT photo_id FROM photo_assets WHERE source_id = ? AND uuid = ?",
+        (source_id, uuid.strip().lower()),
+    ).fetchone()
+    return row["photo_id"] if row is not None else None
+
+
+def asset_uuid(conn: sqlite3.Connection, photo_id: int) -> str | None:
+    """First known Photos-library UUID for a photo (for 'open in Photos')."""
+    row = conn.execute(
+        "SELECT uuid FROM photo_assets WHERE photo_id = ? ORDER BY source_id LIMIT 1",
+        (photo_id,),
+    ).fetchone()
+    return row["uuid"] if row is not None else None
+
+
+def apply_library_hidden(
+    conn: sqlite3.Connection, photo_id: int, hidden: bool
+) -> None:
+    """Sync the library's hidden flag into phototext's hidden flag.
+
+    'user' rows (hidden or unhidden through phototext itself) are never
+    touched — the user's own choice always wins over the library's.
+    """
+    if hidden:
+        conn.execute(
+            "UPDATE photos SET hidden = 1, hidden_origin = 'library' "
+            "WHERE id = ? AND hidden_origin IS NOT 'user'",
+            (photo_id,),
+        )
+    else:
+        conn.execute(
+            "UPDATE photos SET hidden = 0, hidden_origin = NULL "
+            "WHERE id = ? AND hidden_origin = 'library'",
+            (photo_id,),
+        )
+
+
+def demote_offloaded(
+    conn: sqlite3.Connection,
+    source_id: int,
+    photo_id: int,
+    derivative_path: str | None,
+) -> bool:
+    """An asset's original was evicted by iCloud after the photo was
+    processed: keep the processed row (never requeue), prune its dead
+    locations for this source, attach the local preview derivative if one
+    exists, and flag `offloaded`. Returns True when anything changed."""
+    changed = False
+    for loc in conn.execute(
+        "SELECT id, path FROM locations WHERE photo_id = ? AND source_id = ?",
+        (photo_id, source_id),
+    ).fetchall():
+        if not Path(loc["path"]).exists():
+            conn.execute("DELETE FROM locations WHERE id = ?", (loc["id"],))
+            changed = True
+    if derivative_path is not None:
+        conn.execute(
+            "INSERT INTO locations (photo_id, source_id, path, mtime, size) "
+            "VALUES (?, ?, ?, 0, 0) "
+            "ON CONFLICT(source_id, path) DO UPDATE SET photo_id = excluded.photo_id",
+            (photo_id, source_id, derivative_path),
+        )
+        changed = True
+    row = conn.execute(
+        "SELECT offloaded FROM photos WHERE id = ?", (photo_id,)
+    ).fetchone()
+    if row is not None and not row["offloaded"]:
+        conn.execute(
+            "UPDATE photos SET offloaded = 1 WHERE id = ?", (photo_id,)
+        )
+        changed = True
+    return changed
 
 
 def select_photo_ids(

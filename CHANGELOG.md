@@ -6,6 +6,39 @@ semantic versioning.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-18
+
+### Added
+
+- iCloud Optimize Storage resilience: Photos-library assets are tracked by
+  UUID (`photo_assets`), so when iCloud evicts an original *after* the photo
+  was processed, the scan keeps the processed row (flagged `offloaded`),
+  attaches the local Photos preview as its location instead of registering
+  a duplicate, and restores the original location when it downloads again.
+  `unscan` forgets the asset map with the source.
+- The library's hidden flag imports into phototext's hidden: photos hidden
+  in Photos (or in an iPhoto apdb, best-effort) drop out of views, search,
+  export, and the web UI's default grid, and appear in the hidden view.
+  Phototext's own hide/unhide choices always win — rescans never override
+  them, and un-hiding in the library unhides only what the library hid.
+- `phototext cache-previews` backfills the web thumbnail and detail-view
+  caches for every photo with local pixels (resumable; `--thumbs-only` for
+  the grid cache only). Run it before enabling Optimize Storage so photos
+  stay viewable no matter what iCloud evicts.
+- "open in Photos" link on the photo detail page — shows the photo inside
+  the Photos app via AppleScript `spotlight` on the asset UUID. Allowed on
+  read-only servers like reveal; the first use triggers macOS' Automation
+  permission prompt.
+- Scan summaries report `offloaded N` and `library-hidden N`.
+
+### Fixed
+
+- Rescanning a library whose originals iCloud has evicted no longer
+  duplicates already-processed photos as new `deferred:` rows.
+- The web `/image/` route falls back to the cached detail view for any
+  photo whose original is gone; previously browser-safe photos (JPEG) had
+  no cached view and simply 404'd.
+
 ## [0.3.4] - 2026-09-18
 
 ### Fixed

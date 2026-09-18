@@ -10,6 +10,7 @@ date or path-based slices instead.
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 from pathlib import Path
@@ -107,12 +108,25 @@ _IPHOTO_DB_CANDIDATES = ("Database/apdb/Database", "Database/Library.apdb")
 
 
 def iter_photos_assets(library: Path):
-    """Yield (uuid, original_path_or_None) for every photo asset a Photos
-    library knows about — including iCloud-only ones with no local file.
+    """Yield (uuid, original_path_or_None, hidden) for every photo asset a
+    Photos library knows about — including iCloud-only ones with no local
+    file.
 
     Raises LibraryMetaError if osxphotos is unavailable or the library
     cannot be read.
+
+    Test seam: ``PHOTOTEXT_TEST_ASSETS=<json-file>`` replaces osxphotos
+    with a JSON list of ``[uuid, original_path_or_null, hidden]`` triples,
+    so the Photos-library scan path can be exercised without a real
+    library (used by tests/e2e.py; real libraries never see it).
     """
+    seam = os.environ.get("PHOTOTEXT_TEST_ASSETS", "").strip()
+    if seam:
+        with open(seam, encoding="utf-8") as f:
+            entries = json.load(f)
+        for uuid, path, hidden in entries:
+            yield str(uuid), (Path(path) if path else None), bool(hidden)
+        return
     try:
         import osxphotos
     except ImportError as e:
@@ -126,7 +140,8 @@ def iter_photos_assets(library: Path):
         raise LibraryMetaError(f"could not read Photos library '{library}': {e}") from e
     for photo in photo_db.photos(movies=False):
         path = _get(photo, "original_path", None) or _get(photo, "path", None)
-        yield str(photo.uuid), (Path(path) if path else None)
+        hidden = bool(_get(photo, "hidden", False))
+        yield str(photo.uuid), (Path(path) if path else None), hidden
 
 
 def find_derivative(library: Path, uuid: str) -> Path | None:
@@ -285,6 +300,20 @@ def _iphoto_query(
     if not mrefs:
         return set()
 
+    return _master_paths_for(
+        conn, library, mrefs, master_table, master_uuid_col, master_path_col
+    )
+
+
+def _master_paths_for(
+    conn: sqlite3.Connection,
+    library: Path,
+    mrefs: list,
+    master_table: str,
+    master_uuid_col: str,
+    master_path_col: str,
+) -> set[str]:
+    """Resolve version master refs (uuid strings or rowids) to library paths."""
     # Master link: either v.<master_ref> = m.<uuid> or m.rowid = v.<master_ref>.
     paths: set[str] = set()
     if isinstance(mrefs[0], str) and not str(mrefs[0]).isdigit():
@@ -308,6 +337,46 @@ def _iphoto_query(
             ):
                 paths.add(p)
     return {_resolve_iphoto_path(library, p) for p in paths if p}
+
+
+def hidden_iphoto_paths(library: Path) -> set[str]:
+    """Normalized paths of photos hidden inside an iPhoto library (best-effort).
+
+    Old iPhoto schemas vary; when no hidden flag column can be found, or
+    the database cannot be opened, the result is simply empty — the scan
+    never fails because of this. Never raises.
+    """
+    library = Path(library).expanduser().resolve()
+    try:
+        conn = _open_iphoto_db(library)
+    except LibraryMetaError:
+        return set()
+    try:
+        tables = _tables_by_lower(conn)
+        version_table = tables["rkversion"]
+        master_table = tables["rkmaster"]
+        version_cols = _cols(conn, version_table)
+        master_cols = _cols(conn, master_table)
+        master_ref = _pick(version_cols, ("masterid", "masteruuid", "master_id", "master_uuid"))
+        master_uuid_col = _pick(master_cols, ("uuid",))
+        master_path_col = _pick(master_cols, ("imagepath", "image_path", "path"))
+        hidden_col = _pick(version_cols, ("hidden", "ishidden", "is_hidden"))
+        if not (master_ref and master_uuid_col and master_path_col and hidden_col):
+            return set()
+        rows = conn.execute(
+            f'SELECT "{master_ref}" AS _mref, "{hidden_col}" AS _hidden '
+            f'FROM "{version_table}"'
+        ).fetchall()
+        mrefs = [r["_mref"] for r in rows if _truthy(r["_hidden"])]
+        if not mrefs:
+            return set()
+        return _master_paths_for(
+            conn, library, mrefs, master_table, master_uuid_col, master_path_col
+        )
+    except (sqlite3.Error, ValueError, TypeError):
+        return set()
+    finally:
+        conn.close()
 
 
 def _album_version_rowids(

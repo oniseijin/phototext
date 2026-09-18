@@ -25,8 +25,9 @@ src/phototext/
   cli.py           typer commands; global --config/--db; scan/run slices,
                    search (--person/--year/--date-from/--date-to), export,
                    migrate, serve, reprocess, help, hide/unhide/delete/
-                   restore/purge/trash, unscan, backfill-dates, categories,
-                   memes, duplicates, autocomplete, profiles, people
+                   restore/purge/trash, unscan, backfill-dates,
+                   cache-previews, categories, memes, duplicates,
+                   autocomplete, profiles, people
                    (name/run/list/photos/confirm [--add-seed]/remove/rename/
                    reset/delete/describe)
   config.py        dataclass Config, ~/.phototext/config.toml (TOML) loading
@@ -36,7 +37,9 @@ src/phototext/
   imaging.py       hashing, decode/downscale/encode, EXIF date read,
                    quadrant tiles, sips fallback, crop_jpeg, test image
   library_meta.py  album/favorites/UUID -> paths: osxphotos (Photos) or
-                   adaptive iPhoto apdb reader
+                   adaptive iPhoto apdb reader; iter_photos_assets (uuid,
+                   path, hidden) + PHOTOTEXT_TEST_ASSETS seam; apdb hidden
+                   flag; find_derivative
   people.py        person seeds (face crops), recognition profiles, the
                    `people run` matching pass (face prefilter + crops)
   memes.py         63-bit dhash, backfill, hamming clustering (union-find);
@@ -47,10 +50,12 @@ src/phototext/
                    calls, anti-loop retry, parsing
   prompt.py        prompts, response schema, tile merge, normalization
   scanner.py       source resolution, walk, dedup, fast path, EXIF
-                   date_taken at registration, Slice filters
+                   date_taken at registration, Slice filters; Photos
+                   library scan (asset map, offload demote, hidden sync)
   webui.py         read-only local web UI (http.server): browse/search/
                    detail, year timeline, thumbnails, people pages, memes +
-                   duplicates tabs, reveal-in-Finder
+                   duplicates tabs, reveal-in-Finder, open-in-Photos,
+                   views/thumbs caches
   worker.py        run loop: claim/process, retries, budgets, signals
 bin/phototext-dev  dev wrapper: workspace code via repo .venv
 install.sh         installer: snapshot venv, var/ layout, bin wrappers, migrate
@@ -111,6 +116,9 @@ tests/
 - **Web writes are opt-in**: `serve --writable` turns on POST-only hide/
   unhide/delete/restore/purge routes guarded by a session token + Origin
   check; read-only servers 404 them. Keep the token checks intact.
+  `/reveal` and `/open-photos` are read-only GET routes on purpose (they
+  only shell out to `open -R` / osascript `spotlight` locally); keep them
+  out of the writable gate.
 - **Pixel policy**: `max_image_pixels` (default ~357M) is a hard budget;
   `_bomb_check` raises and the error deliberately bypasses the sips
   fallback. Softer PIL warnings are captured per photo
@@ -123,6 +131,25 @@ tests/
   `resources/derivatives/`). The next scan promotes downloaded originals
   (`promote_deferred` collapses into the content-hash row). Scan summaries
   report the split (`previews`, `awaiting download`).
+- **Offload demote** (migration 11): every asset seen is mapped in
+  `photo_assets(source_id, uuid, photo_id)` (uuid lowercase) — the link that
+  survives iCloud Optimize Storage. When an asset's original disappears but
+  the map knows the photo, `db.demote_offloaded` keeps the processed row
+  (never requeues), prunes its dead locations, attaches the Photos preview
+  derivative, and sets `photos.offloaded`; a returning original clears it in
+  `promote_deferred`. Never let a demoted photo fall back into the
+  `ensure_deferred_photo` path — that duplicates already-processed photos.
+  `unscan`/`purge` clean the map (FK on photos.id). The web falls back to
+  the `views/` cache for any photo without on-disk pixels; serve photos
+  before enabling Optimize Storage with `phototext cache-previews`.
+- **Library hidden sync** (migration 11): `photos.hidden_origin` is
+  NULL | 'library' | 'user'. Scans apply the library's hidden flag via
+  `db.apply_library_hidden` — 'user' rows (phototext's own hide/unhide,
+  backfilled onto pre-existing hiddens by the migration) are never touched;
+  a library unhide only clears rows the library hid. iPhoto walk-scans
+  import hidden best-effort from the apdb (`hidden_iphoto_paths`, no hidden
+  column = silent no-op). Hidden photos are still claimed by the worker —
+  invisible in views/results/search/export, visible in the web hidden view.
 - **Profiles** (`--profile <name>`) swap the state dir to
   `<config parent>/profiles/<name>/`: catalog `catalog.db`, optional
   `config.toml` that *replaces* the base config for that profile.
@@ -195,12 +222,20 @@ tests/
   slice preference, backfill, search date filters, web timeline), the
   near-duplicate finder (CLI + json + web tab + derivative exclusion),
   and face detection (auto-box, multi-face refusal, face-crop matching,
-  the no-faces skip, ground-truth survival, doctor), and surrogate hardening
+  the no-faces skip, ground-truth survival, doctor), surrogate hardening
   (unpaired-surrogate model output sanitized at parse time, unencodable
-  filenames skipped and counted). APFS refuses to create invalid-UTF-8
+  filenames skipped and counted), and iCloud offload + library hidden
+  (seamed Photos-library scan via `PHOTOTEXT_TEST_ASSETS`: asset map,
+  demote without duplicates, derivative relink, re-promote, cached-view
+  fallback, hidden sync both directions with user-override survival,
+  iPhoto apdb hidden import + no-op without the column, cache-previews,
+  unscan cleaning the asset map). APFS refuses to create invalid-UTF-8
   filenames, so the scanner skip guard is exercised via the stubbed-walker
   check in e2e section [40] while the model-output path runs end-to-end
-  against the mock's `surrogate` mode. Run it
+  against the mock's `surrogate` mode. The open-in-Photos route is never
+  executed in e2e (it would launch Photos.app); only its links/404s are
+  checked — osascript/AppleScript `spotlight` needs a manual smoke test.
+  Run it
   after any change to scanner/worker/db/ollama_client/cli/library_meta/
   webui/memes/people/prompt/faces.
 - Model output is sanitized for unpaired surrogates at the single parse
@@ -234,5 +269,6 @@ tests/
 See `DESIGN.md` for the full design, decision log, and milestones (M2 shipped:
 slices, FTS search, export, migrations + installer; M3: web UI, idle
 detection, reprocess, tiling, memes, watch mode, workers, two-tier gate —
-all shipped; 0.5.0: tombstones + writable web, warnings + pixel policy,
-iCloud deferred inventory).
+all shipped; 0.3.x: tombstones + writable web, warnings + pixel policy,
+iCloud deferred inventory, hidden view + composing filters; 0.4.0: iCloud
+offload resilience + library hidden sync).

@@ -535,6 +535,8 @@ def render_detail(conn: sqlite3.Connection, photo_id: int, ctx: dict | None = No
         ("sha256", (row["sha256"] or "")[:16] + " ..."),
         ("size", f"{row['byte_size']:,} bytes" if row["byte_size"] else "?"),
     ]
+    if row["offloaded"]:
+        rows_meta.insert(1, ("original", "offloaded by iCloud"))
     if row["error"]:
         rows_meta.append(("error", row["error"]))
     meta = "".join(f"<tr><td>{esc(k)}</td><td>{esc(v)}</td></tr>" for k, v in rows_meta)
@@ -570,14 +572,25 @@ def render_detail(conn: sqlite3.Connection, photo_id: int, ctx: dict | None = No
             if exists
             else "<span class='badge err'>missing</span>"
         )
-        reveal = f"/reveal/{photo_id}?loc={loc['id']}"
+        if exists:
+            reveal = (
+                f"<a href='/reveal/{photo_id}?loc={loc['id']}'>reveal in Finder</a><br>"
+            )
+        else:
+            reveal = ""
         loc_items.append(
             f"<li>{disk} <span class='badge'>{esc(kind)}</span> "
-            f"<a href='{reveal}'>reveal in Finder</a><br>"
+            f"{reveal}"
             f"{esc(loc['path'])}<br>"
             f"<span class='muted'>from {esc(loc['source_uri'] or '?')}</span></li>"
         )
     loc_list = "".join(loc_items)
+    photos_link = (
+        f"<p class='muted'><a href='/open-photos/{photo_id}'>open in Photos</a>"
+        " &#8594; shows the photo inside the Photos app</p>"
+        if db.asset_uuid(conn, photo_id)
+        else ""
+    )
     text = row["text"] or ""
     context = row["context"] or ""
     raw = row["raw_response"] or ""
@@ -637,6 +650,7 @@ def render_detail(conn: sqlite3.Connection, photo_id: int, ctx: dict | None = No
         )
     else:
         body += f"<img src='/image/{photo_id}' alt='photo {photo_id}'>"
+    body += photos_link
     body += "<div class='meta'>"
     body += f"<table>{meta}</table>"
     body += people_section
@@ -815,9 +829,11 @@ def thumb_bytes(conn: sqlite3.Connection, photo_id: int, thumbs_dir: Path) -> by
 def view_image_bytes(conn: sqlite3.Connection, photo_id: int, views_dir: Path) -> bytes | None:
     """Display-ready JPEG for the detail page, cached under <db_dir>/views/.
 
-    Browser-safe originals never reach here (the route serves them raw);
-    this converts HEIC/TIFF/PSD/... so every browser can render them.
-    Returns None when the file exists but cannot be converted."""
+    Browser-safe originals never reach here while the file exists (the
+    route serves them raw); this converts HEIC/TIFF/PSD/... so every
+    browser can render them. When the original is gone entirely (iCloud
+    offload), the cache alone serves the route. Returns None when there
+    is no cache and no readable file."""
     cache = views_dir / f"{photo_id}.jpg"
     if cache.exists():
         try:
@@ -1367,6 +1383,7 @@ class _Handler(BaseHTTPRequestHandler):
             ("/thumb/", self._route_thumb),
             ("/image/", self._route_image),
             ("/reveal/", self._route_reveal),
+            ("/open-photos/", self._route_open_photos),
         ):
             if route.startswith(prefix):
                 tail = route[len(prefix):]
@@ -1470,13 +1487,18 @@ class _Handler(BaseHTTPRequestHandler):
                 # Most browsers cannot render HEIC/TIFF/PSD originals;
                 # serve a converted, cached JPEG instead.
                 converted = view_image_bytes(conn, photo_id, self.server.phototext_views)
+            elif path is None:
+                # Original offloaded by iCloud (or the file vanished):
+                # fall back to the cached view so the detail page keeps
+                # rendering whatever pixels we still have.
+                converted = view_image_bytes(conn, photo_id, self.server.phototext_views)
         finally:
             conn.close()
-        if path is None:
-            self._not_found("original file not on disk")
-            return
         if converted is not None:
             self._send(200, converted, "image/jpeg")
+            return
+        if path is None:
+            self._not_found("original file not on disk")
             return
         try:
             size = path.stat().st_size
@@ -1515,6 +1537,43 @@ class _Handler(BaseHTTPRequestHandler):
             self._not_found("reveal needs macOS (`open` command)")
             return
         subprocess.run([opener, "-R", str(path)], check=False)
+        self.send_response(303)
+        self.send_header("Location", f"/photo/{photo_id}")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _route_open_photos(self, photo_id: int, params: dict, ctx: dict) -> None:
+        """Show the photo in Photos.app (AppleScript 'spotlight').
+
+        Works on read-only servers like /reveal — it only tells the local
+        Photos app to reveal an asset by its library UUID. The first use
+        triggers macOS' Automation permission prompt for the terminal
+        running phototext.
+        """
+        conn = _open_ro(self.server.phototext_db)
+        try:
+            uuid = db.asset_uuid(conn, photo_id)
+        finally:
+            conn.close()
+        if uuid is None:
+            self._not_found("photo has no Photos-library asset id")
+            return
+        osascript = shutil.which("osascript")
+        if osascript is None:
+            self._not_found("opening Photos needs macOS (`osascript`)")
+            return
+        try:
+            subprocess.run(
+                [
+                    osascript, "-e",
+                    'tell application "Photos" to spotlight '
+                    f'(media item id "{uuid}")',
+                ],
+                check=False,
+                timeout=15,
+            )
+        except subprocess.TimeoutExpired:
+            pass
         self.send_response(303)
         self.send_header("Location", f"/photo/{photo_id}")
         self.send_header("Content-Length", "0")

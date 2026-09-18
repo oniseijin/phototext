@@ -353,6 +353,10 @@ def scan(
             line += f" | awaiting download {stats.deferred}"
         if stats.previews:
             line += f" | previews {stats.previews}"
+        if stats.offloaded:
+            line += f" | offloaded {stats.offloaded}"
+        if stats.library_hidden:
+            line += f" | library-hidden {stats.library_hidden}"
         typer.echo(line)
         totals.update(stats)
     typer.echo(f"catalog: {_counts_summary(db.status_counts(conn))}")
@@ -676,6 +680,81 @@ def backfill_dates(
         summary += f", {from_file} from file mtime"
     summary += f"; {undated} photo(s) still without a date"
     typer.echo(summary)
+
+
+def _dir_bytes(path: Path) -> int:
+    try:
+        return sum(p.stat().st_size for p in path.rglob("*") if p.is_file())
+    except OSError:
+        return 0
+
+
+def _fmt_bytes(size: int) -> str:
+    value = float(size)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024 or unit == "TB":
+            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} {unit}"
+        value /= 1024
+    return f"{value:.1f} TB"
+
+
+@app.command("cache-previews")
+def cache_previews(
+    thumbs_only: bool = typer.Option(
+        False,
+        "--thumbs-only",
+        help="Only fill the small grid-tile cache, not the detail-view cache.",
+    ),
+) -> None:
+    """Pre-generate web preview caches so photos stay viewable after iCloud
+    offloads their originals (Optimize Storage).
+
+    Fills <state>/thumbs/ (grid tiles) and <state>/views/ (detail pages)
+    for every photo that currently has pixels on disk. Resumable — existing
+    cache files are kept. Run once before enabling Optimize Storage.
+    """
+    cfg = _cfg()
+    db_path = Path(cfg.db_path).expanduser()
+    thumbs_dir = db_path.parent / "thumbs"
+    views_dir = db_path.parent / "views"
+    conn = db.connect(db_path)
+    try:
+        ids = [
+            r["id"]
+            for r in conn.execute(
+                "SELECT id FROM photos WHERE deleted_at IS NULL ORDER BY id"
+            )
+        ]
+        if not ids:
+            typer.echo("no photos in the catalog yet")
+            return
+        typer.echo(f"{len(ids)} photo(s) in the catalog")
+        cached = missing = failed = 0
+        before = _dir_bytes(thumbs_dir) + (0 if thumbs_only else _dir_bytes(views_dir))
+        for n, photo_id in enumerate(ids, 1):
+            if db.find_first_existing_location(conn, photo_id) is None:
+                missing += 1
+                continue
+            ok = webui.thumb_bytes(conn, photo_id, thumbs_dir) is not None
+            if not thumbs_only:
+                view = webui.view_image_bytes(conn, photo_id, views_dir)
+                ok = ok or view is not None
+            if ok:
+                cached += 1
+            else:
+                failed += 1
+            if n % 500 == 0:
+                typer.echo(f"  ... {n} / {len(ids)}")
+        after = _dir_bytes(thumbs_dir) + (0 if thumbs_only else _dir_bytes(views_dir))
+        summary = (
+            f"preview cache: {cached} photo(s) cached, {missing} without local pixels"
+        )
+        if failed:
+            summary += f", {failed} failed"
+        summary += f"; cache size {_fmt_bytes(after)} (+{_fmt_bytes(max(0, after - before))})"
+        typer.echo(summary)
+    finally:
+        conn.close()
 
 
 _EXPORT_FIELDS = [

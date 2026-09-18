@@ -95,6 +95,8 @@ class ScanStats:
     deferred: int = 0
     previews: int = 0
     bad_names: int = 0
+    offloaded: int = 0
+    library_hidden: int = 0
 
     def update(self, other: "ScanStats") -> None:
         for field in (
@@ -107,6 +109,8 @@ class ScanStats:
             "deferred",
             "previews",
             "bad_names",
+            "offloaded",
+            "library_hidden",
         ):
             setattr(self, field, getattr(self, field) + getattr(other, field))
 
@@ -395,7 +399,53 @@ def scan_source(
             "Disk Access to your terminal app and rescan.",
             file=sys.stderr,
         )
+    if kind == "library" and Path(uri).name.lower().endswith(".photolibrary"):
+        _import_iphoto_hidden(conn, Path(uri), source_id, stats, quiet)
     return stats
+
+
+def _import_iphoto_hidden(
+    conn, library: Path, source_id: int, stats: "ScanStats", quiet: bool
+) -> None:
+    """Apply an iPhoto library's hidden flag to this source's photos.
+
+    Best-effort: sources without a readable apdb or without a hidden
+    column are skipped silently. Sync rules live in
+    db.apply_library_hidden — phototext's own user hiddens are never
+    touched, and library-origin hiddens unhide when the library does.
+    """
+    from .library_meta import hidden_iphoto_paths
+
+    try:
+        hidden_paths = hidden_iphoto_paths(library)
+    except Exception:
+        return
+    rows = conn.execute(
+        "SELECT photo_id, path FROM locations WHERE source_id = ?", (source_id,)
+    ).fetchall()
+    # Library-visible first: unhides rows previously imported from the
+    # library (origin 'library' only), then the hidden set re-applies.
+    matched: set[int] = set()
+    for row in rows:
+        if norm_path(row["path"]) in hidden_paths:
+            matched.add(row["photo_id"])
+    changed = conn.execute(
+        "UPDATE photos SET hidden = 0, hidden_origin = NULL "
+        "WHERE hidden_origin = 'library' AND hidden = 1 AND id IN "
+        "(SELECT photo_id FROM locations WHERE source_id = ?)",
+        (source_id,),
+    ).rowcount
+    for photo_id in sorted(matched):
+        db.apply_library_hidden(conn, photo_id, True)
+        changed += 1
+    if changed:
+        conn.commit()
+        stats.library_hidden += len(matched)
+        if not quiet:
+            print(
+                f"  {len(matched)} photo(s) hidden in the library "
+                f"({max(0, changed - len(matched))} unhidden)"
+            )
 
 
 def _scan_photos_library(
@@ -405,13 +455,18 @@ def _scan_photos_library(
 
     This is a superset of walking originals/: it also registers iCloud-only
     photos (deferred until their file appears) and processes their preview
-    derivatives as best-effort extractions (flagged `derivative`).
+    derivatives as best-effort extractions (flagged `derivative`). On top
+    of the filesystem view it maintains a uuid -> photo identity map
+    (photo_assets), syncs the library's hidden flag into phototext's, and
+    notices originals iCloud has evicted since the last scan — keeping the
+    processed row (flagged `offloaded`) instead of duplicating it.
     """
     from .library_meta import find_derivative, iter_photos_assets
 
     pending = 0
-    for uuid, original in iter_photos_assets(library):
+    for uuid, original, library_hidden in iter_photos_assets(library):
         stats.images_found += 1
+        photo_id = None
         if original is not None and original.exists():
             try:
                 st = original.stat()
@@ -432,70 +487,93 @@ def _scan_photos_library(
                 and deferred is None
             ):
                 stats.unchanged += 1
-                continue
-            try:
-                digest = sha256_file(original)
-            except OSError:
-                stats.errors += 1
-                continue
-            with warnings.catch_warnings(record=True) as caught:
-                warnings.simplefilter("always", UserWarning)
-                phash = memes_mod.dhash(original)
-            photo_id = db.promote_deferred(
-                conn, uuid, digest, st.st_size, source_id, str(original),
-                int(st.st_mtime),
-            )
-            if phash is not None:
-                conn.execute(
-                    "UPDATE photos SET phash = ? WHERE id = ?", (phash, photo_id)
-                )
-            date_taken = read_date_taken(original)
-            if date_taken is not None:
-                conn.execute(
-                    "UPDATE photos SET date_taken = COALESCE(date_taken, ?) "
-                    "WHERE id = ?",
-                    (date_taken, photo_id),
-                )
-            for warning in caught:
-                db.record_warning(
-                    conn, photo_id,
-                    type(warning.message).__name__, str(warning.message),
-                )
-            if deferred is not None:
-                stats.updated += 1
+                photo_id = existing["photo_id"]
             else:
-                stats.new_photos += 1
+                try:
+                    digest = sha256_file(original)
+                except OSError:
+                    stats.errors += 1
+                    continue
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always", UserWarning)
+                    phash = memes_mod.dhash(original)
+                photo_id = db.promote_deferred(
+                    conn, uuid, digest, st.st_size, source_id, str(original),
+                    int(st.st_mtime),
+                )
+                if phash is not None:
+                    conn.execute(
+                        "UPDATE photos SET phash = ? WHERE id = ?", (phash, photo_id)
+                    )
+                date_taken = read_date_taken(original)
+                if date_taken is not None:
+                    conn.execute(
+                        "UPDATE photos SET date_taken = COALESCE(date_taken, ?) "
+                        "WHERE id = ?",
+                        (date_taken, photo_id),
+                    )
+                for warning in caught:
+                    db.record_warning(
+                        conn, photo_id,
+                        type(warning.message).__name__, str(warning.message),
+                    )
+                if deferred is not None:
+                    stats.updated += 1
+                else:
+                    stats.new_photos += 1
             pending += 1
         else:
             if slice_spec is not None and slice_spec.is_active():
                 stats.slice_skipped += 1
                 continue
             derivative_path = find_derivative(library, uuid)
-            existing = conn.execute(
-                "SELECT p.id, p.derivative FROM photos p WHERE p.sha256 = ?",
-                (db.deferred_key(uuid),),
-            ).fetchone()
-            if existing is None:
-                db.ensure_deferred_photo(
-                    conn, source_id, uuid,
+            # An asset we have already processed (its original was local at
+            # the last scan) whose original iCloud has since evicted: keep
+            # the processed row, serve its local preview instead.
+            photo_id = db.asset_photo_id(conn, source_id, uuid)
+            if photo_id is not None:
+                if db.demote_offloaded(
+                    conn, source_id, photo_id,
                     str(derivative_path) if derivative_path else None,
-                    bool(derivative_path),
-                )
-                if derivative_path:
-                    stats.previews += 1
+                ):
+                    stats.offloaded += 1
+            else:
+                existing = conn.execute(
+                    "SELECT p.id, p.derivative FROM photos p WHERE p.sha256 = ?",
+                    (db.deferred_key(uuid),),
+                ).fetchone()
+                if existing is None:
+                    photo_id = db.ensure_deferred_photo(
+                        conn, source_id, uuid,
+                        str(derivative_path) if derivative_path else None,
+                        bool(derivative_path),
+                        library_hidden,
+                    )
+                    if derivative_path:
+                        stats.previews += 1
+                    else:
+                        stats.deferred += 1
                 else:
-                    stats.deferred += 1
-            elif derivative_path is not None and not existing["derivative"]:
-                db.ensure_deferred_photo(
-                    conn, source_id, uuid, str(derivative_path), True
-                )
-                conn.execute(
-                    "UPDATE photos SET status = 'queued' WHERE id = ? AND "
-                    "status = 'deferred'",
-                    (existing["id"],),
-                )
-                stats.previews += 1
+                    photo_id = existing["id"]
+                    if derivative_path is not None and not existing["derivative"]:
+                        db.ensure_deferred_photo(
+                            conn, source_id, uuid, str(derivative_path), True
+                        )
+                        conn.execute(
+                            "UPDATE photos SET status = 'queued' WHERE id = ? AND "
+                            "status = 'deferred'",
+                            (photo_id,),
+                        )
+                        stats.previews += 1
             pending += 1
+        if photo_id is not None:
+            # The uuid -> photo identity link survives offloading.
+            db.record_asset(conn, source_id, uuid, photo_id)
+            # Library hidden flag syncs into phototext's hidden; rows the
+            # user hid/unhid through phototext itself are never touched.
+            db.apply_library_hidden(conn, photo_id, library_hidden)
+            if library_hidden:
+                stats.library_hidden += 1
         if pending >= 500:
             conn.commit()
             pending = 0

@@ -90,6 +90,7 @@ uv venv .venv && uv pip install -e .
 | `phototext delete <ids...>` | Move photos to the catalog trash (tombstone; files untouched). |
 | `phototext restore <ids...>` | Restore photos from the trash. |
 | `phototext purge <ids...>` / `phototext purge --empty-trash` | Forget trashed photos permanently. |
+| `phototext cache-previews` | Pre-generate the web thumbnail and detail-view caches for every photo with local pixels (`--thumbs-only` for grid tiles only). Run before enabling iCloud Optimize Storage. |
 | `phototext trash` | List trashed photos. |
 | `phototext unscan <source>` | Forget a registered source (by id or path) and photos only seen there. |
 | `phototext memes` | Find near-identical photos (perceptual hash clusters), likely memes. |
@@ -100,10 +101,11 @@ uv venv .venv && uv pip install -e .
 | `phototext people list / photos NAME` | People with tag counts; a person's photos with confidence. |
 | `phototext people confirm / remove ID NAME` | Mark a tag correct (ground truth) or remove it (`--add-seed` also grows the profile). |
 | `phototext people rename / reset / delete NAME` | Rename; drop model tags (keeps confirmed); delete (`--yes`). |
+| `phototext people describe NAME` | Rebuild a person's recognition profile from their seed photos. |
 | `phototext search --person NAME QUERY` | Full-text search within a person's tagged photos (`--year`, `--date-from/--date-to` narrow by capture date). |
 | `phototext migrate` | Apply pending catalog schema migrations (backs up the catalog first). |
 | `phototext serve` | Local web UI: browse photos + recovered text, search box (`--host`, `--port`, `--writable` for hide/delete actions). |
-| `phototext doctor` | Diagnose config, database, Ollama, model, vision support (prints the version first). |
+| `phototext doctor` | Diagnose config, database, Ollama, model vision, and face detection support (prints the version first). |
 | `phototext --version` | Print the installed version (`doctor` shows it too). |
 | `phototext autocomplete` | Install TAB completion for the `phototext` command into your shell profile (bash or zsh). |
 | `phototext profiles` | List named profiles (alternate catalogs) with photo counts. |
@@ -137,6 +139,22 @@ previews (flagged `derivative`), and photos with no local pixels are recorded as
 `deferred` (nothing to extract until they are downloaded). The scan summary shows
 the split: `new N | previews N | awaiting download N`. Deferred photos are promoted
 automatically on the next scan after they download. Plain folders work the same way.
+
+**iCloud Optimize Storage is survivable.** Photos-library assets are tracked by
+UUID, so when iCloud evicts an original *after* the photo was processed, the next
+scan keeps the processed row (flagged `offloaded`), serves the photo from the
+Photos preview it keeps on disk, and restores the original when it downloads
+again — text, search, people, and duplicates are never touched. Photos whose
+previews iCloud also dropped fall back to phototext's own thumbnail/view caches;
+run `phototext cache-previews` once before turning Optimize Storage on and
+every photo stays viewable no matter what is evicted.
+
+**The library's hidden flag is honored.** Photos hidden in the library (Photos
+via `osxphotos`, iPhoto best-effort from its `apdb`) are hidden in phototext too
+— out of the default views and searches, in the web UI's *hidden* view, and
+still extracted so their text is ready if you unhide them. Your own hide/unhide
+choices in phototext always win: rescans never override them, and un-hiding in
+the library unhides only what the library hid.
 
 Reading a library requires **Full Disk Access** for your terminal app:
 System Settings -> Privacy & Security -> Full Disk Access. Without it, folders
@@ -175,8 +193,11 @@ thumbnails generated from the originals), status tabs, full-text search, and
 per-photo pages with the recovered text, context, metadata, the raw model
 response, and **where the photo is really stored** — every on-disk location
 with its source (which folder or which iPhoto/Photos library), an on-disk
-status, and a *reveal in Finder* link that opens the real file's location,
-even inside a `.photolibrary`/`.photoslibrary` package. It binds to loopback
+status, a *reveal in Finder* link that opens the real file's location,
+even inside a `.photolibrary`/`.photoslibrary` package, and — for photos that
+live in a Photos library — an *open in Photos* link that shows the photo
+inside the Photos app. Photos whose originals iCloud has offloaded carry a
+badge and keep rendering from their preview or cached view. It binds to loopback
 only, opens the catalog read-only (`mode=ro` + `query_only`), and never
 writes to the library. Ctrl+C stops it.
 

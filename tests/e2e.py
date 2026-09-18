@@ -506,21 +506,24 @@ def main() -> int:
             "ALTER TABLE photos DROP COLUMN deleted_at; "
             "ALTER TABLE photos DROP COLUMN derivative; "
             "ALTER TABLE photos DROP COLUMN date_taken; "
+            "ALTER TABLE photos DROP COLUMN offloaded; "
+            "ALTER TABLE photos DROP COLUMN hidden_origin; "
             "DROP TABLE IF EXISTS photo_warnings; "
             "DROP TABLE IF EXISTS person_tags; "
             "DROP TABLE IF EXISTS people; "
+            "DROP TABLE IF EXISTS photo_assets; "
             "DELETE FROM schema_version WHERE version >= 2;"
         )
         con.commit()
         con.close()
         out = cli.run("migrate", "--dry-run")
         check(
-            "pending migration(s): v2, v3, v4, v5, v6, v7, v8, v9, v10" in out,
+            "pending migration(s): v2, v3, v4, v5, v6, v7, v8, v9, v10, v11" in out,
             "dry run reports pending migrations",
         )
         check("dry run: nothing applied" in out, "dry run applies nothing")
         out = cli.run("migrate")
-        check("migrated: v1 -> v10" in out, "migrate applies pending migrations")
+        check("migrated: v1 -> v11" in out, "migrate applies pending migrations")
         check("backup:" in out, "migrate backs up first")
         con = db_open(db_path)
         check(count(con, "SELECT COUNT(*) FROM photos_fts") == 4, "fts rebuilt with 4 rows")
@@ -1911,6 +1914,251 @@ def main() -> int:
         mode_file.write_text("ok")
         mock40.terminate()
         mock40.wait()
+
+    print("\n[41] iCloud offload, library hidden sync, preview caching")
+    cloud_dir = work / "clouddir"
+    cloud_dir.mkdir()
+    cloud_lib = cloud_dir / "Synced.photoslibrary"
+    (cloud_lib / "originals" / "A").mkdir(parents=True)
+    (cloud_lib / "resources" / "derivatives" / "B").mkdir(parents=True)
+    make_text_image(cloud_lib / "originals/A/keep.jpg", ["KEEPER NOTE"])
+    make_text_image(cloud_lib / "originals/A/vanish.jpg", ["VANISHING NOTE"])
+    make_text_image(cloud_lib / "resources/derivatives/B/UUID-2_2_4096.jpeg", ["PREVIEW"])
+    from pillow_heif import register_heif_opener
+
+    register_heif_opener()
+    im41 = Image.new("RGB", (640, 480), "beige")
+    d41 = ImageDraw.Draw(im41)
+    d41.text((40, 60), "GHOST HEIC", fill="black", font=font())
+    im41.save(cloud_lib / "originals/A/ghost.heic")
+    ghost_path = str(cloud_lib / "originals/A/ghost.heic")
+    (cloud_dir / "ghost.heic.bak").write_bytes(
+        (cloud_lib / "originals/A/ghost.heic").read_bytes()
+    )
+    seam = cloud_dir / "assets.json"
+    vanish_path = str(cloud_lib / "originals/A/vanish.jpg")
+
+    def seam_entries(uuid2_path, uuid2_hidden, uuid3_path):
+        seam.write_text(
+            json.dumps(
+                [
+                    ["UUID-1", str(cloud_lib / "originals/A/keep.jpg"), False],
+                    ["UUID-2", uuid2_path, uuid2_hidden],
+                    ["UUID-3", uuid3_path, False],
+                ]
+            )
+        )
+
+    seam_entries(vanish_path, True, ghost_path)
+    cloud_cfg = work / "config-clouddb.toml"
+    cloud_cfg.write_text(
+        f'ollama_url = "http://127.0.0.1:{port}"\n'
+        f'model = "{MODEL}"\n'
+        f'db_path = "{cloud_dir}/catalog.db"\n'
+        "face_detection = false\n"
+    )
+    c41 = CLI(cloud_cfg)
+    con41 = db_open(cloud_dir / "catalog.db")
+    con41.row_factory = None
+    os.environ["PHOTOTEXT_TEST_ASSETS"] = str(seam)
+    try:
+        out = c41.run("scan", str(cloud_lib))
+        check("new 3" in out, "seamed Photos-library scan registers 3 photos")
+        check("library-hidden 1" in out, "scan summary reports library hiddens")
+        check(
+            count(con41, "SELECT COUNT(*) FROM photo_assets") == 3,
+            "asset map records every library asset",
+        )
+        check(
+            con41.execute(
+                "SELECT COUNT(*) FROM photo_assets "
+                "WHERE uuid IN ('uuid-1', 'uuid-2', 'uuid-3')"
+            ).fetchone()[0]
+            == 3,
+            "asset uuids are stored lowercased",
+        )
+        check(
+            con41.execute(
+                "SELECT hidden, hidden_origin FROM photos WHERE id = 2"
+            ).fetchone()
+            == (1, "library"),
+            "library hidden imports with origin 'library'",
+        )
+        # phototext's own verdicts beat the library's
+        c41.run("unhide", "2")
+        c41.run("scan", str(cloud_lib))  # the seam still hides UUID-2
+        check(
+            con41.execute("SELECT hidden, hidden_origin FROM photos WHERE id = 2").fetchone()
+            == (0, "user"),
+            "user unhide survives the library re-hiding",
+        )
+        seam_entries(vanish_path, False, ghost_path)
+        c41.run("scan", str(cloud_lib))
+        check(
+            con41.execute("SELECT hidden FROM photos WHERE id = 2").fetchone()[0] == 0,
+            "library unhide leaves the user's choice alone",
+        )
+        c41.run("hide", "2")
+        c41.run("scan", str(cloud_lib))
+        check(
+            con41.execute("SELECT hidden, hidden_origin FROM photos WHERE id = 2").fetchone()
+            == (1, "user"),
+            "user hide wins over the library",
+        )
+        # insure the pixels before iCloud takes them away
+        out = c41.run("cache-previews")
+        check("3 photo(s) cached" in out, "cache-previews fills caches for every photo")
+        check((cloud_dir / "thumbs" / "3.jpg").is_file(), "thumb cache filled")
+        check((cloud_dir / "views" / "3.jpg").is_file(), "view cache filled for every type")
+        # offload: iCloud evicts both originals; only UUID-2 keeps a preview
+        os.remove(cloud_lib / "originals/A/vanish.jpg")
+        os.remove(cloud_lib / "originals/A/ghost.heic")
+        seam_entries(None, False, None)
+        out = c41.run("scan", str(cloud_lib))
+        check("offloaded 2" in out, "scan reports offloaded originals")
+        check(
+            count(con41, "SELECT COUNT(*) FROM photos") == 3,
+            "offload never duplicates photos",
+        )
+        check(
+            con41.execute("SELECT offloaded FROM photos WHERE id = 2").fetchone()[0] == 1
+            and con41.execute("SELECT offloaded FROM photos WHERE id = 3").fetchone()[0] == 1,
+            "offloaded flags set",
+        )
+        check(
+            count(
+                con41,
+                "SELECT COUNT(*) FROM locations WHERE path LIKE '%derivatives%'",
+            )
+            == 1,
+            "the Photos preview derivative is attached as a location",
+        )
+        check(
+            count(con41, "SELECT COUNT(*) FROM locations WHERE photo_id = 3") == 0,
+            "offloaded photo without a preview has no locations",
+        )
+        # the web keeps showing whatever pixels it still has
+        port41 = free_port()
+        serve41 = subprocess.Popen(
+            c41.cmd + ["serve", "--port", str(port41)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        base41 = f"http://127.0.0.1:{port41}"
+        try:
+            for _ in range(60):
+                try:
+                    requests.get(base41 + "/", timeout=1)
+                    break
+                except Exception:
+                    time.sleep(0.1)
+            r = requests.get(f"{base41}/photo/3", timeout=5)
+            check(
+                r.status_code == 200 and "offloaded by iCloud" in r.text,
+                "detail page shows the offloaded badge",
+            )
+            check("reveal in Finder" not in r.text, "no reveal link for photos without files")
+            check("open in Photos" in r.text, "open in Photos link present")
+            r = requests.get(f"{base41}/image/3", timeout=5)
+            check(
+                r.status_code == 200 and r.headers["Content-Type"] == "image/jpeg",
+                "image served from the cached view after offload",
+            )
+            r = requests.get(f"{base41}/thumb/3", timeout=5)
+            check(r.status_code == 200, "thumbnail served from the cache after offload")
+            r = requests.get(f"{base41}/photo/2", timeout=5)
+            check("reveal in Finder" in r.text, "derivative location still reveals")
+            r = requests.get(f"{base41}/open-photos/999", timeout=5, allow_redirects=False)
+            check(r.status_code == 404, "open-photos 404s without an asset id")
+            r = requests.get(f"{base41}/open-photos/abc", timeout=5, allow_redirects=False)
+            check(r.status_code == 404, "open-photos rejects non-numeric ids")
+        finally:
+            serve41.terminate()
+            serve41.wait()
+        # downloading the original again clears the offloaded state
+        (cloud_lib / "originals/A/ghost.heic").write_bytes(
+            (cloud_dir / "ghost.heic.bak").read_bytes()
+        )
+        seam_entries(None, False, ghost_path)
+        c41.run("scan", str(cloud_lib))
+        check(
+            con41.execute("SELECT offloaded FROM photos WHERE id = 3").fetchone()[0] == 0,
+            "a downloaded original clears the offloaded flag",
+        )
+        check(
+            count(con41, "SELECT COUNT(*) FROM locations WHERE photo_id = 3") == 1,
+            "the original location is restored",
+        )
+        # unscan forgets the asset map with the source
+        c41.run("unscan", str(cloud_lib))
+        check(
+            count(con41, "SELECT COUNT(*) FROM photo_assets") == 0,
+            "unscan clears the asset map",
+        )
+        check(count(con41, "SELECT COUNT(*) FROM photos") == 0, "unscan forgets source-only photos")
+    finally:
+        os.environ.pop("PHOTOTEXT_TEST_ASSETS", None)
+        con41.close()
+
+    print("\n[42] iPhoto hidden import (apdb) and no-op without a hidden column")
+    iph_dir = work / "iphoto-hidden"
+    (iph_dir / "library.photolibrary/Originals/2013").mkdir(parents=True)
+    make_text_image(iph_dir / "library.photolibrary/Originals/2013/secret.jpg", ["TOP SECRET"])
+    make_text_image(iph_dir / "library.photolibrary/Originals/2013/open.jpg", ["NOTHING HERE"])
+    apdb41 = iph_dir / "library.photolibrary/Database/apdb/Database"
+    apdb41.parent.mkdir(parents=True)
+    ah = sqlite3.connect(apdb41)
+    ah.executescript(
+        "CREATE TABLE RKVersion (uuid TEXT, masterId TEXT, name TEXT, "
+        "flagged INTEGER, hidden INTEGER);"
+        "CREATE TABLE RKMaster (uuid TEXT, imagePath TEXT);"
+    )
+    ah.execute("INSERT INTO RKMaster VALUES ('k1', 'Originals/2013/secret.jpg')")
+    ah.execute("INSERT INTO RKMaster VALUES ('k2', 'Originals/2013/open.jpg')")
+    ah.execute(
+        "INSERT INTO RKVersion (uuid, masterId, name, flagged, hidden) "
+        "VALUES ('W1', 'k1', 'secret', 0, 1)"
+    )
+    ah.execute(
+        "INSERT INTO RKVersion (uuid, masterId, name, flagged, hidden) "
+        "VALUES ('W2', 'k2', 'open', 0, 0)"
+    )
+    ah.commit()
+    ah.close()
+    iph_cfg = work / "config-iphoto-hidden.toml"
+    iph_cfg.write_text(
+        f'ollama_url = "http://127.0.0.1:{port}"\n'
+        f'model = "{MODEL}"\n'
+        f'db_path = "{iph_dir}/catalog.db"\n'
+    )
+    c42 = CLI(iph_cfg)
+    out = c42.run("scan", str(iph_dir / "library.photolibrary"))
+    check(
+        "1 photo(s) hidden in the library" in out,
+        "iPhoto scan reports the library hidden flag",
+    )
+    con42 = db_open(iph_dir / "catalog.db")
+    con42.row_factory = None
+    check(
+        con42.execute(
+            "SELECT COUNT(*) FROM photos WHERE hidden = 1 AND hidden_origin = 'library'"
+        ).fetchone()[0]
+        == 1,
+        "apdb-hidden photo imports with origin 'library'",
+    )
+    check(
+        con42.execute(
+            "SELECT COUNT(*) FROM photos WHERE hidden = 1"
+        ).fetchone()[0]
+        == 1,
+        "only the hidden version is hidden",
+    )
+    con42.close()
+    out = cli.run("scan", str(lib))
+    check(
+        "library-hidden" not in out,
+        "apdb without a hidden column stays a no-op",
+    )
 
     print()
     if FAILURES:
