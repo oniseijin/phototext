@@ -6,6 +6,19 @@ semantic versioning.
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-09-18
+
+### Fixed
+
+- The web UI detail page did not display photos stored as HEIC (or TIFF and
+  other formats most browsers cannot render): the page served the original
+  file bytes, so the image appeared only in thumbnails and card views.
+  Non-browser-safe originals are now converted to JPEG on first view and
+  cached under `<state>/views/`; JPEG/PNG/GIF/WebP/BMP still stream raw.
+- The face-box picker now scales drawn boxes by the photo's true display
+  size (embedded as `data-w`/`data-h`), so tagging stays pixel-accurate
+  even when the served image is a downscaled conversion.
+
 ## [0.3.1] - 2026-09-18
 
 ### Fixed

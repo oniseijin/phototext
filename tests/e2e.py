@@ -634,6 +634,24 @@ def main() -> int:
                 r.status_code == 200 and int(r.headers["Content-Length"]) > 100,
                 "original image served",
             )
+            con_heic = db_open(db_path)
+            heic_id = con_heic.execute(
+                "SELECT p.id FROM photos p JOIN locations l ON l.photo_id=p.id "
+                "WHERE l.path LIKE '%.heic' LIMIT 1"
+            ).fetchone()[0]
+            con_heic.close()
+            r = requests.get(f"{base}/image/{heic_id}")
+            check(
+                r.status_code == 200
+                and r.headers["Content-Type"] == "image/jpeg"
+                and r.content[:2] == b"\xff\xd8",
+                "HEIC original served as a converted JPEG",
+            )
+            check(
+                not (work / "views" / "1.jpg").exists()
+                and (work / "views" / f"{heic_id}.jpg").exists(),
+                "browser-safe originals bypass the view cache, HEIC fills it",
+            )
             check(requests.get(base + "/photo/99999").status_code == 404, "unknown photo 404s")
             check(requests.get(base + "/thumb/abc").status_code == 404, "non-numeric id 404s")
             check(
@@ -1289,6 +1307,10 @@ def main() -> int:
             m = re.search(r"name='token' value='([0-9a-f]+)'", detail.text)
             token = m.group(1) if m else ""
             check("pickimg" in detail.text, "detail page embeds the face-box picker")
+            check(
+                "data-w='640' data-h='480'" in detail.text,
+                "picker carries the original display size for box scaling",
+            )
             check("drag a box around a face" in detail.text, "detail page explains the picker")
             check("Ry &mdash; seed" in detail.text or "Ry — seed" in detail.text,
                   "detail page shows the person chip")

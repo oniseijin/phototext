@@ -21,6 +21,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from .imaging import display_size as _display_size
+
 try:  # macOS only; degrade to "no faces" everywhere else
     import Quartz  # noqa: F401
     from Vision import VNDetectFaceRectanglesRequest, VNImageRequestHandler
@@ -59,21 +61,6 @@ def _test_overrides(photo_id: int | None) -> list[tuple[int, int, int, int]] | N
                 continue
         return boxes
     return None
-
-
-def _display_size(path: Path) -> tuple[int, int] | None:
-    """Image size in display orientation, from headers only (no decode)."""
-    try:
-        from PIL import Image
-
-        with Image.open(path) as im:
-            width, height = im.size
-            orientation = im.getexif().get(274, 1)  # Orientation tag
-    except Exception:
-        return None
-    if orientation in (5, 6, 7, 8):
-        return height, width
-    return width, height
 
 
 def _vision_boxes(path: Path) -> list[tuple[int, int, int, int]]:

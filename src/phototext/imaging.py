@@ -242,6 +242,22 @@ def _encode(im: Image.Image, max_edge: int, jpeg_quality: int) -> bytes:
     return buf.getvalue()
 
 
+def display_size(path: Path) -> tuple[int, int] | None:
+    """Image size in display orientation, from headers only (no decode).
+
+    Returns None when the file cannot be opened. This is the coordinate
+    frame of `crop_jpeg`, the web picker, and face boxes."""
+    try:
+        with Image.open(path) as im:
+            width, height = im.size
+            orientation = im.getexif().get(274, 1)  # Orientation tag
+    except Exception:
+        return None
+    if orientation in (5, 6, 7, 8):
+        return height, width
+    return width, height
+
+
 def _sips_to_jpeg(path: Path) -> Path | None:
     sips = shutil.which("sips")
     if sips is None:

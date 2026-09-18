@@ -24,11 +24,16 @@ from urllib.request import pathname2url
 from . import db
 from . import people as people_mod
 from .config import Config, ensure_noindex
-from .imaging import ImageReadError, crop_jpeg, prepare_image
+from .imaging import ImageReadError, crop_jpeg, display_size, prepare_image
 from .memes import DUPLICATE_HAMMING_DEFAULT, find_clusters
 
 PAGE_SIZE = 48
 THUMB_EDGE = 480
+VIEW_EDGE = 2048
+
+# Formats every mainstream browser can render natively; anything else
+# (HEIC, TIFF, PSD, ...) gets a converted JPEG on the detail page.
+_BROWSER_SAFE = {"jpg", "jpeg", "jfif", "png", "gif", "webp", "bmp"}
 
 _CONTENT_TYPES = {
     "jpg": "image/jpeg",
@@ -559,9 +564,18 @@ def render_detail(conn: sqlite3.Connection, photo_id: int, ctx: dict | None = No
         body += f"<div class='actions'>{actions}</div>"
     body += f"<div class='detail'>"
     if writable:
+        # The picker submits boxes in original-image pixels (crop_jpeg's
+        # frame); /image/ may serve a downscaled conversion of HEIC and
+        # friends, so embed the true display size for the JS to scale by.
+        pick_attrs = ""
+        pick_path = _first_existing(conn, photo_id)
+        if pick_path is not None:
+            dims = display_size(pick_path)
+            if dims:
+                pick_attrs = f" data-w='{dims[0]}' data-h='{dims[1]}'"
         body += (
             "<div class='pickwrap'>"
-            f"<img id='pickimg' src='/image/{photo_id}' alt='photo {photo_id}'>"
+            f"<img id='pickimg' src='/image/{photo_id}'{pick_attrs} alt='photo {photo_id}'>"
             "<div id='selbox' class='selbox'></div></div>"
             "<form class='tagform' method='post' action='/person/tag'>"
             f"<input type='hidden' name='photo_id' value='{photo_id}'>"
@@ -750,6 +764,34 @@ def thumb_bytes(conn: sqlite3.Connection, photo_id: int, thumbs_dir: Path) -> by
     return data
 
 
+def view_image_bytes(conn: sqlite3.Connection, photo_id: int, views_dir: Path) -> bytes | None:
+    """Display-ready JPEG for the detail page, cached under <db_dir>/views/.
+
+    Browser-safe originals never reach here (the route serves them raw);
+    this converts HEIC/TIFF/PSD/... so every browser can render them.
+    Returns None when the file exists but cannot be converted."""
+    cache = views_dir / f"{photo_id}.jpg"
+    if cache.exists():
+        try:
+            return cache.read_bytes()
+        except OSError:
+            pass
+    path = _first_existing(conn, photo_id)
+    if path is None:
+        return None
+    try:
+        data = prepare_image(path, max_edge=VIEW_EDGE, jpeg_quality=85)
+    except ImageReadError:
+        return None
+    try:
+        views_dir.mkdir(parents=True, exist_ok=True)
+        ensure_noindex(views_dir)
+        cache.write_bytes(data)
+    except OSError:
+        pass
+    return data
+
+
 def _person_action(
     action: str,
     photo_id: int,
@@ -857,7 +899,9 @@ _PICKER_JS = """
     start = null;
     if (w < 8 || h < 8) { box.style.display = 'none'; field.value = ''; return; }
     var r = img.getBoundingClientRect();
-    var sx = img.naturalWidth / r.width, sy = img.naturalHeight / r.height;
+    var ow = img.dataset.w ? +img.dataset.w : img.naturalWidth;
+    var oh = img.dataset.h ? +img.dataset.h : img.naturalHeight;
+    var sx = ow / r.width, sy = oh / r.height;
     field.value = [Math.round(x * sx), Math.round(y * sy),
                    Math.round(w * sx), Math.round(h * sy)].join(',');
     if (hint) hint.textContent = 'box set (drag again to change it) — now enter a name';
@@ -980,6 +1024,7 @@ class _Server(ThreadingHTTPServer):
         handler,
         db_path: Path,
         thumbs_dir: Path,
+        views_dir: Path,
         writable: bool = False,
         token: str | None = None,
         person_cfg: Config | None = None,
@@ -987,6 +1032,7 @@ class _Server(ThreadingHTTPServer):
         super().__init__(address, handler)
         self.phototext_db = db_path
         self.phototext_thumbs = thumbs_dir
+        self.phototext_views = views_dir
         self.phototext_writable = writable
         self.phototext_token = token
         self.phototext_person_cfg = person_cfg
@@ -1344,10 +1390,18 @@ class _Handler(BaseHTTPRequestHandler):
         conn = _open_ro(self.server.phototext_db)
         try:
             path = _first_existing(conn, photo_id)
+            converted = None
+            if path is not None and path.suffix.lower().lstrip(".") not in _BROWSER_SAFE:
+                # Most browsers cannot render HEIC/TIFF/PSD originals;
+                # serve a converted, cached JPEG instead.
+                converted = view_image_bytes(conn, photo_id, self.server.phototext_views)
         finally:
             conn.close()
         if path is None:
             self._not_found("original file not on disk")
+            return
+        if converted is not None:
+            self._send(200, converted, "image/jpeg")
             return
         try:
             size = path.stat().st_size
@@ -1407,9 +1461,12 @@ def serve(
     thumbs_dir = db_path.parent / "thumbs"
     thumbs_dir.mkdir(parents=True, exist_ok=True)
     ensure_noindex(thumbs_dir)
+    views_dir = db_path.parent / "views"
+    views_dir.mkdir(parents=True, exist_ok=True)
+    ensure_noindex(views_dir)
     token = secrets.token_hex(16) if writable else None
     httpd = _Server(
-        (host, port), _Handler, db_path, thumbs_dir, writable, token, person_cfg
+        (host, port), _Handler, db_path, thumbs_dir, views_dir, writable, token, person_cfg
     )
     actual_host, actual_port = httpd.server_address[:2]
     mode = "read-only" if not writable else "read-write (hide/delete/restore/purge + people enabled)"
