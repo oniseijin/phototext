@@ -13,6 +13,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -392,7 +393,34 @@ def main() -> int:
             stderr=subprocess.STDOUT,
             text=True,
         )
-        time.sleep(1.5)
+        # Wait until the first photo is mid-model-call (the slow mock holds
+        # it there for seconds) instead of a blind sleep: a fixed delay
+        # raced startup imports under load, and signaling right after the
+        # banner would fire before the first claim.
+        ready = {"seen": False}
+
+        def _wait_ready() -> None:
+            for line in proc.stdout:
+                if "Processing" in line:
+                    ready["seen"] = True
+                    break
+
+        reader = threading.Thread(target=_wait_ready, daemon=True)
+        reader.start()
+        reader.join(timeout=60)
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            try:
+                poll = sqlite3.connect(db_path, timeout=1)
+                n = poll.execute(
+                    "SELECT COUNT(*) FROM photos WHERE status='processing'"
+                ).fetchone()[0]
+                poll.close()
+            except sqlite3.Error:
+                n = 0
+            if n:
+                break
+            time.sleep(0.05)
         proc.send_signal(signal.SIGINT)
         out, _ = proc.communicate(timeout=60)
         check(
@@ -1091,6 +1119,45 @@ def main() -> int:
                 check(r.status_code == 403, "wrong token is rejected")
                 r = requests.post(f"{wr_base}/delete/2", timeout=5)
                 check(r.status_code == 403, "missing token is rejected")
+                # Hidden-only view + one-click card toggle
+                list_page = _try_get(wr_base + "/")
+                check(
+                    list_page is not None and "action='/hide/2'" in list_page.text,
+                    "writable cards carry hide toggles",
+                )
+                r = requests.post(
+                    f"{wr_base}/hide/2",
+                    data={"token": token, "next": "/?hidden=only"},
+                    timeout=5, allow_redirects=False,
+                )
+                check(
+                    r.status_code == 303 and r.headers["Location"] == "/?hidden=only",
+                    "card toggle returns to the list it came from",
+                )
+                list_after = _try_get(wr_base + "/")
+                check("hidden (1)" in list_after.text, "hidden chip shows the count")
+                check("h2.jpg" not in list_after.text, "hidden photo leaves the default view")
+                hidden_page = _try_get(wr_base + "/?hidden=only")
+                check(
+                    hidden_page is not None
+                    and "all photos" in hidden_page.text
+                    and "h2.jpg" in hidden_page.text
+                    and "action='/unhide/2'" in hidden_page.text,
+                    "hidden view lists only hidden photos with unhide toggles",
+                )
+                r = requests.post(
+                    f"{wr_base}/unhide/2", data={"token": token},
+                    timeout=5, allow_redirects=False,
+                )
+                check(
+                    r.status_code == 303 and r.headers["Location"] == "/photo/2",
+                    "toggle without next falls back to the photo page",
+                )
+                hidden_after = _try_get(wr_base + "/?hidden=only")
+                check(
+                    hidden_after is not None and "h2.jpg" not in hidden_after.text,
+                    "unhidden photo leaves the hidden view",
+                )
         else:
             check(False, "writable serve comes up")
         wr_proc.terminate()
@@ -1226,6 +1293,11 @@ def main() -> int:
         red_id, green_id, plain_id = pid_of("red.jpg"), pid_of("green.jpg"), pid_of("plain.jpg")
         out = c26.run("people", "name", str(red_id), "Ryan", "--box", "200,100,240,260")
         check("person 'Ryan' seeded" in out, "people name creates a seed")
+        check(
+            (ppl_dir / "people" / ".metadata_never_index").exists()
+            and (ppl_dir / "people" / "1" / ".metadata_never_index").exists(),
+            "seed crop dirs carry spotlight no-index markers",
+        )
         check("MOCK PERSON PROFILE" in out, "recognition profile built from the seed crop")
         ryan_id = con.execute("SELECT id FROM people WHERE name='Ryan'").fetchone()[0]
         check(
@@ -1414,6 +1486,38 @@ def main() -> int:
             check(r.status_code == 400, "bad person id is a 400")
             r = requests.get(f"{wr_base}/?person={requests.utils.quote('Sam')}")
             check("tagged 'Sam'" in r.text, "list page filters by person")
+            # filters compose: hidden composes with person and other chips
+            # (green's Sam tag was removed above, so red — Sam's seed — is
+            # the person's one remaining photo)
+            r = requests.post(
+                f"{wr_base}/hide/{red_id}", data={"token": token},
+                timeout=5, allow_redirects=False,
+            )
+            check(r.status_code == 303, "hide red for the compose check")
+            r = requests.get(f"{wr_base}/", params={"person": "Sam"})
+            check("red.jpg" not in r.text, "person filter drops hidden photos by default")
+            r = requests.get(f"{wr_base}/", params={"person": "Sam", "hidden": "only"})
+            check(
+                "red.jpg" in r.text and "plain.jpg" not in r.text,
+                "hidden-only composes with the person filter",
+            )
+            r = requests.get(f"{wr_base}/", params={"hidden": "only"})
+            check(
+                "person=Sam&hidden=only" in r.text,
+                "person chips keep the hidden filter",
+            )
+            check(
+                "status=done&hidden=only" in r.text,
+                "status tabs keep the hidden filter",
+            )
+            r = requests.get(f"{wr_base}/person/{sam_id}", params={"hidden": "only"})
+            check(
+                "red.jpg" in r.text and "all photos" in r.text,
+                "person page hidden view lists that person's hidden photos",
+            )
+            requests.post(
+                f"{wr_base}/unhide/{red_id}", data={"token": token}, timeout=5
+            )
         proc.terminate()
         proc.wait(timeout=10)
         con.close()

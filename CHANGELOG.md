@@ -6,6 +6,27 @@ semantic versioning.
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-09-18
+
+### Fixed
+
+- The web UI hidden filter now composes with every other filter instead of
+  being dropped when one is changed: person, category, text, status, and
+  year chips all keep the current hidden view (and each other) in their
+  links. Person pages gained a matching `hidden (N)` view, so a person's
+  hidden photos are reachable there too.
+
+## [0.3.3] - 2026-09-18
+
+### Added
+
+- Web UI hidden view: a `hidden (N)` chip on the browse page lists only
+  hidden photos (hidden cards carry an "unhide" toggle); toggling a photo
+  returns to the list it came from instead of the photo page.
+- One-click hide/unhide toggles on grid cards in writable mode
+  (`serve --writable`), with a "hidden" badge on hidden photos. The detail
+  page keeps its toggle; read-only servers show neither.
+
 ## [0.3.2] - 2026-09-18
 
 ### Fixed

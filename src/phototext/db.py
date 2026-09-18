@@ -843,7 +843,7 @@ def search_photos(
     """
     sql = (
         "SELECT p.id, p.status, p.has_text, p.text_kind, p.language, p.model, p.tiled, "
-        "p.gated, p.category, p.derivative, "
+        "p.gated, p.category, p.derivative, p.hidden, "
         "length(p.text) AS text_len, "
         "snippet(photos_fts, 0, ?, ?, ' ... ', 10) AS text_snip, "
         "snippet(photos_fts, 1, ?, ?, ' ... ', 6) AS context_snip, "
@@ -935,6 +935,7 @@ def page_photos(
     limit: int = 50,
     offset: int = 0,
     show_hidden: bool = False,
+    hidden_only: bool = False,
     person: str | None = None,
     date_from: str | None = None,
     date_to: str | None = None,
@@ -944,7 +945,9 @@ def page_photos(
     (rows, total matching the filter)."""
     where = ["p.deleted_at IS NULL"]
     params: list = []
-    if not show_hidden:
+    if hidden_only:
+        where.append("p.hidden = 1")
+    elif not show_hidden:
         where.append("p.hidden = 0")
     if status and status != "all":
         where.append("p.status = ?")
@@ -1162,17 +1165,31 @@ def people_list(
     ).fetchall()
 
 
-def person_tag_rows(conn: sqlite3.Connection, person_id: int) -> list[sqlite3.Row]:
-    """Tagged photos of a person (visible only), seeds and high confidence
-    first — the tail of the list doubles as the review queue."""
+def person_tag_rows(
+    conn: sqlite3.Connection,
+    person_id: int,
+    hidden_only: bool = False,
+    show_hidden: bool = False,
+) -> list[sqlite3.Row]:
+    """Tagged photos of a person (visible only by default; pass
+    show_hidden to include hidden photos or hidden_only for just those),
+    seeds and high confidence first — the tail of the list doubles as the
+    review queue."""
+    if hidden_only:
+        hidden_clause = "AND p.hidden = 1"
+    elif show_hidden:
+        hidden_clause = ""
+    else:
+        hidden_clause = "AND p.hidden = 0"
     return conn.execute(
-        """
+        f"""
         SELECT p.id, p.status, p.has_text, p.text_kind, p.language, p.category,
-            p.tiled, p.gated, p.derivative, p.text, p.error,
+            p.tiled, p.gated, p.derivative, p.text, p.error, p.hidden,
             (SELECT path FROM locations WHERE photo_id = p.id ORDER BY id LIMIT 1) AS path,
             t.confidence, t.origin, t.box
         FROM person_tags t JOIN photos p ON p.id = t.photo_id
-        WHERE t.person_id = ? AND t.present = 1 AND p.deleted_at IS NULL AND p.hidden = 0
+        WHERE t.person_id = ? AND t.present = 1 AND p.deleted_at IS NULL
+            {hidden_clause}
         ORDER BY t.origin = 'seed' DESC, t.confidence DESC, t.created_at DESC
         """,
         (person_id,),

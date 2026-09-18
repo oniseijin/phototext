@@ -77,6 +77,7 @@ def save_seed_crop(
     target = seed_crop_path(db_path, person_id, photo_id)
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
+        ensure_noindex(target.parent.parent)
         ensure_noindex(target.parent)
         target.write_bytes(data)
     except OSError:

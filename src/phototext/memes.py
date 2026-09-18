@@ -82,7 +82,7 @@ def find_clusters(
     rows = conn.execute(
         "SELECT p.id, p.phash, p.has_text, p.text_kind, p.category, p.tiled, "
         "p.gated, p.derivative, p.status, p.error, p.text, p.language, p.model, "
-        "p.byte_size, p.date_taken, "
+        "p.byte_size, p.date_taken, p.hidden, "
         "(SELECT path FROM locations WHERE photo_id = p.id ORDER BY id LIMIT 1) AS path "
         f"FROM photos p WHERE {where}"
     ).fetchall()

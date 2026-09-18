@@ -215,7 +215,9 @@ tests/
   progress. Do not remove.
 - State dirs (and `~/.ollama`, via install.sh) carry `.metadata_never_index`
   markers so Spotlight/mds stays out of the catalog, thumbnails, and model
-  blobs. Keep dropping them wherever new state dirs are created.
+  blobs. Keep dropping them wherever new state dirs are created. The repo
+  root carries one too (committed) so the workspace — including `.venv` —
+  stays out of the index.
 - Default catalog: `~/.phototext/catalog.db`; default config:
   `~/.phototext/config.toml` (created on first use). Use `--config`/`--db` to
   isolate test/dev state. The installed wrapper overrides this: `phototext`

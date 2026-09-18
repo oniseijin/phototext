@@ -97,6 +97,10 @@ main { padding: 0 20px 40px; }
             display: block; }
 .card .body { padding: 8px 10px 10px; font-size: 12.5px; }
 .card .path { color: #9aa4b2; font-size: 11px; word-break: break-all; margin-top: 4px; }
+.cardbox { position: relative; }
+.cardbox > a.card { display: flex; }
+.cardbox form.act { position: absolute; top: 6px; right: 6px; margin: 0; z-index: 2; }
+.cardbox form.act button.mini { background: rgba(13, 14, 17, 0.85); }
 .snippet { max-height: 5.4em; overflow: hidden; }
 .muted { color: #8b949e; }
 .badge { display: inline-block; font-size: 10.5px; padding: 1px 7px; margin-right: 5px;
@@ -179,8 +183,10 @@ def _status_tabs(
     memes_active: bool = False,
     people_active: bool = False,
     duplicates_active: bool = False,
+    url_for: "callable[[str], str] | None" = None,
 ) -> str:
     parts = []
+    link = url_for or (lambda key: f"/?status={key}")
     for key, label in (
         ("all", "All"),
         ("done", "Done"),
@@ -189,7 +195,7 @@ def _status_tabs(
         ("deferred", "Deferred"),
     ):
         cls = " class='on'" if status == key else ""
-        parts.append(f"<a{cls} href='/?status={key}'>{label}</a>")
+        parts.append(f"<a{cls} href='{link(key)}'>{label}</a>")
     memes_cls = " class='on'" if memes_active else ""
     parts.append(f"<a{memes_cls} href='/memes'>Memes</a>")
     dup_cls = " class='on'" if duplicates_active else ""
@@ -201,12 +207,22 @@ def _status_tabs(
 
 
 def _action_form(
-    action: str, photo_id: int, label: str, token: str, confirm: str | None = None
+    action: str,
+    photo_id: int,
+    label: str,
+    token: str,
+    confirm: str | None = None,
+    next_url: str | None = None,
+    form_class: str = "act",
 ) -> str:
     onsubmit = f" onsubmit=\"return confirm('{esc(confirm)}')\"" if confirm else ""
+    next_input = (
+        f"<input type='hidden' name='next' value='{esc(next_url)}'>" if next_url else ""
+    )
     return (
-        f"<form class='act' method='post' action='/{action}/{photo_id}'{onsubmit}>"
+        f"<form class='{form_class}' method='post' action='/{action}/{photo_id}'{onsubmit}>"
         f"<input type='hidden' name='token' value='{esc(token)}'>"
+        f"{next_input}"
         f"<button class='mini'>{esc(label)}</button></form>"
     )
 
@@ -218,7 +234,7 @@ def _snippet(text: str, limit: int = 220) -> str:
     return flat
 
 
-def _card(row, snippet: str) -> str:
+def _card(row, snippet: str, action_html: str = "") -> str:
     status = row["status"]
     badge = (
         f"<span class='badge err'>{esc(status)}</span>"
@@ -242,16 +258,25 @@ def _card(row, snippet: str) -> str:
     gate_badge = "<span class='badge'>gated</span>" if row["gated"] else ""
     deriv_badge = ("<span class='badge'>preview</span>"
                    if row["derivative"] else "")
-    return (
-        f"<a class='card' href='/photo/{row['id']}'>"
+    hidden_badge = ("<span class='badge'>hidden</span>" if row["hidden"] else "")
+    inner = (
         f"<img src='/thumb/{row['id']}' alt='{esc(name)}' loading='lazy'>"
         "<div class='body'>"
-        f"{badge}{tile_badge}{gate_badge}{deriv_badge}"
+        f"{badge}{tile_badge}{gate_badge}{deriv_badge}{hidden_badge}"
         f"<span class='badge'>{esc(category or kind)}</span>"
         f"{snippet_html}"
         f"<div class='path'>{esc(name)}</div>"
-        "</div></a>"
+        "</div>"
     )
+    if action_html:
+        # Writable mode: wrap the card so the hide/unhide toggle can sit on
+        # top of the link without nesting a form inside the anchor.
+        return (
+            f"<div class='cardbox'>"
+            f"<a class='card' href='/photo/{row['id']}'>{inner}</a>"
+            f"{action_html}</div>"
+        )
+    return f"<a class='card' href='/photo/{row['id']}'>{inner}</a>"
 
 
 def _pager(base: str, page: int, total: int) -> str:
@@ -360,21 +385,23 @@ def render_list(conn: sqlite3.Connection, params: dict, ctx: dict | None = None)
         if text_filter not in ("all", "yes", "no"):
             text_filter = "all"
         has_text = None if text_filter == "all" else (text_filter == "yes")
-        show_hidden = params.get("hidden", [""])[0] == "1"
+        hidden_param = params.get("hidden", [""])[0]
+        show_hidden = hidden_param == "1"
+        hidden_only = hidden_param == "only"
         rows, total = db.page_photos(
             conn, status=status, has_text=has_text, category=category,
-            limit=PAGE_SIZE, offset=offset, show_hidden=show_hidden, person=person,
+            limit=PAGE_SIZE, offset=offset, show_hidden=show_hidden,
+            hidden_only=hidden_only, person=person,
             date_from=date_from, date_to=date_to, year=year,
         )
-        cards = [_card(r, _snippet(r["text"] or "")) for r in rows]
 
-        def qs() -> str:
+        def qs(over: dict | None = None) -> str:
             parts = {
                 "status": status,
                 "category": category,
                 "text": text_filter,
                 "person": person,
-                "hidden": "1" if show_hidden else "",
+                "hidden": ("only" if hidden_only else "1" if show_hidden else ""),
                 "year": year or "",
                 "date-from": (params.get("date-from", [""])[0] or "").strip()
                 if (date_from is not None)
@@ -383,27 +410,51 @@ def render_list(conn: sqlite3.Connection, params: dict, ctx: dict | None = None)
                 if (date_to is not None)
                 else "",
             }
+            for key, value in (over or {}).items():
+                if value:
+                    parts[key] = value
+                else:
+                    parts.pop(key, None)
             query = urlencode({k: v for k, v in parts.items() if v and v != "all"})
             return f"/?{query}&" if query else "/?"
 
         base = qs()
-        body = _header(conn) + _status_tabs(status)
-        hidden_chip = (
-            "<a href='/'>hide hidden</a>" if show_hidden else "<a href='/?hidden=1'>show hidden</a>"
-        )
+        body = _header(conn) + _status_tabs(status, url_for=lambda key: qs({"status": key}))
+        hidden_n = conn.execute(
+            "SELECT COUNT(*) AS n FROM photos WHERE hidden = 1 AND deleted_at IS NULL"
+        ).fetchone()["n"]
+        if hidden_only:
+            hidden_chip = f"<a class='on' href='{qs({'hidden': ''})}'>all photos</a>"
+        elif show_hidden:  # legacy mixed view (?hidden=1): hidden shown inline
+            hidden_chip = f"<a href='{qs({'hidden': ''})}'>hide hidden</a>"
+        else:
+            hidden_chip = f"<a href='{qs({'hidden': 'only'})}'>hidden ({hidden_n})</a>"
         body += f"<nav>{hidden_chip}</nav>"
+        token = (ctx or {}).get("token") if (ctx or {}).get("writable") else None
+        if token:
+            next_url = f"{base}page={page}"
+
+            def _toggle(r) -> str:
+                hidden_now = bool(r["hidden"])
+                return _action_form(
+                    "unhide" if hidden_now else "hide", r["id"],
+                    "unhide" if hidden_now else "hide", token, next_url=next_url,
+                )
+        else:
+            def _toggle(r) -> str:
+                return ""
+        cards = [_card(r, _snippet(r["text"] or ""), _toggle(r)) for r in rows]
         people_rows = db.people_list(
             conn, float((ctx or {}).get("min_confidence") or 0.6)
         )
         if people_rows:
             chips = [
-                f"<a{cls} href='/?status={esc(status)}&text={text_filter}"
-                f"&person={esc(p['name'])}'>{esc(p['name'])}</a>"
+                f"<a{cls} href='{qs({'person': p['name']})}'>{esc(p['name'])}</a>"
                 for p in people_rows
                 for cls in (" class='on'" if person == p["name"] else "",)
             ]
             if person:
-                chips.append(f"<a href='/?status={esc(status)}&text={text_filter}'>all people</a>")
+                chips.append(f"<a href='{qs({'person': ''})}'>all people</a>")
             body += f"<nav>{''.join(chips)}</nav>"
         cats = [
             r["category"]
@@ -414,16 +465,16 @@ def render_list(conn: sqlite3.Connection, params: dict, ctx: dict | None = None)
         ]
         if cats:
             chips = [
-                f"<a{cls} href='/?status={status}&text={text_filter}&category={esc(c)}'>{esc(c)}</a>"
+                f"<a{cls} href='{qs({'category': c})}'>{esc(c)}</a>"
                 for c in cats
                 for cls in (" class='on'" if c == category else "",)
             ]
-            chips.append(f"<a href='/?status={status}&text={text_filter}'>all categories</a>")
+            chips.append(f"<a href='{qs({'category': ''})}'>all categories</a>")
             body += f"<nav>{''.join(chips)}</nav>"
         text_chips = []
         for value, label in (("all", "any text"), ("yes", "with text"), ("no", "no text")):
             cls = " class='on'" if text_filter == value else ""
-            text_chips.append(f"<a{cls} href='/?status={status}&text={value}'>{label}</a>")
+            text_chips.append(f"<a{cls} href='{qs({'text': value})}'>{label}</a>")
         body += f"<nav>{''.join(text_chips)}</nav>"
         years = db.date_taken_histogram(conn)
         if years:
@@ -431,13 +482,10 @@ def render_list(conn: sqlite3.Connection, params: dict, ctx: dict | None = None)
             for y in years:
                 cls = " class='on'" if year == y["year"] else ""
                 chips.append(
-                    f"<a{cls} href='/?status={status}&text={text_filter}"
-                    f"&year={y['year']}'>{y['year']} ({y['n']})</a>"
+                    f"<a{cls} href='{qs({'year': y['year']})}'>{y['year']} ({y['n']})</a>"
                 )
             if year:
-                chips.append(
-                    f"<a href='/?status={status}&text={text_filter}'>all years</a>"
-                )
+                chips.append(f"<a href='{qs({'year': ''})}'>all years</a>")
             body += f"<nav>{''.join(chips)}</nav>"
         body += f"<main><p class='note'>{total} photo(s) with status '{status}'"
         if category:
@@ -951,15 +999,29 @@ def render_people(conn: sqlite3.Connection, ctx: dict | None = None) -> bytes:
 
 
 def render_person(
-    conn: sqlite3.Connection, person_id: int, ctx: dict | None = None
+    conn: sqlite3.Connection,
+    person_id: int,
+    ctx: dict | None = None,
+    params: dict | None = None,
 ) -> bytes | None:
     person = db.get_person(conn, person_id)
     if person is None:
         return None
     threshold = float((ctx or {}).get("min_confidence") or 0.6)
-    rows = db.person_tag_rows(conn, person_id)
+    hidden_param = (params or {}).get("hidden", [""])[0]
+    hidden_only = hidden_param == "only"
+    show_hidden = hidden_param == "1"
+    rows = db.person_tag_rows(
+        conn, person_id, hidden_only=hidden_only, show_hidden=show_hidden
+    )
     seed_count = conn.execute(
         "SELECT COUNT(*) AS n FROM person_tags WHERE person_id = ? AND seed = 1",
+        (person_id,),
+    ).fetchone()["n"]
+    hidden_n = conn.execute(
+        "SELECT COUNT(*) AS n FROM person_tags t JOIN photos p ON p.id = t.photo_id "
+        "WHERE t.person_id = ? AND t.present = 1 AND p.hidden = 1 "
+        "AND p.deleted_at IS NULL",
         (person_id,),
     ).fetchone()["n"]
     review = [r for r in rows if r["origin"] == "model" and r["confidence"] < threshold]
@@ -968,6 +1030,13 @@ def render_person(
     writable = bool(ctx and ctx.get("writable") and ctx.get("token"))
     body += "<main><p><a class='back' href='/people'>&#8592; all people</a></p>"
     body += f"<h2 style='margin:6px 0'>{esc(person['name'])}</h2>"
+    if hidden_only:
+        chip = f"<a class='on' href='/person/{person_id}'>all photos</a>"
+    elif show_hidden:  # legacy mixed view (?hidden=1)
+        chip = f"<a href='/person/{person_id}'>hide hidden</a>"
+    else:
+        chip = f"<a href='/person/{person_id}?hidden=only'>hidden ({hidden_n})</a>"
+    body += f"<nav>{chip}</nav>"
     body += (
         f"<p class='note'>{seed_count} seed anchor(s) for the recognition profile — "
         "grow it with <code>confirm+seed</code> on tagged photos, then refresh with "
@@ -1132,6 +1201,11 @@ class _Handler(BaseHTTPRequestHandler):
                 else:
                     db.purge_photos(conn, [photo_id])
                     dest = "/trash"
+                # Card toggles pass the list URL they came from so the
+                # toggle does not yank the user onto the detail page.
+                next_url = (fields.get("next", [""])[0] or "").strip()
+                if next_url.startswith("/") and not next_url.startswith("//"):
+                    dest = next_url
             else:
                 try:
                     dest = self._handle_person_post(conn, person_match.group(1), fields)
@@ -1283,7 +1357,7 @@ class _Handler(BaseHTTPRequestHandler):
         person_match = re.match(r"^/person/(\d+)$", route)
         face_match = re.match(r"^/face/(\d+)/(\d+)$", route)
         if person_match is not None:
-            self._route_person(int(person_match.group(1)), ctx)
+            self._route_person(int(person_match.group(1)), params, ctx)
             return
         if face_match is not None:
             self._route_face(int(face_match.group(1)), int(face_match.group(2)))
@@ -1303,10 +1377,10 @@ class _Handler(BaseHTTPRequestHandler):
                 return
         self._not_found()
 
-    def _route_person(self, person_id: int, ctx: dict) -> None:
+    def _route_person(self, person_id: int, params: dict, ctx: dict) -> None:
         conn = _open_ro(self.server.phototext_db)
         try:
-            body = render_person(conn, person_id, ctx)
+            body = render_person(conn, person_id, ctx, params)
         finally:
             conn.close()
         if body is None:
@@ -1358,6 +1432,7 @@ class _Handler(BaseHTTPRequestHandler):
             return
         try:
             crop.parent.mkdir(parents=True, exist_ok=True)
+            ensure_noindex(crop.parent.parent)
             ensure_noindex(crop.parent)
             crop.write_bytes(data)
         except OSError:

@@ -162,8 +162,9 @@ else
   "$VENV/bin/pip" install "$SCRIPT_DIR"
 fi
 
-mkdir -p "$VAR/log"
-touch "$VAR/.metadata_never_index" "$VAR/log/.metadata_never_index"
+mkdir -p "$VAR/log" "$VAR/people"
+touch "$VAR/.metadata_never_index" "$VAR/log/.metadata_never_index" \
+  "$VAR/people/.metadata_never_index"
 info "spotlight: $VAR excluded from indexing"
 if [ -d "$HOME/.ollama" ]; then
   touch "$HOME/.ollama/.metadata_never_index"
