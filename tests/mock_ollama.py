@@ -176,6 +176,35 @@ def build_handler(model: str, mode_file: Path, slow_seconds: float, ps_file: Pat
                     return
             if mode == "slow":
                 time.sleep(slow_seconds)
+            if mode == "trickle":
+                # Dribble a valid response one byte at a time: data keeps
+                # arriving, so per-read socket timeouts never fire and only
+                # the client's wall-clock cap can end the call.
+                body = (b" " * 400) + json.dumps(
+                    {
+                        "model": model,
+                        "created_at": "2026-01-01T00:00:00Z",
+                        "message": {
+                            "role": "assistant",
+                            "content": '{"has_text": true, "text": "trickle", '
+                            '"context": "slow drip", "text_kind": "document", '
+                            '"language": "en", "category": "document"}',
+                        },
+                        "done": True,
+                    }
+                ).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                try:
+                    for b in body:
+                        self.wfile.write(bytes([b]))
+                        self.wfile.flush()
+                        time.sleep(0.05)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                return
             if mode == "surrogate":
                 # Raw JSON text carrying an unpaired surrogate escape (half an
                 # emoji): json.loads materializes a lone \ud83e that would

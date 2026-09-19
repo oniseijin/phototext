@@ -61,7 +61,7 @@ bin/phototext-dev  dev wrapper: workspace code via repo .venv
 install.sh         installer: snapshot venv, var/ layout, bin wrappers, migrate
 CHANGELOG.md       release notes; update when bumping the version
 tests/
-  mock_ollama.py   stand-in Ollama server (modes: ok, fail500, slow)
+  mock_ollama.py   stand-in Ollama server (modes: ok, fail500, slow, trickle)
   e2e.py           full pipeline test suite
 ```
 

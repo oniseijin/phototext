@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 
 import requests
 
@@ -250,25 +251,63 @@ class OllamaClient:
             return parse_model_json(content), content
 
     def _chat(self, payload: dict) -> str:
+        # Streamed and wall-clock capped: requests' timeout is a per-read
+        # socket timeout, so a server that trickles bytes can keep a call
+        # open forever even with request_timeout_s set. The budget below
+        # bounds the whole call — headers, body, and the 400-think retry.
         try:
-            resp = requests.post(f"{self.base_url}/api/chat", json=payload, timeout=self.timeout)
+            started = time.monotonic()
+            resp = requests.post(
+                f"{self.base_url}/api/chat",
+                json=payload,
+                timeout=self.timeout,
+                stream=True,
+            )
         except requests.Timeout as e:
             raise OllamaTimeout(f"model call exceeded the {self.timeout}s timeout") from e
         except requests.RequestException as e:
             raise OllamaUnreachable(str(e)) from e
-        if resp.status_code == 400 and "think" in resp.text.lower():
-            payload.pop("think", None)
+        try:
+            if resp.status_code == 400 and "think" in resp.text.lower():
+                payload.pop("think", None)
+                resp.close()
+                try:
+                    resp = requests.post(
+                        f"{self.base_url}/api/chat",
+                        json=payload,
+                        timeout=self.timeout,
+                        stream=True,
+                    )
+                except requests.Timeout as e:
+                    raise OllamaTimeout(
+                        f"model call exceeded the {self.timeout}s timeout"
+                    ) from e
+                except requests.RequestException as e:
+                    raise OllamaUnreachable(str(e)) from e
+            if resp.status_code != 200:
+                raise OllamaServerError(f"HTTP {resp.status_code}: {resp.text[:200]}")
+            parts: list[bytes] = []
             try:
-                resp = requests.post(
-                    f"{self.base_url}/api/chat", json=payload, timeout=self.timeout
-                )
+                # chunk_size=1 matters: larger reads block until the full
+                # chunk arrives (or EOF), which would postpone the deadline
+                # check past the budget. Responses are small (KBs), so the
+                # per-byte overhead is negligible.
+                for chunk in resp.iter_content(chunk_size=1):
+                    if time.monotonic() - started > self.timeout:
+                        raise OllamaTimeout(
+                            f"model call exceeded the {self.timeout}s timeout"
+                        )
+                    parts.append(chunk)
             except requests.Timeout as e:
-                raise OllamaTimeout(f"model call exceeded the {self.timeout}s timeout") from e
+                raise OllamaTimeout(
+                    f"model call exceeded the {self.timeout}s timeout"
+                ) from e
             except requests.RequestException as e:
                 raise OllamaUnreachable(str(e)) from e
-        if resp.status_code != 200:
-            raise OllamaServerError(f"HTTP {resp.status_code}: {resp.text[:200]}")
+            body = b"".join(parts).decode("utf-8", "replace")
+        finally:
+            resp.close()
         try:
-            return resp.json()["message"]["content"]
+            return json.loads(body)["message"]["content"]
         except (ValueError, KeyError, TypeError) as e:
-            raise ModelOutputError(f"unexpected response shape: {resp.text[:200]}") from e
+            raise ModelOutputError(f"unexpected response shape: {body[:200]}") from e

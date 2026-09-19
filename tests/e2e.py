@@ -2160,6 +2160,48 @@ def main() -> int:
         "apdb without a hidden column stays a no-op",
     )
 
+    print("\n[43] model-call wall-clock cap (trickling server)")
+    port43 = free_port()
+    mode43 = work / "mode43"
+    mode43.write_text("trickle")
+    mock43 = start_mock(port43, mode43)
+    try:
+        cfg43 = work / "config-trickle.toml"
+        cfg43.write_text(
+            f'ollama_url = "http://127.0.0.1:{port43}"\n'
+            f'model = "{MODEL}"\n'
+            f'db_path = "{work}/db-trickle.db"\n'
+            "request_timeout_s = 2\n"
+        )
+        c43 = CLI(cfg43)
+        tri_src = work / "tricklefolder"
+        tri_src.mkdir()
+        make_plain_image(tri_src / "one.jpg")
+        c43.run("scan", str(tri_src))
+        started43 = time.time()
+        out = c43.run("run", "--skip-preflight")
+        elapsed43 = time.time() - started43
+        con43 = db_open(work / "db-trickle.db")
+        con43.row_factory = None
+        try:
+            check(
+                count(con43, "SELECT COUNT(*) FROM photos WHERE status='error'") == 1,
+                "trickling model call errors the photo instead of hanging",
+            )
+            err43 = con43.execute(
+                "SELECT error FROM photos WHERE status='error'"
+            ).fetchone()[0]
+            check(
+                "exceeded the 2s timeout" in (err43 or ""),
+                "timeout error names the wall-clock budget",
+            )
+            check(elapsed43 < 15, "the run does not wait out the trickle")
+        finally:
+            con43.close()
+    finally:
+        mock43.terminate()
+        mock43.wait()
+
     print()
     if FAILURES:
         print(f"{len(FAILURES)} FAILURE(S):")

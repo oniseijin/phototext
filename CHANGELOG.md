@@ -6,6 +6,18 @@ semantic versioning.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-09-19
+
+### Fixed
+
+- Model calls now enforce `request_timeout_s` as a hard wall-clock budget
+  on the whole call. Previously it was only a per-read socket timeout, so
+  a backend that kept the connection open (or trickled bytes) could hold
+  a "timed out" call indefinitely — a nightly `run --stop-after` could
+  overshoot its budget and Ctrl+C could not take effect between photos.
+  A trickling server is now cut off after the budget and the photo
+  records the usual timeout error.
+
 ## [0.4.0] - 2026-09-18
 
 ### Added
