@@ -6,6 +6,32 @@ semantic versioning.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-20
+
+### Added
+
+- **Free local OCR at scan time (tier-0)**: macOS Vision
+  (`VNRecognizeTextRequest`, ~150ms/photo, no model) records what it can
+  read into `photos.vision_text` (migration 12, also indexed by FTS5) —
+  photos become searchable before the LLM pass ever reaches them, and
+  `phototext backfill-ocr` catches up existing catalogs. When the two-tier
+  gate is on, photos with Vision text skip the gate call entirely (they
+  clearly have text). `vision_ocr` config (default on; silently a no-op
+  without Vision).
+- **Semantic search**: `phototext embed` builds text embeddings via
+  Ollama `/api/embed` (set `embed_model`, e.g. `nomic-embed-text`) into
+  `photo_embeddings` (migration 13); `phototext search --semantic QUERY`
+  ranks by cosine similarity — merged with the existing person/year/date
+  filters — and `phototext similar <photo-id>` finds nearest neighbors.
+  Answers "the red receipt photo" without keyword overlap with the stored
+  text.
+- **Sidebar that scales**: the web sidebar's global nav (Library /
+  Discover / Utilities / search) is now pinned while filter groups
+  (Views / People / Categories / Text / Years) scroll in their own
+  region as collapsible groups with link counts. People and Categories
+  groups with more than 8 links grow a client-side filter box (type
+  "rya" to find "Ryan" among 150); years cap their scroll height.
+
 ## [0.5.0] - 2026-09-19
 
 ### Changed

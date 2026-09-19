@@ -13,6 +13,7 @@ from PIL import Image
 from . import db, memes as memes_mod
 from .imaging import read_date_taken, sha256_file
 from .library_meta import LibraryMetaError, norm_path, resolve_paths
+from .ocr import vision_ocr
 
 IMAGE_EXTS = {
     "jpg",
@@ -97,6 +98,7 @@ class ScanStats:
     bad_names: int = 0
     offloaded: int = 0
     library_hidden: int = 0
+    vision_ocr: int = 0
 
     def update(self, other: "ScanStats") -> None:
         for field in (
@@ -111,6 +113,7 @@ class ScanStats:
             "bad_names",
             "offloaded",
             "library_hidden",
+            "vision_ocr",
         ):
             setattr(self, field, getattr(self, field) + getattr(other, field))
 
@@ -303,6 +306,7 @@ def scan_source(
     slice_spec: Slice | None = None,
     quiet: bool = False,
     process_derivatives: bool = True,
+    ocr_enabled: bool = True,
 ) -> ScanStats:
     root, kind = resolve_source(Path(uri))
     stats = ScanStats()
@@ -316,7 +320,7 @@ def scan_source(
     if kind == "library" and Path(uri).name.lower().endswith(".photoslibrary"):
         return _scan_photos_library(
             conn, Path(uri), source_id, stats, checker, slice_spec, quiet,
-            process_derivatives,
+            process_derivatives, ocr_enabled,
         )
     queued_new = 0
     for image_path in _iter_image_files(root, walk_errors):
@@ -381,6 +385,18 @@ def scan_source(
                     queued_new += 1
             else:
                 stats.updated += 1
+            if ocr_enabled:
+                row = conn.execute(
+                    "SELECT vision_text FROM photos WHERE id = ?", (photo_id,)
+                ).fetchone()
+                if row is not None and row["vision_text"] is None:
+                    text = vision_ocr(image_path, photo_id)
+                    if text:
+                        conn.execute(
+                            "UPDATE photos SET vision_text = ? WHERE id = ?",
+                            (text, photo_id),
+                        )
+                        stats.vision_ocr += 1
         pending += 1
         if pending >= 500:
             conn.commit()
@@ -456,7 +472,7 @@ def _import_iphoto_hidden(
 
 def _scan_photos_library(
     conn, library: Path, source_id: int, stats: "ScanStats", checker, slice_spec,
-    quiet: bool, process_derivatives: bool = True,
+    quiet: bool, process_derivatives: bool = True, ocr_enabled: bool = True,
 ) -> "ScanStats":
     """Scan a Photos library via its database (osxphotos), not the filesystem.
 
@@ -528,6 +544,18 @@ def _scan_photos_library(
                     stats.updated += 1
                 else:
                     stats.new_photos += 1
+            if ocr_enabled:
+                row = conn.execute(
+                    "SELECT vision_text FROM photos WHERE id = ?", (photo_id,)
+                ).fetchone()
+                if row is not None and row["vision_text"] is None:
+                    text = vision_ocr(original, photo_id)
+                    if text:
+                        conn.execute(
+                            "UPDATE photos SET vision_text = ? WHERE id = ?",
+                            (text, photo_id),
+                        )
+                        stats.vision_ocr += 1
             pending += 1
         else:
             if slice_spec is not None and slice_spec.is_active():

@@ -77,6 +77,13 @@ idle_detection = true
     # photos with faces are matched on close-up face crops.
     face_detection = true
 
+    # Embedding model for semantic search via Ollama /api/embed; empty = off
+    embed_model = ""
+
+    # Free local OCR at scan time with macOS Vision; populates vision_text so
+    # photos are searchable before the LLM pass; off when Vision is unavailable
+    vision_ocr = true
+
     # Claim order for the extraction queue. false = oldest first (classic
     # FIFO); true = newest photos first (by capture date, falling back to
     # first-seen), so recent photos surface while a long backlog runs.
@@ -115,6 +122,8 @@ class Config:
     person_model: str = ""
     person_min_confidence: float = 0.6
     face_detection: bool = True
+    vision_ocr: bool = True
+    embed_model: str = ""
     recent_first: bool = False
     process_derivatives: bool = True
     max_image_pixels: int = 357_913_941

@@ -96,7 +96,8 @@ body { margin: 0; font: 15px/1.5 -apple-system, "Segoe UI", sans-serif;
 .content { flex: 1; min-width: 0; padding: 14px 22px 40px; }
 @media (max-width: 720px) {
   .shell { flex-direction: column; }
-  .side { width: auto; height: auto; position: static; }
+  .side { width: auto; height: auto; position: static; overflow: visible; }
+  .side-scroll { overflow: visible; }
 }
 input[type=text] { flex: 1; padding: 6px 10px; border-radius: 6px; border: 1px solid #2a2f39;
                    background: #14161a; color: #e6e6e6; }
@@ -169,6 +170,17 @@ a.back { color: #8ab4f8; text-decoration: none; }
 .wideform { display: flex; gap: 6px; margin: 8px 0; max-width: 420px; }
 .wideform input[type=text] { flex: 1; padding: 6px 10px; border-radius: 6px;
                             border: 1px solid #2a2f39; background: #14161a; color: #e6e6e6; }
+.side { overflow: hidden; }
+.side-top { flex-shrink: 0; display: flex; flex-direction: column; gap: 12px; }
+.side-scroll { flex: 1; min-height: 0; overflow-y: auto;
+               display: flex; flex-direction: column; gap: 12px; }
+details.fgroup > summary { list-style: none; cursor: pointer; font-size: 11px;
+  text-transform: uppercase; letter-spacing: .06em; color: #6b7380;
+  padding: 0 6px; display: flex; justify-content: space-between; }
+details.fgroup > summary::-webkit-details-marker { display: none; }
+summary .count { color: #475060; text-transform: none; }
+.fitems { max-height: 34vh; overflow-y: auto; }
+.ffilter { width: calc(100% - 12px); margin: 4px 6px; font-size: 12px; padding: 4px 8px; }
 """
 
 
@@ -182,6 +194,37 @@ def _page(title: str, body: str, sidebar: str = "") -> bytes:
     return doc.encode("utf-8")
 
 
+_FILTER_JS = """
+(function(){
+  document.querySelectorAll('.ffilter').forEach(function(i){
+    i.addEventListener('input',function(){
+      var q=i.value.toLowerCase();
+      i.parentElement.querySelectorAll('.fitems a').forEach(function(a){
+        a.style.display=(a.classList.contains('futil')||!q||
+          a.textContent.toLowerCase().indexOf(q)>=0)?'':'none';});
+    });
+  });
+})();
+"""
+
+
+def _fgroup(title: str, links_html: str, count: int, filter_placeholder: str | None = None) -> str:
+    """A collapsible sidebar filter group with a link count; groups with
+    many links can carry a client-side filter box."""
+    box = ""
+    if filter_placeholder is not None:
+        box = (
+            f"<input class='ffilter' type='text' placeholder='{esc(filter_placeholder)}'>"
+        )
+    return (
+        f"<details class='fgroup' open>"
+        f"<summary>{esc(title)}<span class='count'>{count}</span></summary>"
+        f"{box}"
+        f"<div class='fitems navlist'>{links_html}</div>"
+        f"</details>"
+    )
+
+
 def _sidebar(
     conn: sqlite3.Connection,
     q: str = "",
@@ -190,8 +233,9 @@ def _sidebar(
     url_for=None,
     extra: str = "",
 ) -> str:
-    """The left rail: brand, search, the global nav (status filters,
-    Discover, Utilities), then any page-specific filter sections."""
+    """The left rail: brand, search, and the global nav (status filters,
+    Discover, Utilities) stay pinned; page-specific filter sections and
+    the counts footer scroll below them."""
     counts = db.status_counts(conn)
     link = url_for or (lambda key: f"/?status={key}")
 
@@ -215,7 +259,9 @@ def _sidebar(
         + item("/duplicates", "Duplicates", active == "duplicates")
     )
     utilities = item("/trash", "Trash", active == "trash")
+    script = f"<script>{_FILTER_JS}</script>" if "class='ffilter'" in extra else ""
     return (
+        "<div class='side-top'>"
         "<div class='brand'>phototext</div>"
         "<form class='search' action='/' method='get'>"
         "<input type='text' name='q' placeholder='Search recovered text and context...'"
@@ -224,12 +270,16 @@ def _sidebar(
         f"<div class='navlist'>{library}</div>"
         "<div class='navgroup'>Discover</div>"
         f"<div class='navlist'>{discover}</div>"
-        f"{extra}"
         "<div class='navgroup'>Utilities</div>"
         f"<div class='navlist'>{utilities}</div>"
+        "</div>"
+        "<div class='side-scroll'>"
+        f"{extra}"
         f"<div class='sidefoot'>{counts.get('total', 0)} photos "
         f"(&#10003; {counts.get('done', 0)} &#8987; {counts.get('queued', 0)} "
         f"&#10007; {counts.get('error', 0)})</div>"
+        f"{script}"
+        "</div>"
     )
 
 
@@ -398,11 +448,8 @@ def render_list(conn: sqlite3.Connection, params: dict, ctx: dict | None = None)
                     f"<a{cls} href='/?{q_enc}&year={y['year']}'>{y['year']} ({y['n']})</a>"
                 )
             if year:
-                chips.append(f"<a href='/?{q_enc}'>all years</a>")
-            year_section = (
-                "<div class='navgroup'>Years</div>"
-                f"<div class='navlist'>{''.join(chips)}</div>"
-            )
+                chips.append(f"<a class='futil' href='/?{q_enc}'>all years</a>")
+            year_section = _fgroup("Years", "".join(chips), len(years))
         sidebar = _sidebar(conn, q=q, extra=year_section)
         body = f"<p class='note'>{esc(note)}</p>"
     else:
@@ -472,7 +519,7 @@ def render_list(conn: sqlite3.Connection, params: dict, ctx: dict | None = None)
             def _toggle(r) -> str:
                 return ""
         cards = [_card(r, _snippet(r["text"] or ""), _toggle(r)) for r in rows]
-        sections = [f"<div class='navgroup'>Views</div><div class='navlist'>{hidden_chip}</div>"]
+        sections = [_fgroup("Views", hidden_chip, 1)]
         people_rows = db.people_list(
             conn, float((ctx or {}).get("min_confidence") or 0.6)
         )
@@ -483,9 +530,12 @@ def render_list(conn: sqlite3.Connection, params: dict, ctx: dict | None = None)
                 for cls in (" class='on'" if person == p["name"] else "",)
             ]
             if person:
-                chips.append(f"<a href='{qs({'person': ''})}'>all people</a>")
+                chips.append(f"<a class='futil' href='{qs({'person': ''})}'>all people</a>")
             sections.append(
-                f"<div class='navgroup'>People</div><div class='navlist'>{''.join(chips)}</div>"
+                _fgroup(
+                    "People", "".join(chips), len(people_rows),
+                    filter_placeholder="filter people" if len(people_rows) > 8 else None,
+                )
             )
         cats = [
             r["category"]
@@ -500,17 +550,18 @@ def render_list(conn: sqlite3.Connection, params: dict, ctx: dict | None = None)
                 for c in cats
                 for cls in (" class='on'" if c == category else "",)
             ]
-            chips.append(f"<a href='{qs({'category': ''})}'>all categories</a>")
+            chips.append(f"<a class='futil' href='{qs({'category': ''})}'>all categories</a>")
             sections.append(
-                f"<div class='navgroup'>Categories</div><div class='navlist'>{''.join(chips)}</div>"
+                _fgroup(
+                    "Categories", "".join(chips), len(cats),
+                    filter_placeholder="filter categories" if len(cats) > 8 else None,
+                )
             )
         text_chips = []
         for value, label in (("all", "any text"), ("yes", "with text"), ("no", "no text")):
             cls = " class='on'" if text_filter == value else ""
             text_chips.append(f"<a{cls} href='{qs({'text': value})}'>{label}</a>")
-        sections.append(
-            f"<div class='navgroup'>Text</div><div class='navlist'>{''.join(text_chips)}</div>"
-        )
+        sections.append(_fgroup("Text", "".join(text_chips), 3))
         years = db.date_taken_histogram(conn)
         if years:
             chips = []
@@ -520,10 +571,8 @@ def render_list(conn: sqlite3.Connection, params: dict, ctx: dict | None = None)
                     f"<a{cls} href='{qs({'year': y['year']})}'>{y['year']} ({y['n']})</a>"
                 )
             if year:
-                chips.append(f"<a href='{qs({'year': ''})}'>all years</a>")
-            sections.append(
-                f"<div class='navgroup'>Years</div><div class='navlist'>{''.join(chips)}</div>"
-            )
+                chips.append(f"<a class='futil' href='{qs({'year': ''})}'>all years</a>")
+            sections.append(_fgroup("Years", "".join(chips), len(years)))
         sidebar = _sidebar(
             conn, status=status, url_for=lambda key: qs({"status": key}),
             extra="".join(sections),

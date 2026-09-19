@@ -113,7 +113,8 @@ def run_pipeline(
             print(f"Scanning: {src['uri']}")
             try:
                 scanner.scan_source(conn, src["uri"], src["id"], slice_spec,
-                                process_derivatives=cfg.process_derivatives)
+                                process_derivatives=cfg.process_derivatives,
+                                ocr_enabled=cfg.vision_ocr)
             except (FileNotFoundError, ValueError) as e:
                 print(f"  scan error: {e}")
                 if slice_spec is not None:
@@ -180,7 +181,7 @@ def run_pipeline(
                     f"Watching {n_sources} source(s) for new photos "
                     f"(checking every {watch_interval_s}s; Ctrl+C to stop)"
                 )
-            newly = _watch_scan(conn, slice_spec, cfg.process_derivatives)
+            newly = _watch_scan(conn, slice_spec, cfg.process_derivatives, ocr_enabled=cfg.vision_ocr)
             if newly:
                 print(f"watch: {newly} new photo(s) queued")
                 continue
@@ -207,7 +208,8 @@ def run_pipeline(
 
 
 def _watch_scan(
-    conn, slice_spec: scanner.Slice | None, process_derivatives: bool = True
+    conn, slice_spec: scanner.Slice | None, process_derivatives: bool = True,
+    ocr_enabled: bool = True,
 ) -> int:
     """Fast rescan of registered sources; returns newly queued photos."""
     newly = 0
@@ -216,6 +218,7 @@ def _watch_scan(
             stats = scanner.scan_source(
                 conn, src["uri"], src["id"], slice_spec, quiet=True,
                 process_derivatives=process_derivatives,
+                ocr_enabled=ocr_enabled,
             )
             newly += stats.new_photos
         except (FileNotFoundError, ValueError) as e:
@@ -371,7 +374,7 @@ def _run_multi(
             break
         if watch and time.monotonic() - last_scan >= watch_interval_s:
             last_scan = time.monotonic()
-            newly = _watch_scan(conn, slice_spec, cfg.process_derivatives)
+            newly = _watch_scan(conn, slice_spec, cfg.process_derivatives, ocr_enabled=cfg.vision_ocr)
             if newly:
                 print(f"watch: {newly} new photo(s) queued")
         time.sleep(1)
@@ -458,7 +461,7 @@ def _process_item(
         return "error"
     b64 = base64.b64encode(image_bytes).decode("ascii")
     started = time.monotonic()
-    if cfg.two_tier:
+    if cfg.two_tier and not row["vision_text"]:
         try:
             gate_raw, gate_content = client.gate(
                 base64.b64encode(

@@ -14,7 +14,7 @@ from typing import List, Optional
 
 import typer
 
-from . import config, db, people as people_mod, scanner, webui, worker
+from . import config, db, ocr, people as people_mod, scanner, webui, worker
 from .config import load_config
 from .faces import detect_faces, vision_problem
 from .imaging import read_date_taken, test_image_b64
@@ -338,6 +338,7 @@ def scan(
             stats = scanner.scan_source(
                 conn, uri, source_id, slice_spec,
                 process_derivatives=cfg.process_derivatives,
+                ocr_enabled=cfg.vision_ocr,
             )
         except (FileNotFoundError, ValueError) as e:
             typer.echo(f"  error: {e}", err=True)
@@ -360,6 +361,8 @@ def scan(
             line += f" | offloaded {stats.offloaded}"
         if stats.library_hidden:
             line += f" | library-hidden {stats.library_hidden}"
+        if stats.vision_ocr:
+            line += f" | vision-ocr {stats.vision_ocr}"
         typer.echo(line)
         totals.update(stats)
     typer.echo(f"catalog: {_counts_summary(db.status_counts(conn))}")
@@ -575,11 +578,37 @@ def search(
     include_hidden: bool = typer.Option(
         False, "--hidden", help="Include hidden photos in matches."
     ),
+    semantic: bool = typer.Option(
+        False, "--semantic", help="Use semantic (embedding) search instead of keyword search."
+    ),
 ) -> None:
-    """Full-text search over recovered text and photo context."""
+    """Full-text search over recovered text and photo context.
+
+    Use --semantic with an embed_model configured for embedding-based
+    similarity search.
+    """
     cfg = _cfg()
-    conn = db.connect(cfg.db_path)
     joined = " ".join(query)
+    if year is not None and not (year.isdigit() and len(year) == 4):
+        typer.echo("error: --year must be a 4-digit year, e.g. 2023", err=True)
+        raise typer.Exit(2)
+
+    if semantic:
+        if not cfg.embed_model:
+            typer.echo("error: set embed_model in the config to use semantic search", err=True)
+            raise typer.Exit(2)
+        taken_from = taken_to = None
+        try:
+            if date_from is not None:
+                taken_from = scanner.parse_slice_date(date_from, end=False).isoformat()
+            if date_to is not None:
+                taken_to = scanner.parse_slice_date(date_to, end=True).isoformat()
+        except ValueError as e:
+            typer.echo(f"error: {e}", err=True)
+            raise typer.Exit(2)
+        _semantic_search(cfg, joined, limit, person, year, taken_from, taken_to, include_hidden)
+        return
+
     highlight = ("\x1b[1m", "\x1b[0m") if sys.stdout.isatty() else ("", "")
     taken_from = taken_to = None
     try:
@@ -590,9 +619,7 @@ def search(
     except ValueError as e:
         typer.echo(f"error: {e}", err=True)
         raise typer.Exit(2)
-    if year is not None and not (year.isdigit() and len(year) == 4):
-        typer.echo("error: --year must be a 4-digit year, e.g. 2023", err=True)
-        raise typer.Exit(2)
+    conn = db.connect(cfg.db_path)
     try:
         rows, effective = db.search_photos(
             conn, joined, limit=limit, highlight=highlight, category=category,
@@ -626,6 +653,132 @@ def search(
         context = (row["context_snip"] or "").strip()
         if context:
             typer.echo(f"    context: {context}")
+
+
+def _semantic_search(
+    cfg,
+    query_text: str,
+    limit: int,
+    person: str | None,
+    year: str | None,
+    date_from: str | None,
+    date_to: str | None,
+    include_hidden: bool,
+) -> None:
+    import array
+    import math
+
+    client = OllamaClient(cfg)
+    try:
+        query_vecs = client.embed([query_text])
+    except Exception as e:
+        typer.echo(f"error: embed call failed: {e}", err=True)
+        raise typer.Exit(1)
+    if not query_vecs:
+        typer.echo("error: empty embedding returned", err=True)
+        raise typer.Exit(1)
+    query_vec = query_vecs[0]
+
+    conn = db.connect(cfg.db_path)
+    rows = conn.execute(
+        "SELECT photo_id, vector FROM photo_embeddings WHERE model = ?",
+        (cfg.embed_model,),
+    ).fetchall()
+    if not rows:
+        typer.echo("no embeddings in the catalog yet; run `phototext embed` first")
+        return
+
+    scores = []
+    for photo_id, vector_blob in rows:
+        vec = array.array("f", vector_blob)
+        norm_q = math.sqrt(sum(v * v for v in query_vec))
+        norm_d = math.sqrt(sum(v * v for v in vec))
+        if norm_q == 0 or norm_d == 0:
+            continue
+        dot = sum(a * b for a, b in zip(query_vec, vec))
+        similarity = dot / (norm_q * norm_d)
+        scores.append((photo_id, similarity))
+
+    scores.sort(key=lambda x: x[1], reverse=True)
+    top_ids = [pid for pid, _ in scores[:50]]
+
+    if person or year or date_from or date_to:
+        top_ids = db.filter_photo_ids(conn, top_ids, person=person, year=year,
+                                     date_from=date_from, date_to=date_to)
+    if not include_hidden:
+        visible = set(
+            r[0] for r in conn.execute(
+                "SELECT id FROM photos WHERE id IN ({}) AND hidden = 0".format(
+                    ",".join("?" for _ in top_ids)
+                ), top_ids,
+            )
+        )
+        scores = [(pid, s) for pid, s in scores if pid in visible]
+        top_ids = [pid for pid, _ in scores]
+
+    scores = scores[:limit]
+    if not scores:
+        typer.echo(f"no matches for '{query_text}'")
+        return
+
+    typer.echo(f"{len(scores)} match(es) for '{query_text}' (semantic)")
+    for photo_id, similarity in scores:
+        path_row = conn.execute(
+            "SELECT path FROM locations WHERE photo_id = ? ORDER BY id LIMIT 1",
+            (photo_id,),
+        ).fetchone()
+        path = path_row["path"] if path_row else "(no location)"
+        typer.echo(f"[{photo_id}] {path} — score {similarity:.2f}")
+
+
+@app.command("similar")
+def similar(
+    photo_id: int = typer.Argument(..., help="Photo id to find similar photos for."),
+) -> None:
+    """Find photos with the closest text embeddings (semantic similarity)."""
+    import array
+    import math
+
+    cfg = _cfg()
+    if not cfg.embed_model:
+        typer.echo("error: set embed_model in the config to use semantic search", err=True)
+        raise typer.Exit(2)
+    conn = db.connect(cfg.db_path)
+    row = conn.execute(
+        "SELECT vector FROM photo_embeddings WHERE photo_id = ? AND model = ?",
+        (photo_id, cfg.embed_model),
+    ).fetchone()
+    if row is None:
+        existing = conn.execute(
+            "SELECT id FROM photos WHERE id = ? AND deleted_at IS NULL", (photo_id,)
+        ).fetchone()
+        if existing is None:
+            typer.echo(f"error: no photo with id {photo_id}", err=True)
+            raise typer.Exit(2)
+        typer.echo(f"photo {photo_id} has no embedding yet; run `phototext embed` first")
+        return
+    query_vec = array.array("f", row["vector"])
+    rows = conn.execute(
+        "SELECT photo_id, vector FROM photo_embeddings WHERE model = ? AND photo_id != ?",
+        (cfg.embed_model, photo_id),
+    ).fetchall()
+    scores = []
+    norm_q = math.sqrt(sum(v * v for v in query_vec))
+    for other_id, vector_blob in rows:
+        vec = array.array("f", vector_blob)
+        norm_d = math.sqrt(sum(v * v for v in vec))
+        if norm_q == 0 or norm_d == 0:
+            continue
+        dot = sum(a * b for a, b in zip(query_vec, vec))
+        scores.append((other_id, dot / (norm_q * norm_d)))
+    scores.sort(key=lambda x: x[1], reverse=True)
+    for other_id, similarity in scores[:10]:
+        path_row = conn.execute(
+            "SELECT path FROM locations WHERE photo_id = ? ORDER BY id LIMIT 1",
+            (other_id,),
+        ).fetchone()
+        path = path_row["path"] if path_row else "(no location)"
+        typer.echo(f"[{other_id}] {path} — score {similarity:.2f}")
 
 
 @app.command("backfill-dates")
@@ -683,6 +836,112 @@ def backfill_dates(
         summary += f", {from_file} from file mtime"
     summary += f"; {undated} photo(s) still without a date"
     typer.echo(summary)
+
+
+@app.command("backfill-ocr")
+def backfill_ocr() -> None:
+    """Run macOS Vision OCR on all photos that lack vision_text.
+
+    New scans record OCR text automatically when cfg.vision_ocr is enabled;
+    this command catches up existing rows from before the feature shipped.
+    Photos with no readable file are left for a later retry.
+    """
+    cfg = _cfg()
+    conn = db.connect(cfg.db_path)
+    ids = [
+        r["id"]
+        for r in conn.execute(
+            "SELECT id FROM photos WHERE vision_text IS NULL AND deleted_at IS NULL "
+            "ORDER BY id"
+        )
+    ]
+    if not ids:
+        typer.echo("all photos already have OCR text")
+        return
+    typer.echo(f"{len(ids)} photo(s) without OCR text")
+    recorded = missing = 0
+    processed = 0
+    for photo_id in ids:
+        source = db.find_first_existing_location(conn, photo_id)
+        text = ""
+        if source:
+            text = ocr.vision_ocr(Path(source), photo_id)
+        if text:
+            conn.execute(
+                "UPDATE photos SET vision_text = ? WHERE id = ?",
+                (text, photo_id),
+            )
+            recorded += 1
+        else:
+            missing += 1
+        processed += 1
+        if processed % 500 == 0:
+            conn.commit()
+            typer.echo(f"  ... {processed} processed")
+    conn.commit()
+    typer.echo(f"OCR text recorded: {recorded} photo(s); {missing} without readable files")
+
+
+@app.command("embed")
+def embed_command(
+    all_photos: bool = typer.Option(
+        False, "--all", help="Re-embed every photo, not just the ones missing embeddings."
+    ),
+) -> None:
+    """Compute text embeddings for every extracted photo via Ollama /api/embed.
+
+    Embeddings are stored per-photo, per-model so you can swap embedding
+    models without re-extracting photos.
+    """
+    cfg = _cfg()
+    if not cfg.embed_model:
+        typer.echo("error: set embed_model in the config to use embeddings", err=True)
+        raise typer.Exit(2)
+    client = OllamaClient(cfg)
+    conn = db.connect(cfg.db_path)
+    photo_ids = db.photo_ids_missing_embeddings(conn, cfg.embed_model, all_photos=all_photos)
+    if not photo_ids:
+        typer.echo("0 photo(s) to embed (all have embeddings); use --all to re-embed")
+        return
+    typer.echo(f"embedding {len(photo_ids)} photo(s) with {cfg.embed_model}")
+    batch = []
+    batch_ids = []
+    done = 0
+    for photo_id in photo_ids:
+        row = conn.execute(
+            "SELECT id, COALESCE(text,'') || '\n' || COALESCE(context,'') AS content "
+            "FROM photos WHERE id = ?", (photo_id,)
+        ).fetchone()
+        if row is None or not row["content"].strip():
+            continue
+        batch.append(row["content"])
+        batch_ids.append(photo_id)
+        if len(batch) >= 32:
+            _embed_batch(client, conn, cfg.embed_model, batch_ids, batch)
+            done += len(batch_ids)
+            batch.clear()
+            batch_ids.clear()
+            if done % 200 < 32:
+                typer.echo(f"  ... {done}/{len(photo_ids)}")
+    if batch:
+        _embed_batch(client, conn, cfg.embed_model, batch_ids, batch)
+        done += len(batch)
+    conn.commit()
+    conn.close()
+    typer.echo(f"embedded {done} photo(s) with {cfg.embed_model}")
+
+
+def _embed_batch(client, conn, model, photo_ids, texts):
+    try:
+        vectors = client.embed(texts)
+    except Exception as e:
+        typer.echo(f"error: embed call failed: {e}", err=True)
+        raise typer.Exit(1)
+    for photo_id, vec in zip(photo_ids, vectors):
+        dims = len(vec)
+        import array
+        vector_bytes = array.array("f", vec).tobytes()
+        db.store_embedding(conn, photo_id, model, dims, vector_bytes)
 
 
 def _dir_bytes(path: Path) -> int:
@@ -1693,6 +1952,12 @@ def doctor() -> None:
                 face_problem or "enabled")
     else:
         report(True, "face detection (macOS Vision)", "disabled in config")
+    ocr_problem = ocr.vision_problem()
+    if cfg.vision_ocr:
+        report(ocr_problem is None, "OCR (macOS Vision)",
+                ocr_problem or "enabled")
+    else:
+        report(True, "OCR (macOS Vision)", "disabled in config")
     if bad:
         raise typer.Exit(1)
 

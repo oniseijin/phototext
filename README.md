@@ -81,7 +81,10 @@ uv venv .venv && uv pip install -e .
 | `phototext run` | Scan + process queued photos until done, budget, or Ctrl+C. |
 | `phototext status` | Counts, throughput, ETA, recent errors. |
 | `phototext results` | Show recent extractions (`--status done/error/all`, `--full` for untruncated text). |
-| `phototext search QUERY` | Full-text search (FTS5) over recovered text and context; FTS5 syntax, phrases in double quotes. |
+| `phototext search QUERY` | Full-text search (FTS5) over recovered text, context, and scan-time Vision OCR text; FTS5 syntax, phrases in double quotes. `--semantic` ranks by embedding similarity instead (`--person`, `--year`, `--date-from/--date-to` filters still apply). |
+| `phototext embed` | Build text embeddings for semantic search (needs `embed_model` in the config; `--all` re-embeds). |
+| `phototext similar <photo-id>` | Nearest photos by embedding similarity. |
+| `phototext backfill-ocr` | Record macOS Vision OCR text for photos scanned before it existed (makes them searchable without the LLM pass). |
 | `phototext export` | Export results as JSONL or CSV (`--format jsonl\|csv`, `--status`, `--output`). |
 | `phototext retry` | Requeue failed photos. |
 | `phototext reprocess` | Requeue selected photos for re-extraction: `--errors`, `--no-text`, `--tiled`, `--gated`, `--done-with MODEL` (after a model upgrade), `--done-before DATE`, `--category NAME`, `--all`, or `--ids-file` of ids/paths. |
@@ -318,6 +321,8 @@ override it.
 | `person_model` | *(prefilter)* | Model for person matching + recognition profiles. |
 | `person_min_confidence` | `0.6` | Model tags below this confidence wait in the review queue. |
 | `face_detection` | `true` | macOS Vision face detection for the people pass (skip faceless photos, match on face crops). |
+| `vision_ocr` | `true` | Free macOS Vision OCR at scan time into `vision_text` (FTS-indexed) so photos are searchable before the LLM pass; silent no-op without Vision. |
+| `embed_model` | *(empty)* | Ollama embedding model for semantic search (e.g. `nomic-embed-text`); empty disables `embed`/`--semantic`/`similar`. |
 | `prefilter_max_edge` | `512` | Image size for gate calls (smaller is faster). |
 | `max_image_pixels` | `357913941` | Hard decode budget per image (~357 MP). Suspected decompression bombs are recorded as errors — deliberately without the `sips` fallback. |
 | `db_path` | `~/.phototext/catalog.db` | SQLite catalog location. |

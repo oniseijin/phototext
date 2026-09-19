@@ -23,9 +23,10 @@ Guidance for AI coding agents working in this repo.
 ```
 src/phototext/
   cli.py           typer commands; global --config/--db; scan/run slices,
-                   search (--person/--year/--date-from/--date-to), export,
-                   migrate, serve, reprocess, help, hide/unhide/delete/
-                   restore/purge/trash, unscan, backfill-dates,
+                   search (--person/--year/--date-from/--date-to,
+                   --semantic), export, migrate, serve, reprocess, help,
+                   hide/unhide/delete/restore/purge/trash, unscan,
+                   backfill-dates, backfill-ocr, embed, similar,
                    cache-previews, categories, memes, duplicates,
                    autocomplete, profiles, people
                    (name/run/list/photos/confirm [--add-seed]/remove/rename/
@@ -40,6 +41,9 @@ src/phototext/
                    adaptive iPhoto apdb reader; iter_photos_assets (uuid,
                    path, hidden) + PHOTOTEXT_TEST_ASSETS seam; apdb hidden
                    flag; find_derivative
+  ocr.py           macOS Vision OCR (VNRecognizeTextRequest) tier-0:
+                   vision_text at scan time, PHOTOTEXT_TEST_OCR seam,
+                   graceful degradation
   people.py        person seeds (face crops), recognition profiles, the
                    `people run` matching pass (face prefilter + crops)
   memes.py         63-bit dhash, backfill, hamming clustering via BK-tree
@@ -151,6 +155,20 @@ tests/
   `unscan`/`purge` clean the map (FK on photos.id). The web falls back to
   the `views/` cache for any photo without on-disk pixels; serve photos
   before enabling Optimize Storage with `phototext cache-previews`.
+- **Vision OCR tier-0** (migration 12): `ocr.py` runs macOS Vision
+  `VNRecognizeTextRequest` at scan time into `photos.vision_text`
+  (FTS-indexed; `vision_ocr` config, default on, silent no-op without
+  Vision; `PHOTOTEXT_TEST_OCR` seam; `backfill-ocr` for old rows;
+  never overwrites non-NULL). Real Vision DOES read PIL-drawn text —
+  tests that need "no text found" must use `make_plain_image`. In the
+  two-tier gate, photos with vision_text skip the gate call entirely.
+- **Embeddings** (migration 13): `photo_embeddings(photo_id, model, dims,
+  vector BLOB)`; `phototext embed` (missing-by-default, `--all`) embeds
+  `text + context` via Ollama `/api/embed` (`embed_model` config, empty =
+  off); `search --semantic` cosine-ranks (stdlib array, precomputed norms)
+  merged with the person/year/date facets; `similar <id>` nearest
+  neighbors. The mock's /api/embed is deterministic (synonym-canonicalized
+  word-hash vectors).
 - **Library hidden sync** (migration 11): `photos.hidden_origin` is
   NULL | 'library' | 'user'. Scans apply the library's hidden flag via
   `db.apply_library_hidden` — 'user' rows (phototext's own hide/unhide,
@@ -238,12 +256,18 @@ tests/
   demote without duplicates, derivative relink, re-promote, cached-view
   fallback, hidden sync both directions with user-override survival,
   iPhoto apdb hidden import + no-op without the column, cache-previews,
-  unscan cleaning the asset map), and the queue-order/ops batch ([44]:
+  unscan cleaning the asset map), the queue-order/ops batch ([44]:
   recent_first vs FIFO claim order, reprocess --done-with/--done-before/
   --category, process_derivatives=false deferral, worker exit-code
-  propagation on a dead backend). APFS refuses to create invalid-UTF-8
-  filenames, so the scanner skip guard is exercised via the stubbed-walker
-  check in e2e section [40] while the model-output path runs end-to-end
+  propagation on a dead backend), Vision OCR ([45]: seam scan stats,
+  FTS-before-run, backfill graceful-empty, gate skip — with plain-image
+  fixtures since real Vision reads PIL text), embeddings ([46]: embed
+  missing-only and --all, semantic hit with zero FTS overlap, similar,
+  error paths), and sidebar scaling ([47]: pinned nav, collapsible fgroups,
+  filter boxes past 8 people/categories). APFS refuses to create
+  invalid-UTF-8 filenames, so the scanner skip guard is exercised via the
+  stubbed-walker check in e2e section [40] while the model-output path runs
+  end-to-end
   against the mock's `surrogate` mode. The open-in-Photos route is never
   executed in e2e (it would launch Photos.app); only its links/404s are
   checked — osascript/AppleScript `spotlight` needs a manual smoke test.

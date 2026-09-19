@@ -8,7 +8,7 @@ from pathlib import Path
 from .config import ensure_noindex
 from .library_meta import norm_path
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 13
 
 MIGRATIONS: dict[int, str] = {
     1: """
@@ -143,6 +143,46 @@ MIGRATIONS: dict[int, str] = {
     ALTER TABLE photos ADD COLUMN hidden_origin TEXT;
     UPDATE photos SET hidden_origin = 'user'
     WHERE hidden = 1 AND hidden_origin IS NULL;
+    """,
+    12: """
+    ALTER TABLE photos ADD COLUMN vision_text TEXT;
+    DROP TRIGGER IF EXISTS photos_fts_ai;
+    DROP TRIGGER IF EXISTS photos_fts_ad;
+    DROP TRIGGER IF EXISTS photos_fts_au;
+    DROP TABLE IF EXISTS photos_fts;
+    CREATE VIRTUAL TABLE photos_fts USING fts5(
+        text, context, vision_text,
+        content='photos', content_rowid='id'
+    );
+
+    CREATE TRIGGER photos_fts_ai AFTER INSERT ON photos BEGIN
+        INSERT INTO photos_fts(rowid, text, context, vision_text) VALUES (new.id, new.text, new.context, new.vision_text);
+    END;
+
+    CREATE TRIGGER photos_fts_ad AFTER DELETE ON photos BEGIN
+        INSERT INTO photos_fts(photos_fts, rowid, text, context, vision_text)
+        VALUES ('delete', old.id, old.text, old.context, old.vision_text);
+    END;
+
+    CREATE TRIGGER photos_fts_au AFTER UPDATE ON photos
+    WHEN new.text IS NOT old.text OR new.context IS NOT old.context OR new.vision_text IS NOT old.vision_text
+    BEGIN
+        INSERT INTO photos_fts(photos_fts, rowid, text, context, vision_text)
+        VALUES ('delete', old.id, old.text, old.context, old.vision_text);
+        INSERT INTO photos_fts(rowid, text, context, vision_text) VALUES (new.id, new.text, new.context, new.vision_text);
+    END;
+
+    INSERT INTO photos_fts(photos_fts) VALUES ('rebuild');
+    """,
+    13: """
+    CREATE TABLE photo_embeddings (
+        photo_id INTEGER NOT NULL REFERENCES photos(id),
+        model TEXT NOT NULL,
+        dims INTEGER NOT NULL,
+        vector BLOB NOT NULL,
+        updated_at TEXT,
+        PRIMARY KEY (photo_id, model)
+    );
     """,
 }
 
@@ -1400,6 +1440,73 @@ def people_candidates(
         """,
         person_ids,
     ).fetchall()
+
+
+def photo_ids_missing_embeddings(
+    conn: sqlite3.Connection, model: str, all_photos: bool = False
+) -> list[int]:
+    if all_photos:
+        return [
+            r[0] for r in conn.execute(
+                "SELECT id FROM photos WHERE deleted_at IS NULL AND hidden = 0 "
+                "AND (text IS NOT NULL OR context IS NOT NULL) "
+                "ORDER BY id"
+            )
+        ]
+    return [
+        r[0] for r in conn.execute(
+            "SELECT p.id FROM photos p "
+            "LEFT JOIN photo_embeddings e ON e.photo_id = p.id AND e.model = ? "
+            "WHERE p.deleted_at IS NULL AND p.hidden = 0 "
+            "AND (p.text IS NOT NULL OR p.context IS NOT NULL) "
+            "AND e.photo_id IS NULL "
+            "ORDER BY p.id",
+            (model,),
+        )
+    ]
+
+
+def store_embedding(
+    conn: sqlite3.Connection,
+    photo_id: int,
+    model: str,
+    dims: int,
+    vector_bytes: bytes,
+) -> None:
+    conn.execute(
+        "INSERT INTO photo_embeddings (photo_id, model, dims, vector, updated_at) "
+        "VALUES (?, ?, ?, ?, ?) "
+        "ON CONFLICT(photo_id, model) DO UPDATE SET "
+        "dims = excluded.dims, vector = excluded.vector, updated_at = excluded.updated_at",
+        (photo_id, model, dims, vector_bytes, now_utc()),
+    )
+
+
+def filter_photo_ids(
+    conn: sqlite3.Connection,
+    ids: list[int],
+    person: str | None = None,
+    year: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> list[int]:
+    if not ids:
+        return []
+    marks = ",".join("?" for _ in ids)
+    sql = f"SELECT p.id FROM photos p WHERE p.id IN ({marks})"
+    params: list = list(ids)
+    if person:
+        sql += (
+            " AND p.id IN (SELECT t.photo_id FROM person_tags t "
+            "JOIN people pe ON pe.id = t.person_id "
+            "WHERE pe.name = ? COLLATE NOCASE AND t.present = 1)"
+        )
+        params.append(person)
+    date_frags, date_params = _date_filter_parts(date_from, date_to, year)
+    if date_frags:
+        sql += " AND " + " AND ".join(date_frags)
+        params += date_params
+    return [r[0] for r in conn.execute(sql, params)]
 
 
 def export_rows(

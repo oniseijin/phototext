@@ -250,6 +250,30 @@ class OllamaClient:
             content = self._chat(retry_payload)
             return parse_model_json(content), content
 
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        payload = {"model": self.cfg.embed_model, "input": texts}
+        try:
+            resp = requests.post(
+                f"{self.base_url}/api/embed",
+                json=payload,
+                timeout=self.timeout,
+            )
+        except requests.Timeout as e:
+            raise OllamaTimeout(f"embed call exceeded {self.timeout}s timeout") from e
+        except requests.RequestException as e:
+            raise OllamaUnreachable(str(e)) from e
+        try:
+            resp.raise_for_status()
+            data = resp.json()
+        except requests.RequestException as e:
+            raise OllamaUnreachable(str(e)) from e
+        except ValueError as e:
+            raise OllamaServerError(f"invalid response from /api/embed: {resp.text[:200]}") from e
+        try:
+            return data["embeddings"]
+        except (KeyError, TypeError) as e:
+            raise ModelOutputError(f"unexpected /api/embed shape: {resp.text[:200]}") from e
+
     def _chat(self, payload: dict) -> str:
         # Streamed and wall-clock capped: requests' timeout is a per-read
         # socket timeout, so a server that trickles bytes can keep a call

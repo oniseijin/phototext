@@ -488,7 +488,7 @@ def main() -> int:
         check("4 match(es)" in out, "phrase search works")
         out = cli.run("search", "zzznothing")
         check("no matches" in out, "no-match message")
-        out = cli.run("search", "total:$99")
+        out = cli.run("search", "zzz:$qq")
         check("no matches" in out, "invalid fts syntax falls back to a phrase")
 
         print("\n[15] migrate command backs up and applies pending migrations")
@@ -508,22 +508,24 @@ def main() -> int:
             "ALTER TABLE photos DROP COLUMN date_taken; "
             "ALTER TABLE photos DROP COLUMN offloaded; "
             "ALTER TABLE photos DROP COLUMN hidden_origin; "
+            "ALTER TABLE photos DROP COLUMN vision_text; "
             "DROP TABLE IF EXISTS photo_warnings; "
             "DROP TABLE IF EXISTS person_tags; "
             "DROP TABLE IF EXISTS people; "
             "DROP TABLE IF EXISTS photo_assets; "
+            "DROP TABLE IF EXISTS photo_embeddings; "
             "DELETE FROM schema_version WHERE version >= 2;"
         )
         con.commit()
         con.close()
         out = cli.run("migrate", "--dry-run")
         check(
-            "pending migration(s): v2, v3, v4, v5, v6, v7, v8, v9, v10, v11" in out,
+            "pending migration(s): v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13" in out,
             "dry run reports pending migrations",
         )
         check("dry run: nothing applied" in out, "dry run applies nothing")
         out = cli.run("migrate")
-        check("migrated: v1 -> v11" in out, "migrate applies pending migrations")
+        check("migrated: v1 -> v13" in out, "migrate applies pending migrations")
         check("backup:" in out, "migrate backs up first")
         con = db_open(db_path)
         check(count(con, "SELECT COUNT(*) FROM photos_fts") == 4, "fts rebuilt with 4 rows")
@@ -967,8 +969,18 @@ def main() -> int:
         )
         con.close()
         mode_file.write_text("gatenotext")
+        # Vision reads PIL-drawn text, so the textless fixtures must carry
+        # no text at all — otherwise the gate is skipped (vision_text set)
+        # and the gate tier is never exercised. The two plain images are
+        # inverted copies so content-hash dedup keeps them as two photos.
+        gate_folder2 = work / "gatefolder2"
+        gate_folder2.mkdir()
+        make_plain_image(gate_folder2 / "p1.jpg")
+        ImageOps.invert(Image.open(gate_folder2 / "p1.jpg")).save(
+            gate_folder2 / "p2.jpg"
+        )
         c20 = fresh_cli("gatedb2", 'two_tier = true\nprefilter_model = "gemma3:mock"\n')
-        c20.run("scan", str(gate_folder))
+        c20.run("scan", str(gate_folder2))
         out = c20.run("run", "--skip-preflight")
         check("(gated)" in out, "textless photos finish at the gate tier")
         con = db_open(work / "db-gatedb2.db")
@@ -2338,6 +2350,304 @@ def main() -> int:
     finally:
         mock44.terminate()
         mock44.wait()
+
+    print("\n[45] macOS Vision OCR (vision_text, FTS, backfill, gate skip)")
+    port45 = free_port()
+    mock45 = start_mock(port45, mode_file)
+    try:
+
+        def fresh_cli45(name: str, extra: str = "") -> CLI:
+            cfgp = work / f"config-{name}.toml"
+            cfgp.write_text(
+                f'ollama_url = "http://127.0.0.1:{port45}"\n'
+                f'model = "{MODEL}"\n'
+                f'db_path = "{work}/db-{name}.db"\n' + extra
+            )
+            return CLI(cfgp)
+
+        # a) OCR seam: scan two photos, check vision-ocr stats and FTS search
+        ocr_folder = work / "ocrfolder"
+        ocr_folder.mkdir()
+        make_text_image(ocr_folder / "alpha.jpg", ["alpha doc"])
+        make_text_image(ocr_folder / "beta.jpg", ["beta doc"])
+        c45 = fresh_cli45("ocr")
+        os.environ["PHOTOTEXT_TEST_OCR"] = "*:RECEIPT SEAM TEXT"
+        try:
+            out = c45.run("scan", str(ocr_folder))
+            check("vision-ocr 2" in out, "scan summary reports vision-ocr count")
+            con45 = db_open(work / "db-ocr.db")
+            check(
+                count(con45, "SELECT COUNT(*) FROM photos WHERE vision_text IS NOT NULL") == 2,
+                "both photos get vision_text",
+            )
+            check(
+                count(con45, "SELECT COUNT(*) FROM photos_fts WHERE photos_fts MATCH 'RECEIPT'") == 2,
+                "FTS indexes vision_text (searchable before run)",
+            )
+            con45.close()
+            out = c45.run("search", "RECEIPT")
+            check("2 match(es)" in out, "search finds OCR text before run")
+        finally:
+            os.environ.pop("PHOTOTEXT_TEST_OCR", None)
+
+        # b) backfill-ocr on an image Vision cannot read: graceful no-op
+        ocr2_folder = work / "ocr2folder"
+        ocr2_folder.mkdir()
+        make_plain_image(ocr2_folder / "a.jpg")
+        c45b = fresh_cli45("ocr2")
+        c45b.run("scan", str(ocr2_folder))
+        out = c45b.run("backfill-ocr")
+        check("0 photo(s)" in out or "without readable files" in out,
+              "backfill-ocr on synthetic images handles empty gracefully")
+        out2 = c45b.run("backfill-ocr")
+        check(
+            "1 photo(s) without OCR text" in out2,
+            "second backfill-ocr retries photos Vision cannot read",
+        )
+
+        # c) gate skip: photo with vision_text skips the gate and goes full pass
+        mode_file.write_text("gatenotext")
+        ocr3_folder = work / "ocr3folder"
+        ocr3_folder.mkdir()
+        # plain images: real Vision must find nothing, so only the seam
+        # (photo 1) carries vision_text; the inverted copy keeps dedup away
+        make_plain_image(ocr3_folder / "one.jpg")
+        ImageOps.invert(Image.open(ocr3_folder / "one.jpg")).save(
+            ocr3_folder / "two.jpg"
+        )
+        c45c = fresh_cli45("ocr3", 'two_tier = true\nprefilter_model = "gemma3:mock"\n')
+        # Set seam so only photo id 1 gets vision_text (photo 2 gets none)
+        os.environ["PHOTOTEXT_TEST_OCR"] = "1:OCR TEXT HERE"
+        try:
+            c45c.run("scan", str(ocr3_folder))
+            con45c = db_open(work / "db-ocr3.db")
+            # Verify photo 1 got vision_text and photo 2 didn't
+            con45c.row_factory = None
+            check(
+                con45c.execute(
+                    "SELECT vision_text FROM photos WHERE id = 1"
+                ).fetchone()[0]
+                == "OCR TEXT HERE",
+                "photo 1 gets seam vision_text",
+            )
+            check(
+                con45c.execute(
+                    "SELECT vision_text FROM photos WHERE id = 2"
+                ).fetchone()[0]
+                is None,
+                "photo 2 has no vision_text",
+            )
+            con45c.close()
+            out = c45c.run("run", "--skip-preflight")
+            # photo 1: has vision_text -> skips gate -> full model (gated=0)
+            # photo 2: no vision_text -> gate (gatenotext mode: has_text=false) -> gated=1
+            check("(gated)" in out, "photo 2 finishes at the gate")
+            con45c2 = db_open(work / "db-ocr3.db")
+            con45c2.row_factory = None
+            check(
+                con45c2.execute(
+                    "SELECT gated, model FROM photos WHERE id = 1"
+                ).fetchone() == (0, MODEL),
+                "photo 1: gate skipped (vision_text present), full model used",
+            )
+            check(
+                con45c2.execute(
+                    "SELECT gated, model FROM photos WHERE id = 2"
+                ).fetchone() == (1, "gemma3:mock"),
+                "photo 2: no vision_text, gate finishes it",
+            )
+            con45c2.close()
+        finally:
+            os.environ.pop("PHOTOTEXT_TEST_OCR", None)
+    finally:
+        mock45.terminate()
+        mock45.wait()
+
+    print("\n[46] text embeddings + semantic search")
+    port46 = free_port()
+    mock46 = start_mock(port46, mode_file)
+    try:
+        def fresh_cli46(name: str, extra: str = "") -> CLI:
+            cfgp = work / f"config-{name}.toml"
+            cfgp.write_text(
+                f'ollama_url = "http://127.0.0.1:{port46}"\n'
+                f'model = "{MODEL}"\n'
+                f'db_path = "{work}/db-{name}.db"\n'
+                f'embed_model = "nomic-mock"\n'
+                "face_detection = false\n"
+                "request_timeout_s = 20\n"
+                "transport_retries = 2\ntransport_backoff_s = 1\n" + extra
+            )
+            return CLI(cfgp)
+
+        c46 = fresh_cli46("embed")
+        embed_src = work / "embedsrc"
+        embed_src.mkdir()
+        make_text_image(embed_src / "electric.jpg", ["electric utility bill"])
+        make_text_image(embed_src / "invoice.jpg", ["invoice statement payment"])
+        make_text_image(embed_src / "beach.jpg", ["beach waves sunshine"])
+        c46.run("scan", str(embed_src))
+        c46.run("run", "--skip-preflight")
+        con46 = db_open(work / "db-embed.db")
+        con46.execute("UPDATE photos SET text='electric utility bill' WHERE id=1")
+        con46.execute("UPDATE photos SET text='invoice statement payment' WHERE id=2")
+        con46.execute("UPDATE photos SET text='beach waves sunshine' WHERE id=3")
+        con46.commit()
+        con46.close()
+
+        out = c46.run("embed")
+        check("embedded 3 photo(s) with nomic-mock" in out, "embed processes all done photos")
+        con46 = db_open(work / "db-embed.db")
+        con46.row_factory = None
+        check(
+            con46.execute("SELECT COUNT(*) FROM photo_embeddings").fetchone()[0] == 3,
+            "photo_embeddings has 3 rows",
+        )
+        row46 = con46.execute("SELECT * FROM photo_embeddings LIMIT 1").fetchone()
+        check(row46[2] == 8 and len(row46[3]) == 32, "dims=8 and vector is 32 bytes (8 x float32)")
+        con46.close()
+
+        # semantic: "receipt" maps to "bill" in synonyms — matches bill photos
+        out = c46.run("search", "--semantic", "receipt")
+        check("match(es)" in out, "semantic search finds results")
+        check("score" in out, "semantic results show scores")
+        # electric utility bill should be ranked high (utility->bill shares dims)
+        check("[1]" in out or "[2]" in out, "at least one bill photo appears")
+        # beach should be last or absent
+        lines46 = [l for l in out.splitlines() if l.strip().startswith("[")]
+        scores46 = []
+        for l in lines46:
+            if "score" in l:
+                scores46.append(float(l.split("score")[-1].strip()))
+        if len(scores46) >= 3:
+            check(scores46[0] >= scores46[-1], "beach photo ranks lowest")
+        elif len(scores46) >= 2:
+            check("[3]" not in lines46[0], "beach is not first")
+
+        # FTS search for "receipt" should find NOTHING (zero keyword overlap)
+        out = c46.run("search", "receipt")
+        check("no matches" in out, "plain FTS receipt finds nothing")
+
+        # similar command
+        # find beach photo id
+        beach_id = None
+        invoice_id = None
+        con46 = db_open(work / "db-embed.db")
+        for r in con46.execute("SELECT p.id, p.text FROM photos p").fetchall():
+            if "beach" in (r[1] or ""):
+                beach_id = r[0]
+            if "invoice" in (r[1] or ""):
+                invoice_id = r[0]
+        con46.close()
+        if beach_id:
+            out = c46.run("similar", str(beach_id))
+            check("score" in out, "similar command shows scores")
+            lines_sim = [l for l in out.splitlines() if l.strip().startswith("[")]
+            check(f"[{beach_id}]" not in " ".join(lines_sim), "beach not first for similar beach")
+        if invoice_id:
+            out = c46.run("similar", str(invoice_id))
+            lines_sim = [l for l in out.splitlines() if l.strip().startswith("[")]
+            check(f"[{beach_id}]" in " ".join(lines_sim), "beach appears for similar invoice")
+
+        # embed again -> missing only
+        out = c46.run("embed")
+        check("0 photo(s)" in out, "embed reports 0 photos (all have embeddings)")
+
+        # --all re-embeds everyone
+        out = c46.run("embed", "--all")
+        check("embedded 3 photo(s)" in out, "embed --all re-embeds all 3")
+
+        # no embed_model: semantic search errors
+        cfg46n = work / "config-noemb46.toml"
+        cfg46n.write_text(
+            f'ollama_url = "http://127.0.0.1:{port46}"\n'
+            f'model = "{MODEL}"\n'
+            f'db_path = "{work}/db-noemb46.db"\n'
+            "face_detection = false\n"
+        )
+        c46n = CLI(cfg46n)
+        out = c46n.run("search", "--semantic", "x", expect=2)
+        check("set embed_model" in out, "semantic search without embed_model errors")
+
+        out = c46.run("similar", "9999", expect=2)
+        check("no photo" in out, "similar with bad id errors")
+    finally:
+        mock46.terminate()
+        mock46.wait()
+
+    print("\n[47] sidebar scales to many people and categories")
+    side47_dir = work / "side47"
+    side47_dir.mkdir()
+    cfg47 = work / "config-side47.toml"
+    cfg47.write_text(
+        f'ollama_url = "http://127.0.0.1:{port}"\n'
+        f'model = "{MODEL}"\n'
+        f'db_path = "{side47_dir}/catalog.db"\n'
+        "face_detection = false\n"
+    )
+    c47 = CLI(cfg47)
+    side47_src = side47_dir / "s"
+    side47_src.mkdir()
+    make_text_image(side47_src / "one.jpg", ["sidebar scale"])
+    make_text_image(side47_src / "two.jpg", ["sidebar scale 2"])
+    c47.run("scan", str(side47_src))
+    con47 = db_open(side47_dir / "catalog.db")
+    con47.row_factory = None
+    # ten people and a decade of years: the groups need the scalable chrome
+    for i in range(10):
+        con47.execute("INSERT INTO people (name) VALUES (?)", (f"Scale Person {i:02d}",))
+        con47.execute(
+            "INSERT INTO person_tags (photo_id, person_id) VALUES (1, ?)", (i + 1,)
+        )
+    con47.execute(
+        "UPDATE photos SET category = 'scalecat', "
+        "date_taken = '2023-01-01T00:00:00' WHERE id = 1"
+    )
+    con47.execute(
+        "UPDATE photos SET date_taken = '2013-01-01T00:00:00' WHERE id = 2"
+    )
+    con47.commit()
+    con47.close()
+    port47 = free_port()
+    serve47 = subprocess.Popen(
+        c47.cmd + ["serve", "--port", str(port47)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    base47 = f"http://127.0.0.1:{port47}"
+    try:
+        for _ in range(60):
+            try:
+                requests.get(base47 + "/", timeout=1)
+                break
+            except Exception:
+                time.sleep(0.1)
+        r = requests.get(base47 + "/", timeout=5)
+        check(
+            "<details class='fgroup' open>" in r.text,
+            "filter groups render as collapsible details",
+        )
+        check("class='ffilter'" in r.text, "many people get a sidebar filter box")
+        check("<script>" in r.text, "the filter script loads with the filter box")
+        check(
+            "filter people" in r.text, "people filter box carries its placeholder"
+        )
+        check(
+            "Scale Person 09" in r.text and "hidden (0)" in r.text,
+            "all links still render inside the group",
+        )
+        check(
+            "side-top" in r.text and "side-scroll" in r.text,
+            "global nav is pinned above the scrolling filters",
+        )
+        # only two categories: no filter box needed there
+        check(
+            "filter categories" not in r.text,
+            "small category lists stay filterless",
+        )
+    finally:
+        serve47.terminate()
+        serve47.wait()
 
     print()
     if FAILURES:

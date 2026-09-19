@@ -5,8 +5,15 @@ import io
 import json
 import re
 import time
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+_EMBED_SYNONYMS = {
+    "invoice": "bill", "receipt": "bill", "statement": "bill",
+    "utility": "bill", "grocery": "food", "recipe": "food",
+    "beach": "nature", "waves": "nature", "sunset": "nature",
+}
 
 
 def _sample_image_color(img_b64: str) -> tuple[int, int, int] | None:
@@ -88,6 +95,24 @@ def build_handler(model: str, mode_file: Path, slow_seconds: float, ps_file: Pat
                 self._json(404, {"error": "not found"})
 
         def do_POST(self):
+            if self.path == "/api/embed":
+                length = int(self.headers.get("Content-Length") or 0)
+                payload = json.loads(self.rfile.read(length) or b"{}")
+                inputs = payload.get("input") or []
+                embeddings = []
+                for text in inputs:
+                    vec = [0.0] * 8
+                    words = re.findall(r"[a-z]+", text.lower())
+                    for w in words:
+                        c = _EMBED_SYNONYMS.get(w, w)
+                        idx = zlib.crc32(c.encode()) % 8
+                        vec[idx] += 1.0
+                    norm = (sum(v * v for v in vec)) ** 0.5
+                    if norm > 0:
+                        vec = [v / norm for v in vec]
+                    embeddings.append(vec)
+                self._json(200, {"embeddings": embeddings})
+                return
             if self.path != "/api/chat":
                 self._json(404, {"error": "not found"})
                 return
