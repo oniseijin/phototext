@@ -77,18 +77,34 @@ _CSS = """
 * { box-sizing: border-box; }
 body { margin: 0; font: 15px/1.5 -apple-system, "Segoe UI", sans-serif;
        background: #14161a; color: #e6e6e6; }
-header { padding: 14px 20px; background: #1c2027; border-bottom: 1px solid #2a2f39;
-         display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
-header h1 { font-size: 16px; margin: 0; color: #8ab4f8; }
-header form { display: flex; gap: 6px; flex: 1; min-width: 260px; }
+.shell { display: flex; min-height: 100vh; }
+.side { width: 236px; flex-shrink: 0; background: #1c2027;
+        border-right: 1px solid #2a2f39; padding: 16px 12px;
+        display: flex; flex-direction: column; gap: 12px;
+        position: sticky; top: 0; height: 100vh; overflow-y: auto; }
+.side .brand { font-size: 17px; font-weight: 600; color: #8ab4f8; padding: 0 4px; }
+.side form.search { display: flex; gap: 6px; }
+.side form.search input[type=text] { flex: 1; min-width: 0; }
+.navgroup { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em;
+            color: #6b7380; padding: 0 6px; margin-top: 8px; }
+.navlist { display: flex; flex-direction: column; gap: 1px; }
+.navlist a { color: #c7cdd6; text-decoration: none; padding: 5px 8px;
+             border-radius: 6px; font-size: 13.5px; }
+.navlist a:hover { background: #242a33; }
+.navlist a.on { background: #2a5db0; color: white; }
+.sidefoot { margin-top: auto; font-size: 11.5px; color: #6b7380; padding: 0 6px; }
+.content { flex: 1; min-width: 0; padding: 14px 22px 40px; }
+@media (max-width: 720px) {
+  .shell { flex-direction: column; }
+  .side { width: auto; height: auto; position: static; }
+}
 input[type=text] { flex: 1; padding: 6px 10px; border-radius: 6px; border: 1px solid #2a2f39;
                    background: #14161a; color: #e6e6e6; }
 button { padding: 6px 14px; border-radius: 6px; border: 0; background: #2a5db0;
          color: white; cursor: pointer; }
-nav { padding: 10px 20px; display: flex; gap: 10px; flex-wrap: wrap; font-size: 13px; }
+nav { padding: 6px 0; display: flex; gap: 10px; flex-wrap: wrap; font-size: 13px; }
 nav a { color: #9aa4b2; text-decoration: none; padding: 3px 10px; border-radius: 12px; }
 nav a.on { background: #2a5db0; color: white; }
-main { padding: 0 20px 40px; }
 .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
          gap: 14px; margin-top: 12px; }
 .card { background: #1c2027; border-radius: 8px; overflow: hidden; text-decoration: none;
@@ -156,54 +172,65 @@ a.back { color: #8ab4f8; text-decoration: none; }
 """
 
 
-def _page(title: str, body: str) -> bytes:
+def _page(title: str, body: str, sidebar: str = "") -> bytes:
     doc = (
         "<!doctype html><html><head><meta charset='utf-8'>"
         f"<title>{esc(title)}</title><style>{_CSS}</style></head>"
-        f"<body>{body}</body></html>"
+        f"<body><div class='shell'><aside class='side'>{sidebar}</aside>"
+        f"<div class='content'>{body}</div></div></body></html>"
     )
     return doc.encode("utf-8")
 
 
-def _header(conn: sqlite3.Connection, q: str = "") -> str:
+def _sidebar(
+    conn: sqlite3.Connection,
+    q: str = "",
+    status: str = "",
+    active: str = "",
+    url_for=None,
+    extra: str = "",
+) -> str:
+    """The left rail: brand, search, the global nav (status filters,
+    Discover, Utilities), then any page-specific filter sections."""
     counts = db.status_counts(conn)
+    link = url_for or (lambda key: f"/?status={key}")
+
+    def item(href: str, label: str, on: bool = False) -> str:
+        cls = " class='on'" if on else ""
+        return f"<a{cls} href='{href}'>{label}</a>"
+
+    library = "".join(
+        item(link(key), label, on=(status == key and not active))
+        for key, label in (
+            ("all", "All"),
+            ("done", "Done"),
+            ("queued", "Queued"),
+            ("error", "Errors"),
+            ("deferred", "Deferred"),
+        )
+    )
+    discover = (
+        item("/people", "People", active == "people")
+        + item("/memes", "Memes", active == "memes")
+        + item("/duplicates", "Duplicates", active == "duplicates")
+    )
+    utilities = item("/trash", "Trash", active == "trash")
     return (
-        "<header><h1>phototext</h1>"
-        "<form action='/' method='get'>"
+        "<div class='brand'>phototext</div>"
+        "<form class='search' action='/' method='get'>"
         "<input type='text' name='q' placeholder='Search recovered text and context...'"
         f" value='{esc(q)}'><button>Search</button></form>"
-        f"<span class='muted'>{counts.get('total', 0)} photos "
+        "<div class='navgroup'>Library</div>"
+        f"<div class='navlist'>{library}</div>"
+        "<div class='navgroup'>Discover</div>"
+        f"<div class='navlist'>{discover}</div>"
+        f"{extra}"
+        "<div class='navgroup'>Utilities</div>"
+        f"<div class='navlist'>{utilities}</div>"
+        f"<div class='sidefoot'>{counts.get('total', 0)} photos "
         f"(&#10003; {counts.get('done', 0)} &#8987; {counts.get('queued', 0)} "
-        f"&#10007; {counts.get('error', 0)})</span></header>"
+        f"&#10007; {counts.get('error', 0)})</div>"
     )
-
-
-def _status_tabs(
-    status: str,
-    memes_active: bool = False,
-    people_active: bool = False,
-    duplicates_active: bool = False,
-    url_for: "callable[[str], str] | None" = None,
-) -> str:
-    parts = []
-    link = url_for or (lambda key: f"/?status={key}")
-    for key, label in (
-        ("all", "All"),
-        ("done", "Done"),
-        ("queued", "Queued"),
-        ("error", "Errors"),
-        ("deferred", "Deferred"),
-    ):
-        cls = " class='on'" if status == key else ""
-        parts.append(f"<a{cls} href='{link(key)}'>{label}</a>")
-    memes_cls = " class='on'" if memes_active else ""
-    parts.append(f"<a{memes_cls} href='/memes'>Memes</a>")
-    dup_cls = " class='on'" if duplicates_active else ""
-    parts.append(f"<a{dup_cls} href='/duplicates'>Duplicates</a>")
-    people_cls = " class='on'" if people_active else ""
-    parts.append(f"<a{people_cls} href='/people'>People</a>")
-    parts.append("<a href='/trash'>Trash</a>")
-    return f"<nav>{''.join(parts)}</nav>"
 
 
 def _action_form(
@@ -336,12 +363,11 @@ def render_list(conn: sqlite3.Connection, params: dict, ctx: dict | None = None)
             )
         except sqlite3.OperationalError:
             body = (
-                _header(conn)
-                + f"<main><p class='note'>Search is unavailable: the catalog schema is "
+                f"<p class='note'>Search is unavailable: the catalog schema is "
                 "older than this build. Run <code>phototext migrate</code> (or any CLI "
-                "command) once, then reload.</p></main>"
+                "command) once, then reload.</p>"
             )
-            return _page("phototext", body)
+            return _page("phototext", body, _sidebar(conn, q=q))
         note = f"{total} match(es) for '{q}'"
         if year:
             note += f" taken in {year}"
@@ -361,7 +387,7 @@ def render_list(conn: sqlite3.Connection, params: dict, ctx: dict | None = None)
         if date_to:
             base_parts["date-to"] = date_to[:10]
         base = "/?" + urlencode(base_parts) + "&"
-        year_nav = ""
+        year_section = ""
         years = db.date_taken_histogram(conn)
         if years:
             q_enc = urlencode({"q": q})
@@ -373,8 +399,12 @@ def render_list(conn: sqlite3.Connection, params: dict, ctx: dict | None = None)
                 )
             if year:
                 chips.append(f"<a href='/?{q_enc}'>all years</a>")
-            year_nav = f"<nav>{''.join(chips)}</nav>"
-        body = _header(conn, q) + year_nav + f"<main><p class='note'>{esc(note)}</p>"
+            year_section = (
+                "<div class='navgroup'>Years</div>"
+                f"<div class='navlist'>{''.join(chips)}</div>"
+            )
+        sidebar = _sidebar(conn, q=q, extra=year_section)
+        body = f"<p class='note'>{esc(note)}</p>"
     else:
         status = params.get("status", ["all"])[0] or "all"
         if status not in ("all", "done", "queued", "error", "processing"):
@@ -419,7 +449,6 @@ def render_list(conn: sqlite3.Connection, params: dict, ctx: dict | None = None)
             return f"/?{query}&" if query else "/?"
 
         base = qs()
-        body = _header(conn) + _status_tabs(status, url_for=lambda key: qs({"status": key}))
         hidden_n = conn.execute(
             "SELECT COUNT(*) AS n FROM photos WHERE hidden = 1 AND deleted_at IS NULL"
         ).fetchone()["n"]
@@ -429,7 +458,6 @@ def render_list(conn: sqlite3.Connection, params: dict, ctx: dict | None = None)
             hidden_chip = f"<a href='{qs({'hidden': ''})}'>hide hidden</a>"
         else:
             hidden_chip = f"<a href='{qs({'hidden': 'only'})}'>hidden ({hidden_n})</a>"
-        body += f"<nav>{hidden_chip}</nav>"
         token = (ctx or {}).get("token") if (ctx or {}).get("writable") else None
         if token:
             next_url = f"{base}page={page}"
@@ -444,6 +472,7 @@ def render_list(conn: sqlite3.Connection, params: dict, ctx: dict | None = None)
             def _toggle(r) -> str:
                 return ""
         cards = [_card(r, _snippet(r["text"] or ""), _toggle(r)) for r in rows]
+        sections = [f"<div class='navgroup'>Views</div><div class='navlist'>{hidden_chip}</div>"]
         people_rows = db.people_list(
             conn, float((ctx or {}).get("min_confidence") or 0.6)
         )
@@ -455,7 +484,9 @@ def render_list(conn: sqlite3.Connection, params: dict, ctx: dict | None = None)
             ]
             if person:
                 chips.append(f"<a href='{qs({'person': ''})}'>all people</a>")
-            body += f"<nav>{''.join(chips)}</nav>"
+            sections.append(
+                f"<div class='navgroup'>People</div><div class='navlist'>{''.join(chips)}</div>"
+            )
         cats = [
             r["category"]
             for r in conn.execute(
@@ -470,12 +501,16 @@ def render_list(conn: sqlite3.Connection, params: dict, ctx: dict | None = None)
                 for cls in (" class='on'" if c == category else "",)
             ]
             chips.append(f"<a href='{qs({'category': ''})}'>all categories</a>")
-            body += f"<nav>{''.join(chips)}</nav>"
+            sections.append(
+                f"<div class='navgroup'>Categories</div><div class='navlist'>{''.join(chips)}</div>"
+            )
         text_chips = []
         for value, label in (("all", "any text"), ("yes", "with text"), ("no", "no text")):
             cls = " class='on'" if text_filter == value else ""
             text_chips.append(f"<a{cls} href='{qs({'text': value})}'>{label}</a>")
-        body += f"<nav>{''.join(text_chips)}</nav>"
+        sections.append(
+            f"<div class='navgroup'>Text</div><div class='navlist'>{''.join(text_chips)}</div>"
+        )
         years = db.date_taken_histogram(conn)
         if years:
             chips = []
@@ -486,8 +521,14 @@ def render_list(conn: sqlite3.Connection, params: dict, ctx: dict | None = None)
                 )
             if year:
                 chips.append(f"<a href='{qs({'year': ''})}'>all years</a>")
-            body += f"<nav>{''.join(chips)}</nav>"
-        body += f"<main><p class='note'>{total} photo(s) with status '{status}'"
+            sections.append(
+                f"<div class='navgroup'>Years</div><div class='navlist'>{''.join(chips)}</div>"
+            )
+        sidebar = _sidebar(
+            conn, status=status, url_for=lambda key: qs({"status": key}),
+            extra="".join(sections),
+        )
+        body = f"<p class='note'>{total} photo(s) with status '{status}'"
         if category:
             body += f" and category '{esc(category)}'"
         if person:
@@ -504,8 +545,7 @@ def render_list(conn: sqlite3.Connection, params: dict, ctx: dict | None = None)
         body += "</p>"
     body += "<div class='cards'>" + "".join(cards) + "</div>"
     body += _pager(base, page, total)
-    body += "</main>"
-    return _page("phototext", body)
+    return _page("phototext", body, sidebar)
 
 
 def render_detail(conn: sqlite3.Connection, photo_id: int, ctx: dict | None = None) -> bytes | None:
@@ -620,7 +660,7 @@ def render_detail(conn: sqlite3.Connection, photo_id: int, ctx: dict | None = No
         people_section = (
             "<p class='muted'>people</p><div class='people'>" + "".join(chips) + "</div>"
         )
-    body = _header(conn) + "<main><p><a class='back' href='/'>&#8592; back to photos</a></p>"
+    body = "<p><a class='back' href='/'>&#8592; back to photos</a></p>"
     if actions:
         body += f"<div class='actions'>{actions}</div>"
     body += f"<div class='detail'>"
@@ -669,8 +709,8 @@ def render_detail(conn: sqlite3.Connection, photo_id: int, ctx: dict | None = No
     if raw:
         body += "<details><summary>raw model response</summary>" \
                 f"<pre>{esc(raw)}</pre></details>"
-    body += "</div></div></main>"
-    return _page(f"photo {photo_id}", body)
+    body += "</div></div>"
+    return _page(f"photo {photo_id}", body, _sidebar(conn))
 
 
 def render_memes(conn: sqlite3.Connection, ctx: dict | None = None) -> bytes:
@@ -678,7 +718,8 @@ def render_memes(conn: sqlite3.Connection, ctx: dict | None = None) -> bytes:
         clusters = find_clusters(conn)
     except sqlite3.OperationalError:
         clusters = []
-    body = _header(conn) + _status_tabs("", memes_active=True)
+    sidebar = _sidebar(conn, active="memes")
+    body = ""
     if not clusters:
         note = "no meme-like groups found"
         try:
@@ -692,10 +733,10 @@ def render_memes(conn: sqlite3.Connection, ctx: dict | None = None) -> bytes:
                 f" — {unhashed} photo(s) have no perceptual hash yet; "
                 "run `phototext memes` once to compute them"
             )
-        body += f"<main><p class='note'>{esc(note)}</p></main>"
-        return _page("memes - phototext", body)
+        body += f"<p class='note'>{esc(note)}</p>"
+        return _page("memes - phototext", body, sidebar)
     body += (
-        "<main><p class='note'>" + esc(str(len(clusters))) + " meme-like group(s) "
+        "<p class='note'>" + esc(str(len(clusters))) + " meme-like group(s) "
         "— near-identical photos, often with overlaid text</p>"
     )
     for index, group in enumerate(clusters, 1):
@@ -708,8 +749,7 @@ def render_memes(conn: sqlite3.Connection, ctx: dict | None = None) -> bytes:
             f"<p class='muted'>group {index}: {len(group)} photo(s) — {esc(snippet)}</p>"
             f"<div class='cards'>{cards}</div>"
         )
-    body += "</main>"
-    return _page("memes - phototext", body)
+    return _page("memes - phototext", body, sidebar)
 
 
 def render_duplicates(conn: sqlite3.Connection, ctx: dict | None = None) -> bytes:
@@ -721,7 +761,8 @@ def render_duplicates(conn: sqlite3.Connection, ctx: dict | None = None) -> byte
         )
     except sqlite3.OperationalError:
         clusters = []
-    body = _header(conn) + _status_tabs("", duplicates_active=True)
+    sidebar = _sidebar(conn, active="duplicates")
+    body = ""
     if not clusters:
         note = "no duplicate groups found"
         try:
@@ -735,10 +776,10 @@ def render_duplicates(conn: sqlite3.Connection, ctx: dict | None = None) -> byte
                 f" — {unhashed} photo(s) have no perceptual hash yet; "
                 "run `phototext duplicates` once to compute them"
             )
-        body += f"<main><p class='note'>{esc(note)}</p></main>"
-        return _page("duplicates - phototext", body)
+        body += f"<p class='note'>{esc(note)}</p>"
+        return _page("duplicates - phototext", body, sidebar)
     body += (
-        "<main><p class='note'>" + esc(str(len(clusters))) + " duplicate group(s) "
+        "<p class='note'>" + esc(str(len(clusters))) + " duplicate group(s) "
         "— resized/re-encoded copies of the same image (perceptual hash within "
         f"{DUPLICATE_HAMMING_DEFAULT} bits). iCloud preview proxies are excluded. "
         "The largest file is highlighted; cleaning up is yours to do — files are "
@@ -759,18 +800,18 @@ def render_duplicates(conn: sqlite3.Connection, ctx: dict | None = None) -> byte
             f"<p class='muted'>group {index}: {len(group)} photo(s)</p>"
             f"<div class='cards'>{cards}</div>"
         )
-    body += "</main>"
-    return _page("duplicates - phototext", body)
+    return _page("duplicates - phototext", body, sidebar)
 
 
 def render_trash(conn: sqlite3.Connection, ctx: dict | None = None) -> bytes:
     rows = db.trash_list(conn)
-    body = _header(conn) + _status_tabs("trash")
+    sidebar = _sidebar(conn, active="trash")
+    body = ""
     if not rows:
-        body += "<main><p class='note'>trash is empty</p></main>"
-        return _page("trash - phototext", body)
+        body += "<p class='note'>trash is empty</p>"
+        return _page("trash - phototext", body, sidebar)
     writable = bool(ctx and ctx.get("writable") and ctx.get("token"))
-    body += f"<main><p class='note'>{len(rows)} photo(s) in the trash. "
+    body += f"<p class='note'>{len(rows)} photo(s) in the trash. "
     if not writable:
         body += "Start the server with --writable to restore or purge from here."
     body += "</p>"
@@ -794,8 +835,7 @@ def render_trash(conn: sqlite3.Connection, ctx: dict | None = None) -> bytes:
             f"<span class='muted'>({esc(row['deleted_at'] or '')})</span></div>"
             f"<div class='snippet'>{snippet}</div>{buttons}</div></div>"
         )
-    body += "</main>"
-    return _page("trash - phototext", body)
+    return _page("trash - phototext", body, sidebar)
 
 
 def _first_existing(conn: sqlite3.Connection, photo_id: int) -> Path | None:
@@ -977,16 +1017,17 @@ _PICKER_JS = """
 def render_people(conn: sqlite3.Connection, ctx: dict | None = None) -> bytes:
     threshold = float((ctx or {}).get("min_confidence") or 0.6)
     people = db.people_list(conn, threshold)
-    body = _header(conn) + _status_tabs("", people_active=True)
+    sidebar = _sidebar(conn, active="people")
+    body = ""
     if not people:
         body += (
-            "<main><p class='note'>no people yet. Open a photo, drag a box around "
+            "<p class='note'>no people yet. Open a photo, drag a box around "
             "a face, and give the person a name (needs a writable server: "
             "<code>phototext serve --writable</code>), or use "
-            "<code>phototext people name <photo-id> <name> --box x,y,w,h</code>.</p></main>"
+            "<code>phototext people name <photo-id> <name> --box x,y,w,h</code>.</p>"
         )
-        return _page("people - phototext", body)
-    body += f"<main><p class='note'>{len(people)} person(s)</p>"
+        return _page("people - phototext", body, sidebar)
+    body += f"<p class='note'>{len(people)} person(s)</p>"
     for person in people:
         seeds = db.person_seed_photo_ids(conn, person["id"], 1)
         face = f"/face/{person['id']}/{seeds[0]}" if seeds else ""
@@ -1010,8 +1051,7 @@ def render_people(conn: sqlite3.Connection, ctx: dict | None = None) -> bytes:
             f"<div class='muted'>{_snippet(person['description'] or '', 160) or 'no recognition profile yet'}</div>"
             f"</div></a>"
         )
-    body += "</main>"
-    return _page("people - phototext", body)
+    return _page("people - phototext", body, sidebar)
 
 
 def render_person(
@@ -1042,9 +1082,9 @@ def render_person(
     ).fetchone()["n"]
     review = [r for r in rows if r["origin"] == "model" and r["confidence"] < threshold]
     settled = [r for r in rows if r not in review]
-    body = _header(conn) + _status_tabs("", people_active=True)
+    sidebar = _sidebar(conn, active="people")
+    body = "<p><a class='back' href='/people'>&#8592; all people</a></p>"
     writable = bool(ctx and ctx.get("writable") and ctx.get("token"))
-    body += "<main><p><a class='back' href='/people'>&#8592; all people</a></p>"
     body += f"<h2 style='margin:6px 0'>{esc(person['name'])}</h2>"
     if hidden_only:
         chip = f"<a class='on' href='/person/{person_id}'>all photos</a>"
@@ -1096,8 +1136,7 @@ def render_person(
     if settled:
         body += "<p class='muted'>tagged photos</p>"
         body += _person_grid(settled, ctx, threshold, person_id, with_actions=True)
-    body += "</main>"
-    return _page(f"{person['name']} - phototext", body)
+    return _page(f"{person['name']} - phototext", body, sidebar)
 
 
 class _Server(ThreadingHTTPServer):

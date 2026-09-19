@@ -338,10 +338,17 @@ def get_location(conn: sqlite3.Connection, source_id: int, path: str) -> sqlite3
     ).fetchone()
 
 
-def claim_next(conn: sqlite3.Connection) -> sqlite3.Row | None:
+def claim_next(
+    conn: sqlite3.Connection, recent_first: bool = False
+) -> sqlite3.Row | None:
+    order = (
+        "ORDER BY COALESCE(date_taken, first_seen_at) DESC, id DESC"
+        if recent_first
+        else "ORDER BY id"
+    )
     row = conn.execute(
         "SELECT * FROM photos WHERE status = 'queued' AND deleted_at IS NULL "
-        "ORDER BY id LIMIT 1"
+        f"{order} LIMIT 1"
     ).fetchone()
     if row is None:
         return None
@@ -537,14 +544,16 @@ def ensure_deferred_photo(
     path: str | None,
     derivative: bool,
     hidden: bool = False,
+    queue: bool = True,
 ) -> int:
     """Register an iCloud-only photo so the inventory is complete.
 
     Identity is 'deferred:<uuid>' until real content exists locally. Photos
     with a preview derivative are queued for best-effort extraction
-    (flagged `derivative`); the rest wait as status='deferred'. A library
-    hidden flag imports into phototext's hidden (origin 'library').
-    Returns the photo id.
+    (flagged `derivative`) — unless `queue` is false, which keeps them
+    deferred until the original downloads; the rest always wait as
+    status='deferred'. A library hidden flag imports into phototext's
+    hidden (origin 'library'). Returns the photo id.
     """
     key = deferred_key(uuid)
     row = conn.execute("SELECT id FROM photos WHERE sha256 = ?", (key,)).fetchone()
@@ -554,7 +563,7 @@ def ensure_deferred_photo(
             "hidden_origin) VALUES (?, 0, ?, ?, ?, ?)",
             (
                 key,
-                "queued" if derivative else "deferred",
+                "queued" if derivative and queue else "deferred",
                 int(derivative),
                 int(hidden),
                 "library" if hidden else None,
@@ -729,8 +738,15 @@ def select_photo_ids(
     gated: bool = False,
     derivative: bool = False,
     all_photos: bool = False,
+    done_with: str | None = None,
+    done_before: str | None = None,
+    category: str | None = None,
 ) -> list[int]:
-    """Photo-id selections for `reprocess`. Exactly one selector should be set."""
+    """Photo-id selections for `reprocess`. Exactly one selector should be set.
+
+    The done_with/done_before/category selectors re-run photos extracted by
+    an older model or before a date or in a category — "All/Missing"
+    granularity for model swaps without paying for the whole library."""
     visible = "deleted_at IS NULL AND hidden = 0"
     if errors:
         sql, params = (
@@ -760,6 +776,25 @@ def select_photo_ids(
             f"SELECT id FROM photos WHERE status = 'done' AND derivative = 1 "
             f"AND {visible} ORDER BY id",
             [],
+        )
+    elif done_with is not None:
+        sql, params = (
+            f"SELECT id FROM photos WHERE status = 'done' AND model = ? "
+            f"AND {visible} ORDER BY id",
+            [done_with],
+        )
+    elif done_before is not None:
+        sql, params = (
+            f"SELECT id FROM photos WHERE status = 'done' "
+            f"AND COALESCE(finished_at, '') != '' AND finished_at < ? "
+            f"AND {visible} ORDER BY id",
+            [done_before],
+        )
+    elif category is not None:
+        sql, params = (
+            f"SELECT id FROM photos WHERE status = 'done' AND category = ? "
+            f"AND {visible} ORDER BY id",
+            [category],
         )
     elif all_photos:
         sql, params = (

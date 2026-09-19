@@ -2202,6 +2202,143 @@ def main() -> int:
         mock43.terminate()
         mock43.wait()
 
+    print("\n[44] recent-first claims, reprocess selectors, derivative deferral")
+    port44 = free_port()
+    mock44 = start_mock(port44, mode_file)
+    try:
+
+        def fresh_cli44(name: str, extra: str = "") -> CLI:
+            cfgp = work / f"config-{name}.toml"
+            cfgp.write_text(
+                f'ollama_url = "http://127.0.0.1:{port44}"\n'
+                f'model = "{MODEL}"\n'
+                f'db_path = "{work}/db-{name}.db"\n' + extra
+            )
+            return CLI(cfgp)
+
+        c44 = fresh_cli44("recentfirst", "recent_first = true\n")
+        rec_src = work / "recentfolder"
+        rec_src.mkdir()
+
+        def make_dated44(path: Path, taken: str, label: str) -> None:
+            exif = Image.Exif()
+            exif.get_ifd(0x8769)[36867] = taken
+            exif[306] = taken
+            im = Image.new("RGB", (640, 480), "steelblue")
+            d = ImageDraw.Draw(im)
+            d.text((40, 40), label, fill="white", font=font())
+            im.save(path, exif=exif)
+
+        # aaa is scanned first (lowest id); zzz is the newest — the two claim
+        # orders must therefore pick different photos.
+        make_dated44(rec_src / "aaa.jpg", "2011:03:15 08:00:00", "OLD ERA")
+        make_dated44(rec_src / "zzz.jpg", "2023:05:01 10:00:00", "NEW ERA")
+        c44.run("scan", str(rec_src))
+        c44.run("run", "--skip-preflight", "--limit", "1")
+        con44 = db_open(work / "db-recentfirst.db")
+        con44.row_factory = None
+        done_path44 = con44.execute(
+            "SELECT l.path FROM photos p JOIN locations l ON l.photo_id = p.id "
+            "WHERE p.status = 'done'"
+        ).fetchone()[0]
+        check("zzz.jpg" in done_path44, "recent_first claims the newest photo first")
+        c44b = fresh_cli44("fifo44")
+        c44b.run("scan", str(rec_src))
+        c44b.run("run", "--skip-preflight", "--limit", "1")
+        con44b = db_open(work / "db-fifo44.db")
+        con44b.row_factory = None
+        done_path44b = con44b.execute(
+            "SELECT l.path FROM photos p JOIN locations l ON l.photo_id = p.id "
+            "WHERE p.status = 'done'"
+        ).fetchone()[0]
+        check("aaa.jpg" in done_path44b, "fifo claims the lowest id first")
+        con44.close()
+        con44b.close()
+
+        # reprocess granularity: model / date / category selectors
+        c44.run("run", "--skip-preflight", "--limit", "1")  # finish the backlog
+        out = c44.run("reprocess", "--done-with", MODEL)
+        check("requeued 2 photo(s)" in out, "reprocess --done-with selects by model")
+        c44.run("run", "--skip-preflight")
+        out = c44.run("reprocess", "--done-before", "2030-01-01")
+        check("requeued 2 photo(s)" in out, "reprocess --done-before selects by date")
+        c44.run("run", "--skip-preflight")
+        out = c44.run("reprocess", "--category", "document")
+        check("requeued 2 photo(s)" in out, "reprocess --category selects by category")
+        out = c44.run("reprocess", "--done-with", "nope:never")
+        check(
+            "no matching photos to requeue" in out,
+            "reprocess --done-with misses cleanly",
+        )
+
+        # process_derivatives = false keeps preview extractions deferred
+        deriv44_dir = work / "deriv44"
+        deriv44_dir.mkdir()
+        deriv44_lib = deriv44_dir / "Synced.photoslibrary"
+        (deriv44_lib / "originals" / "A").mkdir(parents=True)
+        seam44 = deriv44_dir / "assets.json"
+        seam44.write_text(json.dumps([["D-1", None, False]]))
+        cfg44d = work / "config-deriv44.toml"
+        cfg44d.write_text(
+            f'ollama_url = "http://127.0.0.1:{port44}"\n'
+            f'model = "{MODEL}"\n'
+            f'db_path = "{deriv44_dir}/catalog.db"\n'
+            "process_derivatives = false\n"
+        )
+        c44d = CLI(cfg44d)
+        os.environ["PHOTOTEXT_TEST_ASSETS"] = str(seam44)
+        try:
+            # a preview derivative exists, but the config defers it
+            (deriv44_lib / "resources" / "derivatives" / "B").mkdir(parents=True)
+            make_text_image(
+                deriv44_lib / "resources/derivatives/B/D-1_2_4096.jpeg",
+                ["DERIV PREVIEW"],
+            )
+            out = c44d.run("scan", str(deriv44_lib))
+            check("previews 1" in out, "scan still reports the preview derivative")
+            con44d = db_open(deriv44_dir / "catalog.db")
+            con44d.row_factory = None
+            check(
+                con44d.execute(
+                    "SELECT status FROM photos WHERE sha256 = 'deferred:D-1'"
+                ).fetchone()[0]
+                == "deferred",
+                "process_derivatives=false keeps previews deferred",
+            )
+            con44d.close()
+        finally:
+            os.environ.pop("PHOTOTEXT_TEST_ASSETS", None)
+
+        # worker exit codes propagate: a dead backend must fail the run
+        dead_port = free_port()
+        cfg44e = work / "config-dead44.toml"
+        cfg44e.write_text(
+            f'ollama_url = "http://127.0.0.1:{dead_port}"\n'
+            f'model = "{MODEL}"\n'
+            f'db_path = "{work}/db-dead44.db"\n'
+            "transport_retries = 1\ntransport_backoff_s = 1\n"
+        )
+        c44e = CLI(cfg44e)
+        dead_src = work / "deadfolder44"
+        dead_src.mkdir()
+        make_text_image(dead_src / "one.jpg", ["WILL NOT RUN"])
+        c44e.run("scan", str(dead_src))
+        out = c44e.run("run", "--skip-preflight", "--workers", "2", expect=1)
+        check("aborted" in out, "unreachable backend aborts the workers")
+        con44e = db_open(work / "db-dead44.db")
+        con44e.row_factory = None
+        check(
+            con44e.execute(
+                "SELECT COUNT(*) FROM photos WHERE status = 'queued'"
+            ).fetchone()[0]
+            == 1,
+            "aborted workers leave the photo queued",
+        )
+        con44e.close()
+    finally:
+        mock44.terminate()
+        mock44.wait()
+
     print()
     if FAILURES:
         print(f"{len(FAILURES)} FAILURE(S):")

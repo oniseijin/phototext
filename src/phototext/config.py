@@ -77,6 +77,17 @@ idle_detection = true
     # photos with faces are matched on close-up face crops.
     face_detection = true
 
+    # Claim order for the extraction queue. false = oldest first (classic
+    # FIFO); true = newest photos first (by capture date, falling back to
+    # first-seen), so recent photos surface while a long backlog runs.
+    recent_first = false
+
+    # Best-effort extraction from iCloud preview derivatives: when false,
+    # cloud-only photos with a local preview wait as 'deferred' until the
+    # original downloads, instead of spending a full model call on the
+    # low-resolution preview.
+    process_derivatives = true
+
     # SQLite catalog location
     db_path = "~/.phototext/catalog.db"
 """
@@ -104,6 +115,8 @@ class Config:
     person_model: str = ""
     person_min_confidence: float = 0.6
     face_detection: bool = True
+    recent_first: bool = False
+    process_derivatives: bool = True
     max_image_pixels: int = 357_913_941
     db_path: Path = DEFAULT_DB_PATH
 

@@ -297,7 +297,12 @@ def register_source(conn, path: Path) -> SourceRef:
 
 
 def scan_source(
-    conn, uri: str, source_id: int, slice_spec: Slice | None = None, quiet: bool = False
+    conn,
+    uri: str,
+    source_id: int,
+    slice_spec: Slice | None = None,
+    quiet: bool = False,
+    process_derivatives: bool = True,
 ) -> ScanStats:
     root, kind = resolve_source(Path(uri))
     stats = ScanStats()
@@ -310,7 +315,8 @@ def scan_source(
         checker = _slice_checker(uri, kind, slice_spec)
     if kind == "library" and Path(uri).name.lower().endswith(".photoslibrary"):
         return _scan_photos_library(
-            conn, Path(uri), source_id, stats, checker, slice_spec, quiet
+            conn, Path(uri), source_id, stats, checker, slice_spec, quiet,
+            process_derivatives,
         )
     queued_new = 0
     for image_path in _iter_image_files(root, walk_errors):
@@ -449,7 +455,8 @@ def _import_iphoto_hidden(
 
 
 def _scan_photos_library(
-    conn, library: Path, source_id: int, stats: "ScanStats", checker, slice_spec, quiet: bool
+    conn, library: Path, source_id: int, stats: "ScanStats", checker, slice_spec,
+    quiet: bool, process_derivatives: bool = True,
 ) -> "ScanStats":
     """Scan a Photos library via its database (osxphotos), not the filesystem.
 
@@ -548,6 +555,7 @@ def _scan_photos_library(
                         str(derivative_path) if derivative_path else None,
                         bool(derivative_path),
                         library_hidden,
+                        queue=process_derivatives,
                     )
                     if derivative_path:
                         stats.previews += 1
@@ -557,13 +565,15 @@ def _scan_photos_library(
                     photo_id = existing["id"]
                     if derivative_path is not None and not existing["derivative"]:
                         db.ensure_deferred_photo(
-                            conn, source_id, uuid, str(derivative_path), True
+                            conn, source_id, uuid, str(derivative_path), True,
+                            queue=process_derivatives,
                         )
-                        conn.execute(
-                            "UPDATE photos SET status = 'queued' WHERE id = ? AND "
-                            "status = 'deferred'",
-                            (photo_id,),
-                        )
+                        if process_derivatives:
+                            conn.execute(
+                                "UPDATE photos SET status = 'queued' WHERE id = ? AND "
+                                "status = 'deferred'",
+                                (photo_id,),
+                            )
                         stats.previews += 1
             pending += 1
         if photo_id is not None:

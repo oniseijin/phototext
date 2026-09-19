@@ -63,6 +63,64 @@ def ensure_hashes(conn: sqlite3.Connection) -> int:
     return computed
 
 
+def _hamming_pairs(values: list[int], max_distance: int):
+    """Yield (i, j) index pairs whose hamming distance <= max_distance.
+
+    Exact like a naive O(n^2) scan, but via a BK-tree so large catalogs
+    cluster in seconds instead of minutes. Duplicate values share one node
+    (they are distance 0 from each other)."""
+    if len(values) < 2:
+        return
+    tree: list[tuple[int, dict[int, int]]] = []
+    node_rows: list[list[int]] = []
+    by_value: dict[int, int] = {}
+    for i, v in enumerate(values):
+        node = by_value.get(v)
+        if node is not None:
+            node_rows[node].append(i)
+            continue
+        if not tree:
+            tree.append((v, {}))
+            node_rows.append([i])
+            by_value[v] = 0
+            continue
+        node = 0
+        while True:
+            value, children = tree[node]
+            d = (value ^ v).bit_count()
+            child = children.get(d)
+            if child is None:
+                tree.append((v, {}))
+                node_rows.append([i])
+                children[d] = len(tree) - 1
+                by_value[v] = len(tree) - 1
+                break
+            node = child
+    for a in range(len(tree)):
+        value_a, _ = tree[a]
+        stack = [0]
+        while stack:
+            cur = stack.pop()
+            value_c, children_c = tree[cur]
+            d = (value_a ^ value_c).bit_count()
+            if d <= max_distance:
+                if a == cur:
+                    # Duplicates share this node: pair them with each other.
+                    rows_a = node_rows[a]
+                    for x in range(len(rows_a)):
+                        for y in range(x + 1, len(rows_a)):
+                            yield rows_a[x], rows_a[y]
+                else:
+                    for i in node_rows[a]:
+                        for j in node_rows[cur]:
+                            yield i, j
+            # Triangle inequality: only children at edge distance k with
+            # |k - d| <= max_distance can hold a match for value_a.
+            for k, child in children_c.items():
+                if d - max_distance <= k <= d + max_distance:
+                    stack.append(child)
+
+
 def find_clusters(
     conn: sqlite3.Connection,
     max_distance: int = HAMMING_DEFAULT,
@@ -99,11 +157,8 @@ def find_clusters(
         if ri != rj:
             parent[rj] = ri
 
-    for i in range(len(rows)):
-        phash_i = rows[i]["phash"]
-        for j in range(i + 1, len(rows)):
-            if (phash_i ^ rows[j]["phash"]).bit_count() <= max_distance:
-                union(i, j)
+    for i, j in _hamming_pairs([r["phash"] for r in rows], max_distance):
+        union(i, j)
     groups: dict[int, list[sqlite3.Row]] = defaultdict(list)
     for i in range(len(rows)):
         groups[find(i)].append(rows[i])

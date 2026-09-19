@@ -6,6 +6,42 @@ semantic versioning.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-19
+
+### Changed
+
+- The web UI is laid out like iCloud Photos: a left sidebar carries the
+  search field, the Library / Discover / Utilities navigation, and every
+  filter (hidden, people, categories, text, years) instead of stacked
+  chip rows across the top. All features, URLs, and actions are
+  unchanged — same routes, same writable gate, same composing filters,
+  now with room to grow. Narrow windows collapse the sidebar on top.
+
+### Added
+
+- `recent_first` config: claim the newest photos first (capture date,
+  falling back to first-seen) while a long backlog runs, so yesterday's
+  photos surface during nightly runs instead of 2013's. Default stays
+  FIFO (oldest first).
+- `process_derivatives` config: when false, iCloud-only photos with a
+  local preview wait as `deferred` until the real original downloads,
+  instead of spending a full model call on a low-resolution preview.
+- `reprocess --done-with MODEL`, `--done-before DATE`, and `--category
+  NAME` — re-run exactly the photos extracted by an older model, before
+  a date, or in a category, instead of `--all`.
+
+### Fixed
+
+- Meme/duplicate clustering is exact but no longer quadratic: a BK-tree
+  replaces the O(n^2) scan, keeping the web Memes/Duplicates tabs usable
+  at 15k+ photos (minutes → seconds). Verified against the naive scan
+  on randomized data.
+- The two-tier gate now downscales to `prefilter_max_edge` (512px,
+  previously defined but never used) before the prefilter model call.
+- `run --workers N` propagates worker exit codes: a night where every
+  worker aborted (dead backend) now exits non-zero instead of reporting
+  success to cron.
+
 ## [0.4.1] - 2026-09-19
 
 ### Fixed

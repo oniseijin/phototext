@@ -14,7 +14,7 @@ from pathlib import Path
 
 from . import db, scanner
 from .config import Config, with_model
-from .imaging import ImageReadError, prepare_image, prepare_tiles
+from .imaging import ImageReadError, downscale_jpeg_bytes, prepare_image, prepare_tiles
 from .ollama_client import (
     ModelOutputError,
     OllamaClient,
@@ -112,7 +112,8 @@ def run_pipeline(
         for src in sources:
             print(f"Scanning: {src['uri']}")
             try:
-                scanner.scan_source(conn, src["uri"], src["id"], slice_spec)
+                scanner.scan_source(conn, src["uri"], src["id"], slice_spec,
+                                process_derivatives=cfg.process_derivatives)
             except (FileNotFoundError, ValueError) as e:
                 print(f"  scan error: {e}")
                 if slice_spec is not None:
@@ -167,7 +168,7 @@ def run_pipeline(
                 print("Nothing was lost: unfinished items stay queued. Start Ollama and run again.")
                 exit_code = 1
                 break
-        row = db.claim_next(conn)
+        row = db.claim_next(conn, recent_first=cfg.recent_first)
         if row is None:
             if not watch:
                 print(f"Queue drained: {processed} processed, {failed} failed this run.")
@@ -179,7 +180,7 @@ def run_pipeline(
                     f"Watching {n_sources} source(s) for new photos "
                     f"(checking every {watch_interval_s}s; Ctrl+C to stop)"
                 )
-            newly = _watch_scan(conn, slice_spec)
+            newly = _watch_scan(conn, slice_spec, cfg.process_derivatives)
             if newly:
                 print(f"watch: {newly} new photo(s) queued")
                 continue
@@ -205,12 +206,17 @@ def run_pipeline(
     return exit_code
 
 
-def _watch_scan(conn, slice_spec: scanner.Slice | None) -> int:
+def _watch_scan(
+    conn, slice_spec: scanner.Slice | None, process_derivatives: bool = True
+) -> int:
     """Fast rescan of registered sources; returns newly queued photos."""
     newly = 0
     for src in db.get_sources(conn):
         try:
-            stats = scanner.scan_source(conn, src["uri"], src["id"], slice_spec, quiet=True)
+            stats = scanner.scan_source(
+                conn, src["uri"], src["id"], slice_spec, quiet=True,
+                process_derivatives=process_derivatives,
+            )
             newly += stats.new_photos
         except (FileNotFoundError, ValueError) as e:
             print(f"  watch scan error: {e}")
@@ -275,7 +281,7 @@ def worker_child(
             except RunAborted as e:
                 print(f"aborted: {e}")
                 return 1
-        row = db.claim_next(conn)
+        row = db.claim_next(conn, recent_first=cfg.recent_first)
         if row is None:
             if not persistent:
                 break
@@ -365,7 +371,7 @@ def _run_multi(
             break
         if watch and time.monotonic() - last_scan >= watch_interval_s:
             last_scan = time.monotonic()
-            newly = _watch_scan(conn, slice_spec)
+            newly = _watch_scan(conn, slice_spec, cfg.process_derivatives)
             if newly:
                 print(f"watch: {newly} new photo(s) queued")
         time.sleep(1)
@@ -373,7 +379,11 @@ def _run_multi(
     if stop_reason is None:
         stop_reason = "All workers finished."
     print(stop_reason)
-    return 0
+    # A night where every worker aborted must not look like a good night:
+    # propagate the worst child exit code to the caller (cron, scripts).
+    if controller.stop:
+        return 0
+    return max((proc.returncode or 0) for proc in children)
 
 
 def _extract_photo(
@@ -450,7 +460,11 @@ def _process_item(
     started = time.monotonic()
     if cfg.two_tier:
         try:
-            gate_raw, gate_content = client.gate(b64)
+            gate_raw, gate_content = client.gate(
+                base64.b64encode(
+                    downscale_jpeg_bytes(image_bytes, cfg.prefilter_max_edge)
+                ).decode("ascii")
+            )
             if not gate_raw.get("has_text"):
                 result = normalize_gate_result(gate_raw)
                 duration_ms = max(1, int((time.monotonic() - started) * 1000))

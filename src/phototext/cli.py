@@ -335,7 +335,10 @@ def scan(
     for uri, source_id in targets:
         typer.echo(f"scanning {uri}")
         try:
-            stats = scanner.scan_source(conn, uri, source_id, slice_spec)
+            stats = scanner.scan_source(
+                conn, uri, source_id, slice_spec,
+                process_derivatives=cfg.process_derivatives,
+            )
         except (FileNotFoundError, ValueError) as e:
             typer.echo(f"  error: {e}", err=True)
             if slice_spec is not None:
@@ -1209,6 +1212,19 @@ def reprocess(
         "--derivative",
         help="Requeue photos extracted from preview thumbnails (redo after originals download).",
     ),
+    done_with: Optional[str] = typer.Option(
+        None,
+        "--done-with",
+        help="Requeue photos extracted by MODEL (e.g. gemma4:12b) — redo after a model upgrade.",
+    ),
+    done_before: Optional[str] = typer.Option(
+        None,
+        "--done-before",
+        help="Requeue photos finished before DATE (ISO, e.g. 2026-09-01).",
+    ),
+    done_category: Optional[str] = typer.Option(
+        None, "--category", help="Requeue photos the model labeled with CATEGORY."
+    ),
     all_photos: bool = typer.Option(False, "--all", help="Requeue every photo."),
     ids_file: Optional[Path] = typer.Option(
         None, "--ids-file", help="File with one photo id (integer) or path per line."
@@ -1220,11 +1236,16 @@ def reprocess(
     results stay in place.
     """
     cfg = _cfg()
-    selectors = [errors, no_text, tiled, gated, derivative, all_photos, ids_file is not None]
+    selectors = [
+        errors, no_text, tiled, gated, derivative,
+        done_with is not None, done_before is not None, done_category is not None,
+        all_photos, ids_file is not None,
+    ]
     if sum(1 for s in selectors if s) != 1:
         typer.echo(
             "error: choose exactly one selector: --errors, --no-text, --tiled, "
-            "--gated, --derivative, --all, or --ids-file",
+            "--gated, --derivative, --done-with, --done-before, --category, "
+            "--all, or --ids-file",
             err=True,
         )
         raise typer.Exit(2)
@@ -1244,6 +1265,9 @@ def reprocess(
             gated=gated,
             derivative=derivative,
             all_photos=all_photos,
+            done_with=done_with,
+            done_before=done_before,
+            category=done_category,
         )
     n = db.requeue_photos(conn, photo_ids)
     if n == 0:

@@ -84,7 +84,7 @@ uv venv .venv && uv pip install -e .
 | `phototext search QUERY` | Full-text search (FTS5) over recovered text and context; FTS5 syntax, phrases in double quotes. |
 | `phototext export` | Export results as JSONL or CSV (`--format jsonl\|csv`, `--status`, `--output`). |
 | `phototext retry` | Requeue failed photos. |
-| `phototext reprocess` | Requeue selected photos for re-extraction: `--errors`, `--no-text`, `--tiled`, `--gated`, `--all`, or `--ids-file` of ids/paths. |
+| `phototext reprocess` | Requeue selected photos for re-extraction: `--errors`, `--no-text`, `--tiled`, `--gated`, `--done-with MODEL` (after a model upgrade), `--done-before DATE`, `--category NAME`, `--all`, or `--ids-file` of ids/paths. |
 | `phototext categories` | List the categories the models assigned, with counts. |
 | `phototext hide / unhide <ids...>` | Hide photos from default views (catalog only; files untouched). |
 | `phototext delete <ids...>` | Move photos to the catalog trash (tombstone; files untouched). |
@@ -188,18 +188,21 @@ processed by `run`.
 phototext serve                 # http://127.0.0.1:8765
 ```
 
-A read-only local web app over the catalog: a card grid of photos (cached
-thumbnails generated from the originals), status tabs, full-text search, and
-per-photo pages with the recovered text, context, metadata, the raw model
-response, and **where the photo is really stored** — every on-disk location
-with its source (which folder or which iPhoto/Photos library), an on-disk
-status, a *reveal in Finder* link that opens the real file's location,
-even inside a `.photolibrary`/`.photoslibrary` package, and — for photos that
-live in a Photos library — an *open in Photos* link that shows the photo
-inside the Photos app. Photos whose originals iCloud has offloaded carry a
-badge and keep rendering from their preview or cached view. It binds to loopback
-only, opens the catalog read-only (`mode=ro` + `query_only`), and never
-writes to the library. Ctrl+C stops it.
+A read-only local web app over the catalog, laid out like iCloud Photos: a
+left **sidebar** with the search box, the Library / Discover / Utilities
+navigation, and every filter — hidden photos, people, categories, text,
+years — while the main area holds a card grid of photos (cached thumbnails
+from the originals), status tabs, full-text search, and per-photo pages with
+the recovered text, context, metadata, the raw model response, and **where
+the photo is really stored** — every on-disk location with its source (which
+folder or which iPhoto/Photos library), an on-disk status, a *reveal in
+Finder* link that opens the real file's location, even inside a
+`.photolibrary`/`.photoslibrary` package, and — for photos that live in a
+Photos library — an *open in Photos* link that shows the photo inside the
+Photos app. Photos whose originals iCloud has offloaded carry a badge and
+keep rendering from their preview or cached view. It binds to loopback only,
+opens the catalog read-only (`mode=ro` + `query_only`), and never writes to
+the library. Ctrl+C stops it.
 
 There is also a **People** tab: person cards with face crops, and per-person
 pages with a review queue for uncertain model tags. With `serve --writable`
@@ -310,6 +313,8 @@ override it.
 | `lease_timeout_s` | `3600` | Multi-worker runs: reclaim photos from dead workers after this long. |
 | `two_tier` | `false` | Cheap prefilter model gates the full pass; textless photos finish at the gate. |
 | `prefilter_model` | `gemma3:4b` | The gate model for two-tier mode. |
+| `recent_first` | `false` | Claim the newest photos first (capture date) while the backlog runs — yesterday's photos surface during nightly runs instead of 2013's. Default is FIFO. |
+| `process_derivatives` | `true` | Best-effort extraction from iCloud preview thumbnails for cloud-only photos; `false` keeps them `deferred` until the real original downloads. |
 | `person_model` | *(prefilter)* | Model for person matching + recognition profiles. |
 | `person_min_confidence` | `0.6` | Model tags below this confidence wait in the review queue. |
 | `face_detection` | `true` | macOS Vision face detection for the people pass (skip faceless photos, match on face crops). |

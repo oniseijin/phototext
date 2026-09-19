@@ -242,6 +242,12 @@ def _encode(im: Image.Image, max_edge: int, jpeg_quality: int) -> bytes:
     return buf.getvalue()
 
 
+def downscale_jpeg_bytes(data: bytes, max_edge: int, jpeg_quality: int = 85) -> bytes:
+    """Downscale an in-memory JPEG without touching the disk (gate input)."""
+    with Image.open(io.BytesIO(data)) as im:
+        return _encode(im, max_edge, jpeg_quality)
+
+
 def display_size(path: Path) -> tuple[int, int] | None:
     """Image size in display orientation, from headers only (no decode).
 

@@ -42,9 +42,9 @@ src/phototext/
                    flag; find_derivative
   people.py        person seeds (face crops), recognition profiles, the
                    `people run` matching pass (face prefilter + crops)
-  memes.py         63-bit dhash, backfill, hamming clustering (union-find);
-                   shared by memes view and the duplicates finder
-                   (tight threshold + derivative exclusion)
+  memes.py         63-bit dhash, backfill, hamming clustering via BK-tree
+                   (union-find, exact); shared by memes view and the
+                   duplicates finder (tight threshold + derivative exclusion)
   ollama_client.py /api/chat + /api/tags + /api/ps, structured output,
                    preflight, two-tier gate call, person describe/match
                    calls, anti-loop retry, parsing
@@ -52,10 +52,11 @@ src/phototext/
   scanner.py       source resolution, walk, dedup, fast path, EXIF
                    date_taken at registration, Slice filters; Photos
                    library scan (asset map, offload demote, hidden sync)
-  webui.py         read-only local web UI (http.server): browse/search/
-                   detail, year timeline, thumbnails, people pages, memes +
-                   duplicates tabs, reveal-in-Finder, open-in-Photos,
-                   views/thumbs caches
+  webui.py         read-only local web UI (http.server): iCloud-style sidebar
+                   chrome (Library/Discover/Utilities + filter groups),
+                   browse/search/detail, year timeline, thumbnails, people
+                   pages, memes + duplicates tabs, reveal-in-Finder,
+                   open-in-Photos, views/thumbs caches
   worker.py        run loop: claim/process, retries, budgets, signals
 bin/phototext-dev  dev wrapper: workspace code via repo .venv
 install.sh         installer: snapshot venv, var/ layout, bin wrappers, migrate
@@ -71,6 +72,10 @@ tests/
   maps one photo to many paths/sources; duplicate content is processed once.
 - `photos.status` state machine: `queued -> processing -> done | error`. Every
   transition is a committed transaction.
+- **Claim order** (`db.claim_next`): FIFO by id by default; `recent_first = true`
+  orders by `COALESCE(date_taken, first_seen_at) DESC` so nightly runs surface
+  recent photos first. `run --workers N` propagates child exit codes — a fully
+  aborted night must exit non-zero for cron.
 - `run` **owns the catalog at startup**: it requeues all `processing` rows
   (single-process design). If multi-process is added, replace this with real
   claim leases — do not silently weaken it.
@@ -99,9 +104,13 @@ tests/
 - The **two-tier gate** (`two_tier`, off by default) runs a cheap prefilter
   model first; textless photos finish there with a short description +
   category (`photos.gated`, migration 5; `reprocess --gated` redoes them with
-  the full model). Gate failures fall through to the full pass. Categories
+  the full model). Gate failures fall through to the full pass. The gate
+  image is downscaled to `prefilter_max_edge` (512px) via
+  `imaging.downscale_jpeg_bytes` — keep it cheap. Categories
   are model-chosen free-form short labels (normalize via
   `prompt.normalize_category`); discover them with `phototext categories`.
+  `reprocess` also selects by `--done-with MODEL` / `--done-before DATE` /
+  `--category NAME` — the "All/Missing" granularity for model swaps.
 - **Workers**: `--workers 1` (default) keeps single-process startup ownership
   (`reset_processing`). `--workers N` spawns `phototext _worker` children with
   atomic claims and **stale-lease recovery** (`db.reclaim_stale`,
@@ -229,7 +238,10 @@ tests/
   demote without duplicates, derivative relink, re-promote, cached-view
   fallback, hidden sync both directions with user-override survival,
   iPhoto apdb hidden import + no-op without the column, cache-previews,
-  unscan cleaning the asset map). APFS refuses to create invalid-UTF-8
+  unscan cleaning the asset map), and the queue-order/ops batch ([44]:
+  recent_first vs FIFO claim order, reprocess --done-with/--done-before/
+  --category, process_derivatives=false deferral, worker exit-code
+  propagation on a dead backend). APFS refuses to create invalid-UTF-8
   filenames, so the scanner skip guard is exercised via the stubbed-walker
   check in e2e section [40] while the model-output path runs end-to-end
   against the mock's `surrogate` mode. The open-in-Photos route is never
