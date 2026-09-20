@@ -92,9 +92,10 @@ uv venv .venv && uv pip install -e .
 | `phototext hide / unhide <ids...>` | Hide photos from default views (catalog only; files untouched). |
 | `phototext delete <ids...>` | Move photos to the catalog trash (tombstone; files untouched). |
 | `phototext restore <ids...>` | Restore photos from the trash. |
-| `phototext purge <ids...>` / `phototext purge --empty-trash` | Forget trashed photos permanently. |
+| `phototext purge <ids...>` / `phototext purge --empty-trash` | Forget trashed photos permanently (also removes their cached thumbnails/views). |
 | `phototext cache-previews` | Pre-generate the web thumbnail and detail-view caches for every photo with local pixels (`--thumbs-only` for grid tiles only). Run before enabling iCloud Optimize Storage. |
 | `phototext trash` | List trashed photos. |
+| `phototext clean-caches` | Remove cached thumbnail/view files whose photos no longer exist (`--dry-run` to preview). |
 | `phototext unscan <source>` | Forget a registered source (by id or path) and photos only seen there. |
 | `phototext memes` | Find near-identical photos (perceptual hash clusters), likely memes. |
 | `phototext duplicates` | Find near-duplicate photos (resized/re-encoded copies), largest file highlighted; `--json`, `--threshold`. |
@@ -214,6 +215,15 @@ type a name, and the person is seeded (recognition profile built on the
 spot) — plus confirm/remove buttons on every person chip and rename/reset/
 delete on the person page. All writes stay behind the session token and
 Origin check.
+
+Writable mode also carries **bulk actions**: any filtered view (the hidden
+view, a person, a category, a status, a year, a date range, or a search)
+offers a confirmed *delete all N in view* button that tombstones every
+photo in that view — the selection is recomputed server-side from the same
+filters, unfiltered requests are refused, and nothing is ever deleted
+automatically (deleting a photo in the Photos app leaves it here until
+you choose). The trash view carries a matching *purge all* button, and
+purging removes the cached thumbnails/views with the rows.
 
 The list page doubles as a **timeline**: year chips (from EXIF capture
 dates) narrow the grid, and the search bar accepts date narrowing via the
@@ -371,9 +381,12 @@ network or real library involved.
 
 - **M2 (done, 0.2.0)**: slices (album/date/favorites/limit/ids-file), FTS5
   full-text search, JSONL/CSV export, schema migrations with backups, installer.
-- **M3**: local web UI to browse photos alongside their recovered text;
-  re-processing with a better model; quadrant tiling for dense documents.
-- **Backlog**: meme identification (perceptual-hash clustering of repeated images
-  with overlaid text), idle detection (pause while Ollama is busy), watch mode.
+- **M3 (done, 0.3.x–0.6.0)**: local web UI (iCloud-style sidebar, people,
+  memes, duplicates, trash), reprocessing, quadrant tiling, idle detection,
+  watch mode, multi-worker runs, two-tier gate, tombstones + writable web,
+  iCloud offload resilience, Vision OCR tier-0, semantic search.
+- **0.7.0**: bulk delete in the web UI, cache cleanup on purge.
+- **Backlog**: saved searches / find-similar web strip, timeline scrubber,
+  YAML sidecar export.
 
 See `DESIGN.md` for the full design and decision log.

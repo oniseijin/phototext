@@ -25,10 +25,10 @@ src/phototext/
   cli.py           typer commands; global --config/--db; scan/run slices,
                    search (--person/--year/--date-from/--date-to,
                    --semantic), export, migrate, serve, reprocess, help,
-                   hide/unhide/delete/restore/purge/trash, unscan,
-                   backfill-dates, backfill-ocr, embed, similar,
-                   cache-previews, categories, memes, duplicates,
-                   autocomplete, profiles, people
+                   hide/unhide/delete/restore/purge [--empty-trash]/trash,
+                   unscan, backfill-dates, backfill-ocr, embed, similar,
+                   cache-previews, clean-caches, categories, memes,
+                   duplicates, autocomplete, profiles, people
                    (name/run/list/photos/confirm [--add-seed]/remove/rename/
                    reset/delete/describe)
   config.py        dataclass Config, ~/.phototext/config.toml (TOML) loading
@@ -60,7 +60,9 @@ src/phototext/
                    chrome (Library/Discover/Utilities + filter groups),
                    browse/search/detail, year timeline, thumbnails, people
                    pages, memes + duplicates tabs, reveal-in-Finder,
-                   open-in-Photos, views/thumbs caches
+                   open-in-Photos (all known asset ids, newest first),
+                   views/thumbs caches, writable bulk-delete/bulk-purge
+                   routes + cache GC helpers
   worker.py        run loop: claim/process, retries, budgets, signals
 bin/phototext-dev  dev wrapper: workspace code via repo .venv
 install.sh         installer: snapshot venv, var/ layout, bin wrappers, migrate
@@ -280,7 +282,12 @@ tests/
   fixtures since real Vision reads PIL text), embeddings ([46]: embed
   missing-only and --all, semantic hit with zero FTS overlap, similar,
   error paths), and sidebar scaling ([47]: pinned nav, collapsible fgroups,
-  filter boxes past 8 people/categories). APFS refuses to create
+  filter boxes past 8 people/categories); the ops batch ([21] extensions
+  and [15]): v14 migration rewind + true-case repair from paths, raw-case
+  asset storage, web bulk-delete (hidden-only and search scopes, token/
+  400/404 gates, multiple-asset-row link survival), purge cache cleanup,
+  clean-caches orphan GC with live-row retention, and bulk-purge from the
+  trash view (button, route, empty-on-empty). APFS refuses to create
   invalid-UTF-8 filenames, so the scanner skip guard is exercised via the
   stubbed-walker check in e2e section [40] while the model-output path runs
   end-to-end
