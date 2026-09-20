@@ -304,6 +304,31 @@ def _action_form(
     )
 
 
+def _bulk_delete_form(
+    token: str, next_url: str, fields: dict[str, str], total: int
+) -> str:
+    """One-click 'delete everything in this view' (writable servers only).
+
+    Manual and confirmed by design: nothing is ever deleted automatically
+    because a photo left Photos. The filter fields are echoed so the route
+    recomputes the same selection server-side.
+    """
+    inputs = "".join(
+        f"<input type='hidden' name='{esc(k)}' value='{esc(v)}'>"
+        for k, v in fields.items()
+        if v
+    )
+    return (
+        "<form class='act bulkdel' method='post' action='/bulk-delete' "
+        f"onsubmit=\"return confirm('Move all {total} photo(s) in this view "
+        "to the trash? Files are never touched.')\">"
+        f"<input type='hidden' name='token' value='{esc(token)}'>"
+        f"<input type='hidden' name='next' value='{esc(next_url)}'>"
+        f"{inputs}"
+        f"<button class='mini'>delete all {total} in view</button></form>"
+    )
+
+
 def _snippet(text: str, limit: int = 220) -> str:
     flat = " ".join((text or "").split())
     if len(flat) > limit:
@@ -452,6 +477,19 @@ def render_list(conn: sqlite3.Connection, params: dict, ctx: dict | None = None)
             year_section = _fgroup("Years", "".join(chips), len(years))
         sidebar = _sidebar(conn, q=q, extra=year_section)
         body = f"<p class='note'>{esc(note)}</p>"
+        token = (ctx or {}).get("token") if (ctx or {}).get("writable") else None
+        if token and total:
+            body += _bulk_delete_form(
+                token,
+                "/?" + urlencode(base_parts),
+                {
+                    "q": q,
+                    "year": year or "",
+                    "date-from": date_from[:10] if date_from else "",
+                    "date-to": date_to[:10] if date_to else "",
+                },
+                total,
+            )
     else:
         status = params.get("status", ["all"])[0] or "all"
         if status not in ("all", "done", "queued", "error", "processing"):
@@ -592,6 +630,25 @@ def render_list(conn: sqlite3.Connection, params: dict, ctx: dict | None = None)
         if text_filter != "all":
             body += f" ({'with' if text_filter == 'yes' else 'no'} text)"
         body += "</p>"
+        if token and total and (
+            hidden_only or person or category or status != "all"
+            or text_filter != "all" or year or date_from or date_to
+        ):
+            body += _bulk_delete_form(
+                token,
+                f"{base}page=1",
+                {
+                    "hidden": "only" if hidden_only else "",
+                    "person": person or "",
+                    "category": category or "",
+                    "status": "" if status == "all" else status,
+                    "text": "" if text_filter == "all" else text_filter,
+                    "year": year or "",
+                    "date-from": date_from[:10] if date_from else "",
+                    "date-to": date_to[:10] if date_to else "",
+                },
+                total,
+            )
     body += "<div class='cards'>" + "".join(cards) + "</div>"
     body += _pager(base, page, total)
     return _page("phototext", body, sidebar)
@@ -677,7 +734,7 @@ def render_detail(conn: sqlite3.Connection, photo_id: int, ctx: dict | None = No
     photos_link = (
         f"<p class='muted'><a href='/open-photos/{photo_id}'>open in Photos</a>"
         " &#8594; shows the photo inside the Photos app</p>"
-        if db.asset_uuid(conn, photo_id)
+        if db.asset_uuids(conn, photo_id)
         else ""
     )
     text = row["text"] or ""
@@ -864,6 +921,14 @@ def render_trash(conn: sqlite3.Connection, ctx: dict | None = None) -> bytes:
     if not writable:
         body += "Start the server with --writable to restore or purge from here."
     body += "</p>"
+    if writable:
+        body += (
+            "<form class='act bulkdel' method='post' action='/bulk-purge' "
+            f"onsubmit=\"return confirm('Permanently forget all {len(rows)} "
+            "photo(s) in the trash? This cannot be undone.')\">"
+            f"<input type='hidden' name='token' value='{esc(ctx['token'])}'>"
+            f"<button class='mini'>purge all {len(rows)}</button></form>"
+        )
     for row in rows:
         name = (row["path"] or "").rsplit("/", 1)[-1] or "(no location)"
         snippet = _snippet(row["text"] or "") or "<span class='muted'>(no text)</span>"
@@ -890,6 +955,65 @@ def render_trash(conn: sqlite3.Connection, ctx: dict | None = None) -> bytes:
 def _first_existing(conn: sqlite3.Connection, photo_id: int) -> Path | None:
     path = db.find_first_existing_location(conn, photo_id)
     return Path(path) if path else None
+
+
+def cache_dirs(db_path: Path) -> tuple[Path, Path]:
+    """(thumbs, views) cache dirs for a catalog at db_path."""
+    return db_path.parent / "thumbs", db_path.parent / "views"
+
+
+def remove_cached_images(db_path: Path, photo_ids: list[int]) -> int:
+    """Drop thumbs/views cache files for photos whose rows are gone (purge).
+
+    Tombstoned photos keep their caches — the trash view still shows
+    thumbnails and restore must work.
+    """
+    removed = 0
+    for cache_dir in cache_dirs(db_path):
+        for photo_id in photo_ids:
+            cache = cache_dir / f"{photo_id}.jpg"
+            try:
+                cache.unlink()
+                removed += 1
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+    return removed
+
+
+def clean_cached_images(db_path: Path, dry_run: bool = False) -> tuple[int, int]:
+    """Garbage-collect cache files whose photo row no longer exists.
+
+    Covers files orphaned by purges older than the cleanup-on-purge logic.
+    Returns (files removed, bytes freed).
+    """
+    conn = _open_ro(db_path)
+    try:
+        live = {
+            row["id"]
+            for row in conn.execute("SELECT id FROM photos")
+        }
+    finally:
+        conn.close()
+    removed = freed = 0
+    for cache_dir in cache_dirs(db_path):
+        if not cache_dir.is_dir():
+            continue
+        for cache in cache_dir.iterdir():
+            if not cache.name.endswith(".jpg") or not cache.stem.isdigit():
+                continue
+            if int(cache.stem) in live:
+                continue
+            try:
+                size = cache.stat().st_size
+                if not dry_run:
+                    cache.unlink()
+                removed += 1
+                freed += size
+            except OSError:
+                pass
+    return removed, freed
 
 
 def thumb_bytes(conn: sqlite3.Connection, photo_id: int, thumbs_dir: Path) -> bytes | None:
@@ -1270,7 +1394,14 @@ class _Handler(BaseHTTPRequestHandler):
             return
         match = re.match(r"^/(hide|unhide|delete|restore|purge)/(\d+)$", route)
         person_match = re.match(r"^/person/(tag|confirm|remove|rename|reset|delete)$", route)
-        if match is None and person_match is None:
+        bulk = route == "/bulk-delete"
+        bulk_purge = route == "/bulk-purge"
+        if (
+            match is None
+            and person_match is None
+            and not bulk
+            and not bulk_purge
+        ):
             self._not_found()
             return
         length = int(self.headers.get("Content-Length") or 0)
@@ -1304,12 +1435,30 @@ class _Handler(BaseHTTPRequestHandler):
                     dest = f"/photo/{photo_id}"
                 else:
                     db.purge_photos(conn, [photo_id])
+                    remove_cached_images(self.server.phototext_db, [photo_id])
                     dest = "/trash"
                 # Card toggles pass the list URL they came from so the
                 # toggle does not yank the user onto the detail page.
                 next_url = (fields.get("next", [""])[0] or "").strip()
                 if next_url.startswith("/") and not next_url.startswith("//"):
                     dest = next_url
+            elif bulk:
+                dest = self._handle_bulk_delete(conn, fields)
+                if dest is None:
+                    self._send(
+                        400,
+                        b"refusing to bulk-delete without a filter",
+                        "text/plain",
+                    )
+                    return
+                next_url = (fields.get("next", [""])[0] or "").strip()
+                if next_url.startswith("/") and not next_url.startswith("//"):
+                    dest = next_url
+            elif bulk_purge:
+                ids = [row["id"] for row in db.trash_list(conn)]
+                db.purge_photos(conn, ids)
+                remove_cached_images(self.server.phototext_db, ids)
+                dest = "/trash"
             else:
                 try:
                     dest = self._handle_person_post(conn, person_match.group(1), fields)
@@ -1322,6 +1471,62 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Location", dest)
         self.send_header("Content-Length", "0")
         self.end_headers()
+
+    def _handle_bulk_delete(
+        self, conn: sqlite3.Connection, fields: dict
+    ) -> str:
+        """Tombstone every photo matching the posted view filters.
+
+        Manual by design: photos are never trashed automatically when
+        their asset disappears from the Photos library — this only runs
+        when the user confirms the button. Refuses unfiltered requests so
+        an accidental click cannot trash the whole catalog.
+        """
+
+        def field(name: str) -> str:
+            return (fields.get(name, [""])[0] or "").strip()
+
+        q = field("q")
+        hidden_only = field("hidden") == "only"
+        status = field("status") or "all"
+        if status not in ("all", "done", "queued", "error", "processing"):
+            status = "all"
+        text_filter = field("text") or "all"
+        if text_filter not in ("all", "yes", "no"):
+            text_filter = "all"
+        has_text = None if text_filter == "all" else (text_filter == "yes")
+        category = field("category") or None
+        person = field("person") or None
+        date_from, date_to, year = _parse_date_params(
+            {
+                "year": [field("year")],
+                "date-from": [field("date-from")],
+                "date-to": [field("date-to")],
+            }
+        )
+        scoped = bool(
+            q or hidden_only or person or category or status != "all"
+            or text_filter != "all" or year or date_from or date_to
+        )
+        if not scoped:
+            return None
+        if q:
+            try:
+                rows, _eff = db.search_photos(
+                    conn, q, limit=10**9,
+                    date_from=date_from, date_to=date_to, year=year,
+                )
+                ids = [r["id"] for r in rows]
+            except sqlite3.OperationalError:
+                ids = []
+        else:
+            ids = db.photo_ids_matching(
+                conn, status=status, has_text=has_text, category=category,
+                hidden_only=hidden_only, person=person,
+                date_from=date_from, date_to=date_to, year=year,
+            )
+        db.trash_photos(conn, ids)
+        return "/"
 
     def _handle_person_post(
         self, conn: sqlite3.Connection, action: str, fields: dict
@@ -1640,28 +1845,34 @@ class _Handler(BaseHTTPRequestHandler):
         """
         conn = _open_ro(self.server.phototext_db)
         try:
-            uuid = db.asset_uuid(conn, photo_id)
+            uuids = db.asset_uuids(conn, photo_id)
         finally:
             conn.close()
-        if uuid is None:
+        if not uuids:
             self._not_found("photo has no Photos-library asset id")
             return
         osascript = shutil.which("osascript")
         if osascript is None:
             self._not_found("opening Photos needs macOS (`osascript`)")
             return
-        try:
-            subprocess.run(
-                [
-                    osascript, "-e",
-                    'tell application "Photos" to spotlight '
-                    f'(media item id "{uuid}")',
-                ],
-                check=False,
-                timeout=15,
-            )
-        except subprocess.TimeoutExpired:
-            pass
+        # The same photo can exist as several library assets; rows for
+        # copies since deleted from Photos are stale but harmless — try
+        # each id (newest first) until Photos resolves one.
+        for uuid in uuids:
+            try:
+                proc = subprocess.run(
+                    [
+                        osascript, "-e",
+                        'tell application "Photos" to spotlight '
+                        f'(media item id "{uuid}")',
+                    ],
+                    check=False,
+                    timeout=15,
+                )
+            except subprocess.TimeoutExpired:
+                break
+            if proc.returncode == 0:
+                break
         self.send_response(303)
         self.send_header("Location", f"/photo/{photo_id}")
         self.send_header("Content-Length", "0")

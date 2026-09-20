@@ -125,10 +125,21 @@ tests/
   `deleted_at`, migration 6); files are never touched. All queries (claims,
   results, search, export, web, `status_counts`) exclude tombstones.
   `unscan <source>` forgets a source and photos only seen there — content
-  with locations elsewhere survives. `purge` is the only row deletion.
+  with locations elsewhere survives. `purge` is the only row deletion and
+  also removes the photo's cached `thumbs/<id>.jpg` / `views/<id>.jpg`
+  (tombstoned photos keep them — the trash view and restore need them);
+  `phototext clean-caches` garbage-collects cache files orphaned by purges
+  that predate the cleanup.
 - **Web writes are opt-in**: `serve --writable` turns on POST-only hide/
   unhide/delete/restore/purge routes guarded by a session token + Origin
-  check; read-only servers 404 them. Keep the token checks intact.
+  check; read-only servers 404 them. `POST /bulk-delete` tombstones every
+  photo matching the posted view filters (hidden-only, person, category,
+  status, text, year, dates, or search query) — it refuses unfiltered
+  requests, recomputes the selection server-side from the same filters,
+  and stays manual by design: photos are never trashed automatically when
+  their asset disappears from the Photos library. Keep the token checks
+  intact. `POST /bulk-purge` empties the trash from the web (same gate;
+  the trash view carries a "purge all" button).
   `/reveal` and `/open-photos` are read-only GET routes on purpose (they
   only shell out to `open -R` / osascript `spotlight` locally); keep them
   out of the writable gate.
@@ -148,7 +159,9 @@ tests/
   `photo_assets(source_id, uuid, photo_id)` (uuid raw-case, NOCASE
   collation as of migration 14 — AppleScript's `media item id` is
   case-sensitive, so "open in Photos" needs the true case; v14 repairs
-  old lowercased rows from originals/ paths) — the link that
+  old lowercased rows from originals/ paths; the open-photos route tries
+  every known asset id, newest first — deleting a duplicate in Photos
+  leaves a stale row behind) — the link that
   survives iCloud Optimize Storage. When an asset's original disappears but
   the map knows the photo, `db.demote_offloaded` keeps the processed row
   (never requeues), prunes its dead locations, attaches the Photos preview

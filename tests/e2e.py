@@ -1120,8 +1120,37 @@ def main() -> int:
             "done count unchanged after deleting queued photo",
         )
         con.close()
-        out = c21.run("purge", "3")
-        check("purged 1" in out, "purge forgets permanently")
+        # purge forgets the photo *and* its cached thumbnails/views
+        for d in ("thumbs", "views"):
+            cache_dir = work / d
+            cache_dir.mkdir(exist_ok=True)
+            (cache_dir / "3.jpg").write_bytes(b"cached")
+        out = c21.run("purge", "--empty-trash")
+        check("purged 1" in out, "purge --empty-trash forgets the trash")
+        check("removed 2 cached" in out, "purge reports removed cache files")
+        check(
+            not (work / "thumbs" / "3.jpg").exists()
+            and not (work / "views" / "3.jpg").exists(),
+            "purge removes cached thumbnails/views",
+        )
+        # clean-caches: orphans go, photos still in the catalog stay
+        (work / "thumbs" / "99999.jpg").write_bytes(b"orphan")
+        (work / "views" / "99999.jpg").write_bytes(b"orphan")
+        (work / "thumbs" / "2.jpg").write_bytes(b"live")
+        out = c21.run("clean-caches")
+        m = re.search(r"removed (\d+) orphaned cache", out)
+        check(m is not None and int(m.group(1)) >= 2, "clean-caches reports orphans")
+        check(
+            not (work / "thumbs" / "99999.jpg").exists()
+            and not (work / "views" / "99999.jpg").exists(),
+            "clean-caches removes orphaned files",
+        )
+        check(
+            (work / "thumbs" / "2.jpg").exists(),
+            "clean-caches keeps files for photos still in the catalog",
+        )
+        out = c21.run("clean-caches", "--dry-run")
+        check("would remove 0" in out, "clean-caches dry run finds nothing left")
         con = db_open(work / "db-hidedb.db")
         check(count(con, "SELECT COUNT(*) FROM photos") == 2, "purged row gone")
         con.close()
@@ -1138,6 +1167,15 @@ def main() -> int:
         if wait_for(lambda: _try_get(hide_base + "/") is not None, tries=50):
             r = requests.post(f"{hide_base}/delete/1", data={"token": "x"}, timeout=5)
             check(r.status_code == 404, "read-only server rejects write actions")
+            r = requests.post(
+                f"{hide_base}/bulk-delete", data={"token": "x", "hidden": "only"},
+                timeout=5,
+            )
+            check(r.status_code == 404, "read-only server rejects bulk delete")
+            r = requests.post(
+                f"{hide_base}/bulk-purge", data={"token": "x"}, timeout=5
+            )
+            check(r.status_code == 404, "read-only server rejects bulk purge")
             detail = _try_get(hide_base + "/photo/1")
             check("name='token'" not in detail.text, "read-only server hides action forms")
         else:
@@ -1210,6 +1248,123 @@ def main() -> int:
                     hidden_after is not None and "h2.jpg" not in hidden_after.text,
                     "unhidden photo leaves the hidden view",
                 )
+                # bulk delete: one confirmed click tombstones the whole view
+                for pid in (2, 3):
+                    requests.post(
+                        f"{wr_base}/hide/{pid}", data={"token": token}, timeout=5
+                    )
+                hidden_page = _try_get(wr_base + "/?hidden=only")
+                check(
+                    hidden_page is not None
+                    and "delete all 2 in view" in hidden_page.text,
+                    "hidden view offers bulk delete with the count",
+                )
+                r = requests.post(
+                    f"{wr_base}/bulk-delete",
+                    data={
+                        "token": token, "hidden": "only", "next": "/?hidden=only",
+                    },
+                    timeout=5, allow_redirects=False,
+                )
+                check(
+                    r.status_code == 303
+                    and r.headers["Location"] == "/?hidden=only",
+                    "bulk delete returns to the list it came from",
+                )
+                con = db_open(work / "db-hidedb.db")
+                check(
+                    count(
+                        con,
+                        "SELECT COUNT(*) FROM photos WHERE deleted_at IS NOT NULL",
+                    )
+                    == 3,
+                    "bulk delete tombstones every hidden photo",
+                )
+                con.close()
+                hidden_page = _try_get(wr_base + "/?hidden=only")
+                check(
+                    hidden_page is not None and "delete all" not in hidden_page.text,
+                    "empty view carries no bulk button",
+                )
+                r = requests.post(
+                    f"{wr_base}/bulk-delete", data={"token": "bad", "hidden": "only"},
+                    timeout=5, allow_redirects=False,
+                )
+                check(r.status_code == 403, "bulk delete requires the token")
+                r = requests.post(
+                    f"{wr_base}/bulk-delete", data={"token": token},
+                    timeout=5, allow_redirects=False,
+                )
+                check(r.status_code == 400, "unscoped bulk delete is refused")
+                # search-scope bulk delete + restore round trip
+                requests.post(
+                    f"{wr_base}/restore/2", data={"token": token}, timeout=5
+                )
+                requests.post(
+                    f"{wr_base}/unhide/2", data={"token": token}, timeout=5
+                )
+                search_page = _try_get(wr_base + "/?q=hide+two")
+                check(
+                    search_page is not None
+                    and "delete all 1 in view" in search_page.text,
+                    "search view offers bulk delete",
+                )
+                r = requests.post(
+                    f"{wr_base}/bulk-delete",
+                    data={"token": token, "q": "hide two"},
+                    timeout=5, allow_redirects=False,
+                )
+                check(r.status_code == 303, "search-scope bulk delete works")
+                con = db_open(work / "db-hidedb.db")
+                check(
+                    count(
+                        con,
+                        "SELECT COUNT(*) FROM photos WHERE deleted_at IS NOT NULL",
+                    )
+                    == 3,
+                    "search-scope bulk delete tombstones the matches",
+                )
+                con.close()
+                # trash view: purge all with cache cleanup
+                for pid in (1, 2, 3):
+                    for d in ("thumbs", "views"):
+                        cache_dir = work / d
+                        cache_dir.mkdir(exist_ok=True)
+                        (cache_dir / f"{pid}.jpg").write_bytes(b"cached")
+                trash_page = _try_get(wr_base + "/trash")
+                check(
+                    trash_page is not None and "purge all 3" in trash_page.text,
+                    "trash view offers purge all with the count",
+                )
+                r = requests.post(
+                    f"{wr_base}/bulk-purge", data={"token": token},
+                    timeout=5, allow_redirects=False,
+                )
+                check(
+                    r.status_code == 303 and r.headers["Location"] == "/trash",
+                    "bulk purge stays on the trash view",
+                )
+                con = db_open(work / "db-hidedb.db")
+                check(
+                    count(con, "SELECT COUNT(*) FROM photos") == 0,
+                    "bulk purge forgets every trashed photo",
+                )
+                con.close()
+                check(
+                    all(
+                        not (work / d / f"{pid}.jpg").exists()
+                        for d in ("thumbs", "views")
+                        for pid in (1, 2, 3)
+                    ),
+                    "bulk purge removes cached thumbnails/views",
+                )
+                trash_page = _try_get(wr_base + "/trash")
+                check(
+                    trash_page is not None and "trash is empty" in trash_page.text,
+                    "trash empties after purge all",
+                )
+                out = c21.run("purge", "--empty-trash")
+                check("purged 0" in out, "purge --empty-trash on an empty trash")
         else:
             check(False, "writable serve comes up")
         wr_proc.terminate()
@@ -2115,6 +2270,18 @@ def main() -> int:
             )
             check("reveal in Finder" not in r.text, "no reveal link for photos without files")
             check("open in Photos" in r.text, "open in Photos link present")
+            # a duplicated asset (its copy since deleted in Photos) must not
+            # break the link — the route tries every known id
+            con41.execute(
+                "INSERT INTO photo_assets (source_id, uuid, photo_id) "
+                "VALUES (1, 'UUID-3-DUP', 3)"
+            )
+            con41.commit()
+            r = requests.get(f"{base41}/photo/3", timeout=5)
+            check(
+                "open in Photos" in r.text,
+                "open in Photos link survives multiple asset rows",
+            )
             r = requests.get(f"{base41}/image/3", timeout=5)
             check(
                 r.status_code == 200 and r.headers["Content-Type"] == "image/jpeg",

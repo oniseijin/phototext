@@ -530,17 +530,22 @@ def trash_photos(conn: sqlite3.Connection, photo_ids: list[int]) -> int:
     """Move photos to the trash (catalog tombstone; files are never touched).
 
     The row is kept so rescans remember the deletion via the content hash.
+    Chunks the update so bulk deletions stay within SQLite's host-parameter
+    limit.
     """
-    if not photo_ids:
-        return 0
-    marks = ",".join("?" for _ in photo_ids)
-    cur = conn.execute(
-        f"UPDATE photos SET deleted_at = ?, hidden = 0 "
-        f"WHERE id IN ({marks}) AND deleted_at IS NULL",
-        [now_utc()] + photo_ids,
-    )
-    conn.commit()
-    return cur.rowcount
+    moved = 0
+    for i in range(0, len(photo_ids), 500):
+        chunk = photo_ids[i : i + 500]
+        marks = ",".join("?" for _ in chunk)
+        cur = conn.execute(
+            f"UPDATE photos SET deleted_at = ?, hidden = 0 "
+            f"WHERE id IN ({marks}) AND deleted_at IS NULL",
+            [now_utc()] + chunk,
+        )
+        moved += cur.rowcount
+    if photo_ids:
+        conn.commit()
+    return moved
 
 
 def restore_photos(conn: sqlite3.Connection, photo_ids: list[int]) -> int:
@@ -559,21 +564,28 @@ def purge_photos(conn: sqlite3.Connection, photo_ids: list[int]) -> int:
     """Forget photos permanently: rows, locations, and search entries.
 
     A later rescan of the same files will register them as new photos.
+    Chunks the deletes so bulk purges stay within SQLite's host-parameter
+    limit.
     """
-    if not photo_ids:
-        return 0
-    marks = ",".join("?" for _ in photo_ids)
-    if _table_exists(conn, "photo_warnings"):
-        conn.execute(
-            f"DELETE FROM photo_warnings WHERE photo_id IN ({marks})", photo_ids
-        )
-    if _table_exists(conn, "person_tags"):
-        conn.execute(f"DELETE FROM person_tags WHERE photo_id IN ({marks})", photo_ids)
-    conn.execute(f"DELETE FROM photo_assets WHERE photo_id IN ({marks})", photo_ids)
-    conn.execute(f"DELETE FROM locations WHERE photo_id IN ({marks})", photo_ids)
-    cur = conn.execute(f"DELETE FROM photos WHERE id IN ({marks})", photo_ids)
-    conn.commit()
-    return cur.rowcount
+    purged = 0
+    for i in range(0, len(photo_ids), 500):
+        chunk = photo_ids[i : i + 500]
+        marks = ",".join("?" for _ in chunk)
+        if _table_exists(conn, "photo_warnings"):
+            conn.execute(
+                f"DELETE FROM photo_warnings WHERE photo_id IN ({marks})", chunk
+            )
+        if _table_exists(conn, "person_tags"):
+            conn.execute(
+                f"DELETE FROM person_tags WHERE photo_id IN ({marks})", chunk
+            )
+        conn.execute(f"DELETE FROM photo_assets WHERE photo_id IN ({marks})", chunk)
+        conn.execute(f"DELETE FROM locations WHERE photo_id IN ({marks})", chunk)
+        cur = conn.execute(f"DELETE FROM photos WHERE id IN ({marks})", chunk)
+        purged += cur.rowcount
+    if photo_ids:
+        conn.commit()
+    return purged
 
 
 def trash_list(conn: sqlite3.Connection) -> list[sqlite3.Row]:
@@ -740,13 +752,20 @@ def asset_photo_id(
     return row["photo_id"] if row is not None else None
 
 
-def asset_uuid(conn: sqlite3.Connection, photo_id: int) -> str | None:
-    """First known Photos-library UUID for a photo (for 'open in Photos')."""
-    row = conn.execute(
-        "SELECT uuid FROM photo_assets WHERE photo_id = ? ORDER BY source_id LIMIT 1",
-        (photo_id,),
-    ).fetchone()
-    return row["uuid"] if row is not None else None
+def asset_uuids(conn: sqlite3.Connection, photo_id: int) -> list[str]:
+    """All known Photos-library UUIDs for a photo (for 'open in Photos').
+
+    Newest registration first: the same content can exist as several
+    library assets, and deleting a duplicate in Photos leaves its row
+    behind — later rows are likelier to be the surviving copy.
+    """
+    return [
+        row["uuid"]
+        for row in conn.execute(
+            "SELECT uuid FROM photo_assets WHERE photo_id = ? ORDER BY rowid DESC",
+            (photo_id,),
+        )
+    ]
 
 
 def apply_library_hidden(
@@ -1160,22 +1179,18 @@ def search_count(
             raise first_error from None
 
 
-def page_photos(
-    conn: sqlite3.Connection,
+def _browse_filters(
     status: str | None = "done",
     has_text: bool | None = None,
     category: str | None = None,
-    limit: int = 50,
-    offset: int = 0,
     show_hidden: bool = False,
     hidden_only: bool = False,
     person: str | None = None,
     date_from: str | None = None,
     date_to: str | None = None,
     year: str | None = None,
-) -> tuple[list[sqlite3.Row], int]:
-    """Browse photos (no query), most recently finished first. Returns
-    (rows, total matching the filter)."""
+) -> tuple[list[str], list]:
+    """WHERE parts shared by the browse view and its bulk actions."""
     where = ["p.deleted_at IS NULL"]
     params: list = []
     if hidden_only:
@@ -1202,6 +1217,30 @@ def page_photos(
     for frag in date_frags:
         where.append(frag)
     params += date_params
+    return where, params
+
+
+def page_photos(
+    conn: sqlite3.Connection,
+    status: str | None = "done",
+    has_text: bool | None = None,
+    category: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+    show_hidden: bool = False,
+    hidden_only: bool = False,
+    person: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    year: str | None = None,
+) -> tuple[list[sqlite3.Row], int]:
+    """Browse photos (no query), most recently finished first. Returns
+    (rows, total matching the filter)."""
+    where, params = _browse_filters(
+        status=status, has_text=has_text, category=category,
+        show_hidden=show_hidden, hidden_only=hidden_only, person=person,
+        date_from=date_from, date_to=date_to, year=year,
+    )
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
     total = conn.execute(
         f"SELECT COUNT(*) AS n FROM photos p {where_sql}", params
@@ -1215,6 +1254,31 @@ def page_photos(
         params + [limit, offset],
     ).fetchall()
     return rows, total
+
+
+def photo_ids_matching(
+    conn: sqlite3.Connection,
+    status: str | None = "all",
+    has_text: bool | None = None,
+    category: str | None = None,
+    show_hidden: bool = False,
+    hidden_only: bool = False,
+    person: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    year: str | None = None,
+) -> list[int]:
+    """All non-deleted photo ids matching the browse filters — bulk actions."""
+    where, params = _browse_filters(
+        status=status, has_text=has_text, category=category,
+        show_hidden=show_hidden, hidden_only=hidden_only, person=person,
+        date_from=date_from, date_to=date_to, year=year,
+    )
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+    return [
+        row["id"]
+        for row in conn.execute(f"SELECT p.id FROM photos p {where_sql}", params)
+    ]
 
 
 def get_photo(conn: sqlite3.Connection, photo_id: int) -> sqlite3.Row | None:

@@ -6,6 +6,33 @@ semantic versioning.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-20
+
+### Added
+
+- **Bulk delete in the web UI**: any filtered view (hidden-only, person,
+  category, status, text, year, date range, or a search) now offers a
+  confirmed "delete all N in view" button on writable servers. The
+  selection is recomputed server-side from the same filters, unfiltered
+  requests are refused, and nothing is ever deleted automatically —
+  removing a photo from the Photos app leaves it in phototext until you
+  choose otherwise.
+- **Cache cleanup**: `purge` now removes the photo's cached
+  thumbnails/views along with its rows, and the trash view gained a
+  "purge all" button (web `POST /bulk-purge`, CLI `purge --empty-trash`).
+  New `phototext clean-caches` command garbage-collects cache files
+  orphaned by purges that predate the cleanup.
+
+## [0.6.2] - 2026-09-20
+
+### Fixed
+
+- **"Open in Photos" failed for photos that existed as several library
+  assets** (e.g. a duplicate you since deleted in Photos): the route
+  referenced only the first-known asset id, which may no longer resolve.
+  It now tries every known asset id — newest registration first — until
+  Photos resolves one.
+
 ## [0.6.1] - 2026-09-20
 
 ### Fixed

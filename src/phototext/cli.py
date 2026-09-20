@@ -1019,6 +1019,27 @@ def cache_previews(
         conn.close()
 
 
+@app.command("clean-caches")
+def clean_caches(
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Report what would be removed without deleting."
+    ),
+) -> None:
+    """Remove thumbnail/view cache files whose photos no longer exist.
+
+    Purges clean up after themselves; this collects files orphaned before
+    that existed (or left by very old versions).
+    """
+    cfg = _cfg()
+    files, freed = webui.clean_cached_images(cfg.db_path, dry_run=dry_run)
+    mb = freed / 1_000_000
+    verb = "would remove" if dry_run else "removed"
+    typer.echo(
+        f"{verb} {files} orphaned cache file(s), "
+        f"{'freeing' if not dry_run else 'would free'} {mb:.1f} MB"
+    )
+
+
 _EXPORT_FIELDS = [
     "id",
     "sha256",
@@ -1157,16 +1178,26 @@ def restore(ids: List[int]) -> None:
 
 
 @app.command()
-def purge(ids: List[int]) -> None:
+def purge(
+    ids: Optional[List[int]] = typer.Argument(None),
+    empty_trash: bool = typer.Option(
+        False, "--empty-trash", help="Forget every photo in the trash."
+    ),
+) -> None:
     """Forget photos permanently: rows, locations, and search entries.
 
     A later rescan of the same files registers them as new photos. Files are
-    never touched.
+    never touched. Cached thumbnails/views are removed with the rows.
     """
     cfg = _cfg()
     conn = db.connect(cfg.db_path)
-    n = db.purge_photos(conn, ids)
+    if empty_trash and not ids:
+        ids = [r["id"] for r in db.trash_list(conn)]
+    n = db.purge_photos(conn, ids or [])
+    removed = webui.remove_cached_images(cfg.db_path, ids or [])
     typer.echo(f"purged {n} photo(s)")
+    if removed:
+        typer.echo(f"removed {removed} cached thumbnail/view file(s)")
 
 
 @app.command()
