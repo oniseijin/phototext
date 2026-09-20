@@ -520,18 +520,55 @@ def main() -> int:
         con.close()
         out = cli.run("migrate", "--dry-run")
         check(
-            "pending migration(s): v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13" in out,
+            "pending migration(s): v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14" in out,
             "dry run reports pending migrations",
         )
         check("dry run: nothing applied" in out, "dry run applies nothing")
         out = cli.run("migrate")
-        check("migrated: v1 -> v13" in out, "migrate applies pending migrations")
+        check("migrated: v1 -> v14" in out, "migrate applies pending migrations")
         check("backup:" in out, "migrate backs up first")
         con = db_open(db_path)
         check(count(con, "SELECT COUNT(*) FROM photos_fts") == 4, "fts rebuilt with 4 rows")
         con.close()
         out = cli.run("search", "MOCK")
         check("4 match(es)" in out, "search works after migrate")
+
+        # v14 repair: a v13-era catalog stored asset uuids lowercased, which
+        # breaks AppleScript's case-sensitive `media item id` lookup. The
+        # migration recovers the true case from the originals/ file name.
+        true_case = "AA11BB22-CC33-44DD-55EE-FF6677889900"
+        con = db_open(db_path)
+        con.execute(
+            "INSERT INTO photo_assets (source_id, uuid, photo_id) VALUES (1, ?, 1)",
+            (true_case.lower(),),
+        )
+        con.execute(
+            "INSERT INTO locations (photo_id, source_id, path, mtime, size) "
+            "VALUES (1, 1, ?, 0, 0)",
+            (f"/fake/originals/A/{true_case}.jpeg",),
+        )
+        con.execute("DELETE FROM schema_version WHERE version >= 14")
+        con.commit()
+        con.close()
+        out = cli.run("migrate")
+        check("migrated: v13 -> v14" in out, "v14 re-applies after a rewind")
+        con = db_open(db_path)
+        check(
+            con.execute(
+                "SELECT uuid FROM photo_assets WHERE photo_id = 1"
+            ).fetchone()[0]
+            == true_case,
+            "v14 recovers true-case asset uuids from paths",
+        )
+        check(
+            con.execute(
+                "SELECT photo_id FROM photo_assets WHERE uuid = ?",
+                (true_case.lower(),),
+            ).fetchone()[0]
+            == 1,
+            "asset lookups are case-insensitive after v14",
+        )
+        con.close()
 
         print("\n[16] export jsonl/csv")
         out = cli.run("export")
@@ -1987,7 +2024,14 @@ def main() -> int:
                 "WHERE uuid IN ('uuid-1', 'uuid-2', 'uuid-3')"
             ).fetchone()[0]
             == 3,
-            "asset uuids are stored lowercased",
+            "asset map records every library asset",
+        )
+        check(
+            con41.execute(
+                "SELECT uuid FROM photo_assets WHERE uuid = 'uuid-2'"
+            ).fetchone()[0]
+            == "UUID-2",
+            "asset uuids keep their original case",
         )
         check(
             con41.execute(

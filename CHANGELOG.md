@@ -6,6 +6,18 @@ semantic versioning.
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-09-20
+
+### Fixed
+
+- **"Open in Photos" failed with** `execution error: Photos got an error:
+  Can't get media item id "…" (-1728)`. AppleScript's `media item id`
+  lookup is case-sensitive, but asset UUIDs were stored lowercased.
+  `photo_assets.uuid` is now kept in its original case with NOCASE
+  collation (migration 14), and the migration repairs existing rows by
+  recovering the true case from the originals/ file name Photos derives
+  from the UUID.
+
 ## [0.6.0] - 2026-09-20
 
 ### Added

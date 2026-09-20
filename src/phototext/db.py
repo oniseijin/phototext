@@ -8,7 +8,7 @@ from pathlib import Path
 from .config import ensure_noindex
 from .library_meta import norm_path
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 
 MIGRATIONS: dict[int, str] = {
     1: """
@@ -182,6 +182,45 @@ MIGRATIONS: dict[int, str] = {
         vector BLOB NOT NULL,
         updated_at TEXT,
         PRIMARY KEY (photo_id, model)
+    );
+    """,
+    # 14: AppleScript's `media item id` lookup in Photos is case-sensitive,
+    # but asset uuids were stored lowercased (breaking "open in Photos").
+    # Rebuild photo_assets with NOCASE collation — comparisons and the
+    # primary key stay case-insensitive — and recover the true-case uuid
+    # from originals/ file names, which Photos derives from the uuid.
+    14: """
+    CREATE TABLE photo_assets_v14 (
+        source_id INTEGER NOT NULL,
+        uuid TEXT NOT NULL COLLATE NOCASE,
+        photo_id INTEGER NOT NULL REFERENCES photos(id),
+        PRIMARY KEY (source_id, uuid)
+    );
+    INSERT INTO photo_assets_v14 (source_id, uuid, photo_id)
+        SELECT source_id, uuid, photo_id FROM photo_assets;
+    DROP TABLE photo_assets;
+    ALTER TABLE photo_assets_v14 RENAME TO photo_assets;
+    WITH names AS (
+        SELECT photo_id,
+               replace(path, rtrim(path, replace(path, '/', '')), '') AS fname
+        FROM locations
+    ),
+    stems AS (
+        -- asset uuids are 36 chars; originals are "<uuid>.<ext>" and
+        -- Photos edits "<uuid>_1.<ext>" — take the leading 36 chars
+        SELECT photo_id, substr(fname, 1, 36) AS stem
+        FROM names
+        WHERE length(fname) > 36
+    )
+    UPDATE photo_assets AS a
+    SET uuid = (
+        SELECT s.stem FROM stems s
+        WHERE s.photo_id = a.photo_id AND lower(s.stem) = a.uuid
+        LIMIT 1
+    )
+    WHERE EXISTS (
+        SELECT 1 FROM stems s
+        WHERE s.photo_id = a.photo_id AND lower(s.stem) = a.uuid
     );
     """,
 }
@@ -687,7 +726,7 @@ def record_asset(
     conn.execute(
         "INSERT INTO photo_assets (source_id, uuid, photo_id) VALUES (?, ?, ?) "
         "ON CONFLICT(source_id, uuid) DO UPDATE SET photo_id = excluded.photo_id",
-        (source_id, uuid.strip().lower(), photo_id),
+        (source_id, uuid.strip(), photo_id),
     )
 
 
@@ -696,7 +735,7 @@ def asset_photo_id(
 ) -> int | None:
     row = conn.execute(
         "SELECT photo_id FROM photo_assets WHERE source_id = ? AND uuid = ?",
-        (source_id, uuid.strip().lower()),
+        (source_id, uuid.strip()),
     ).fetchone()
     return row["photo_id"] if row is not None else None
 

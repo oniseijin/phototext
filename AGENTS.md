@@ -145,7 +145,10 @@ tests/
   (`promote_deferred` collapses into the content-hash row). Scan summaries
   report the split (`previews`, `awaiting download`).
 - **Offload demote** (migration 11): every asset seen is mapped in
-  `photo_assets(source_id, uuid, photo_id)` (uuid lowercase) — the link that
+  `photo_assets(source_id, uuid, photo_id)` (uuid raw-case, NOCASE
+  collation as of migration 14 — AppleScript's `media item id` is
+  case-sensitive, so "open in Photos" needs the true case; v14 repairs
+  old lowercased rows from originals/ paths) — the link that
   survives iCloud Optimize Storage. When an asset's original disappears but
   the map knows the photo, `db.demote_offloaded` keeps the processed row
   (never requeues), prunes its dead locations, attaches the Photos preview
