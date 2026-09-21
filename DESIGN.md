@@ -249,6 +249,59 @@ model, `num_ctx`.
   (migration backfills existing hiddens as 'user'); iPhoto apdb hidden
   import best-effort via the adaptive reader.
 
+### 0.8.0 — PoI themes, lightbox, run reliability (planned)
+
+Port of the Person of Interest design system from the sibling
+`video-security` app (its single source of truth: `report_theme.py`),
+plus the runtime niceties worth taking from the same codebase. Decisions
+below are locked (see decision log entries).
+
+- **Theme system** — new `src/phototext/webtheme.py` mirroring
+  video-security's `report_theme.py`: ~24 `--pt-*` tokens × 3 themes —
+  `icloud` (the current look, baked default), `machine` (black +
+  `#ff0000`, scanlines, glow, square corners), `samaritan` (white +
+  `#e8000d`, reticle, hairline frames, no glow). Mechanism: `data-theme`
+  attribute on `<html>` + `pt-theme` localStorage + a no-FOUC restore
+  script emitted before the stylesheet; a 3-state toggle
+  (`icloud -> machine -> samaritan`) in the pinned sidebar top. Purely
+  client-side — read-only `serve` stays read-only. All ~40 color literals
+  in `webui._CSS` become token references; ink/accent-ink pairs keep
+  samaritan legible.
+- **Element mapping**: detail-view images + person header crops get
+  corner-bracket `.subject` frames with `.designation` tags (tone =
+  status); recovered-text `pre` blocks get `.terminal` styling; the
+  face-picker `.selbox` gets the face-box glow + red corner accent; a
+  semantic REC dot in the sidebar (pulses while `queued > 0 or
+  processing > 0`); scanlines, `::selection`, print + reduced-motion
+  rules carried over from the source design system.
+- **Grid cards**: hover-acquisition — brackets + tone glow appear only on
+  the pointed card in machine (one at a time reads as "tracking"; on
+  every card it reads as wallpaper); samaritan cards get a 1px hairline
+  frame; mono/dim snippet + path in PoI themes; icloud untouched.
+  Duplicates view: the keep-suggestion becomes the bracketed subject with
+  a `KEEP` designation, derivatives get a dim `DERIVATIVE` tag.
+- **Fonts**: self-hosted Barlow Semi Condensed + JetBrains Mono variable
+  woff2 (~120-150 KB package data) served at `/fonts/` (same pattern as
+  `/thumb/`), fallback stacks preserved, `LICENSES/OFL.txt` + README
+  note. No Google Fonts `@import` — the UI is local-first; an online
+  import stalls first paint and guts the theme offline.
+- **Config**: `web_theme = "icloud"` sets the server default theme;
+  per-browser localStorage still wins.
+- **Lightbox** (follow-up commit): the framework-free zoom-to-cursor /
+  pan / keyboard-nav lightbox from video-security's report module, wired
+  to detail images (users zoom to read recovered text).
+- **Run reliability** (from video-security's engine): CaffeinateGuard +
+  AC-power warning (overnight runs must survive lid-close and warn on
+  battery); `keep_alive: "30m"` + explicit model unload at clean run end
+  (warm through watch-mode gaps, free ~8 GB after the nightly cron) —
+  never port `_evict_other` single-model eviction (phototext's per-photo
+  gate alternation would thrash loads); start-of-run disk preflight
+  against the catalog volume.
+- **Verification**: e2e additions — token-key parity across themes,
+  toggle presence, theme CSS blocks, `/fonts/` 200 + content-type,
+  duplicates-view designations — plus a grep gate that no color literal
+  survives in `webui.py` outside token dicts; full suite green.
+
 ### Backlog
 
 - **Meme identification**: add a perceptual hash (`phash`, e.g. 64-bit dHash/pHash)
@@ -392,3 +445,24 @@ model, `num_ctx`.
   next scan promotes the deferred row into the real content hash row and
   requeues it. The scan summary reports the three-way split (`previews`,
   `awaiting download`).
+- **PoI themes via a token layer, icloud stays default** (user decision,
+  0.8.0): the Machine/Samaritan design system ports from video-security's
+  `report_theme.py` as a new `webtheme.py` (TOKENS dict + `data-theme`
+  attribute + localStorage + no-FOUC restore) rather than restyling
+  `webui.py` in place — webui keeps the server, the theme module is the
+  single source of the design system and is importable by e2e for token-key
+  parity. icloud (the current look) remains the baked default and becomes
+  the third theme; machine/samaritan are opt-in per browser, and a
+  `web_theme` config value sets the server default (localStorage wins).
+  Fonts are self-hosted variable woff2 under OFL — an online `@import`
+  would stall first paint and degrade offline, which defeats a
+  local-first UI. Grid cards use hover-acquisition brackets (one framed
+  card reads as "tracking"; forty read as wallpaper), mono snippets carry
+  the text-is-the-product identity into the grid, and the duplicates view
+  gets semantic KEEP/DERIVATIVE designations — the one place grid-level
+  brackets carry meaning.
+- **keep_alive + unload, never evict** (user decision, 0.8.0): port
+  video-security's warm-window (`keep_alive: "30m"`) and clean-shutdown
+  model unload, but NOT its single-model-residency eviction —
+  phototext's two-tier gate alternates gate/main models per photo, so
+  evict-on-switch would thrash model loads.

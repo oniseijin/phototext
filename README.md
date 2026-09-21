@@ -386,6 +386,9 @@ network or real library involved.
   watch mode, multi-worker runs, two-tier gate, tombstones + writable web,
   iCloud offload resilience, Vision OCR tier-0, semantic search.
 - **0.7.0**: bulk delete in the web UI, cache cleanup on purge.
+- **0.8.0 (planned)**: Person of Interest themes (machine/samaritan) for the
+  web UI, image lightbox, run reliability (caffeinate, keep-alive, disk
+  preflight).
 - **Backlog**: saved searches / find-similar web strip, timeline scrubber,
   YAML sidecar export.
 
