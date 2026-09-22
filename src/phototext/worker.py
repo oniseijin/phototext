@@ -15,9 +15,9 @@ from pathlib import Path
 from . import db, scanner
 from .config import Config, with_model
 from .imaging import ImageReadError, downscale_jpeg_bytes, prepare_image, prepare_tiles
+from .clients import make_client
 from .ollama_client import (
     ModelOutputError,
-    OllamaClient,
     OllamaServerError,
     OllamaTimeout,
     OllamaUnreachable,
@@ -126,7 +126,7 @@ def run_pipeline(
         print(f"Nothing to process. Catalog: {_summary(counts)}")
         return 0
     effective = with_model(cfg, model)
-    client = OllamaClient(effective)
+    client = make_client(effective)
     if not skip_preflight:
         problems = client.preflight()
         if problems:
@@ -258,7 +258,7 @@ def worker_child(
     if no_idle_detection:
         cfg = replace(cfg, idle_detection=False)
     effective = with_model(cfg, model)
-    client = OllamaClient(effective)
+    client = make_client(effective)
     conn = db.connect(cfg.db_path)
     reclaimed = db.reclaim_stale(conn, effective.lease_timeout_s)
     if reclaimed:

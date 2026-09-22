@@ -11,8 +11,16 @@ DEFAULT_CONFIG_PATH = DEFAULT_DIR / "config.toml"
 EXAMPLE_CONFIG = """\
 # phototext configuration (CLI flags override these values)
 
+# LLM backend: "ollama" | "mlx-serve". Model names below are the ollama
+# base values; the [mlx-serve] table overlays them when that provider is
+# active, so switching back is a one-line change.
+provider = "ollama"
+
 # Ollama server
 ollama_url = "http://localhost:11434"
+
+# mlx-serve server (OpenAI-compatible)
+mlx_url = "http://127.0.0.1:11234"
 
 # Any vision-capable model tag installed in Ollama
 model = "gemma4:12b"
@@ -97,12 +105,23 @@ idle_detection = true
 
     # SQLite catalog location
     db_path = "~/.phototext/catalog.db"
+
+# Per-provider model overlays: when `provider` matches a table below, its
+# model names replace the base values at config load (rollback = flip
+# `provider` back; the base ollama names stay intact).
+[mlx-serve]
+model = "mlx-community/gemma-4-e4b-it-4bit"
+prefilter_model = "mlx-community/gemma-4-e4b-it-4bit"
+# person_model = ""            # empty = prefilter model
+embed_model = "mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ"
 """
 
 
 @dataclass
 class Config:
+    provider: str = "ollama"
     ollama_url: str = "http://localhost:11434"
+    mlx_url: str = "http://127.0.0.1:11234"
     model: str = "gemma4:12b"
     max_image_edge: int = 1024
     max_output_tokens: int = 2048
@@ -149,6 +168,9 @@ def ensure_default_config() -> Path | None:
         return None
 
 
+_PROVIDER_OVERLAY_FIELDS = ("model", "prefilter_model", "person_model", "embed_model")
+
+
 def load_config(path: Path | None = None) -> Config:
     if path is not None:
         path = Path(path).expanduser()
@@ -166,6 +188,15 @@ def load_config(path: Path | None = None) -> Config:
                 if key == "db_path":
                     value = Path(str(value)).expanduser()
                 setattr(cfg, key, value)
+        if cfg.provider not in ("ollama", "mlx-serve"):
+            raise ValueError(
+                f"provider must be 'ollama' or 'mlx-serve' (got: {cfg.provider!r})"
+            )
+        overlay = data.get(cfg.provider)
+        if cfg.provider != "ollama" and isinstance(overlay, dict):
+            for key in _PROVIDER_OVERLAY_FIELDS:
+                if key in overlay:
+                    setattr(cfg, key, overlay[key])
     return cfg
 
 

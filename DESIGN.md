@@ -249,7 +249,7 @@ model, `num_ctx`.
   (migration backfills existing hiddens as 'user'); iPhoto apdb hidden
   import best-effort via the adaptive reader.
 
-### 0.8.0 — PoI themes, lightbox, run reliability (planned)
+### 0.9.0 — PoI themes, lightbox, run reliability (planned)
 
 Port of the Person of Interest design system from the sibling
 `video-security` app (its single source of truth: `report_theme.py`),
@@ -446,7 +446,7 @@ below are locked (see decision log entries).
   requeues it. The scan summary reports the three-way split (`previews`,
   `awaiting download`).
 - **PoI themes via a token layer, icloud stays default** (user decision,
-  0.8.0): the Machine/Samaritan design system ports from video-security's
+  0.9.0): the Machine/Samaritan design system ports from video-security's
   `report_theme.py` as a new `webtheme.py` (TOKENS dict + `data-theme`
   attribute + localStorage + no-FOUC restore) rather than restyling
   `webui.py` in place — webui keeps the server, the theme module is the
@@ -461,7 +461,7 @@ below are locked (see decision log entries).
   the text-is-the-product identity into the grid, and the duplicates view
   gets semantic KEEP/DERIVATIVE designations — the one place grid-level
   brackets carry meaning.
-- **keep_alive + unload, never evict** (user decision, 0.8.0): port
+- **keep_alive + unload, never evict** (user decision, 0.9.0): port
   video-security's warm-window (`keep_alive: "30m"`) and clean-shutdown
   model unload, but NOT its single-model-residency eviction —
   phototext's two-tier gate alternates gate/main models per photo, so

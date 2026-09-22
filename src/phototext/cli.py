@@ -20,7 +20,7 @@ from .faces import detect_faces, vision_problem
 from .imaging import read_date_taken, test_image_b64
 from .library_meta import norm_path
 from .memes import ensure_hashes, find_clusters
-from .ollama_client import OllamaClient
+from .clients import make_client
 
 try:
     # line_buffering: piped overnight runs show live progress; backslashreplace:
@@ -668,7 +668,7 @@ def _semantic_search(
     import array
     import math
 
-    client = OllamaClient(cfg)
+    client = make_client(cfg)
     try:
         query_vecs = client.embed([query_text])
     except Exception as e:
@@ -897,7 +897,7 @@ def embed_command(
     if not cfg.embed_model:
         typer.echo("error: set embed_model in the config to use embeddings", err=True)
         raise typer.Exit(2)
-    client = OllamaClient(cfg)
+    client = make_client(cfg)
     conn = db.connect(cfg.db_path)
     photo_ids = db.photo_ids_missing_embeddings(conn, cfg.embed_model, all_photos=all_photos)
     if not photo_ids:
@@ -1951,8 +1951,12 @@ def doctor() -> None:
     conn = db.connect(cfg.db_path)
     counts = db.status_counts(conn)
     report(True, "database readable", _counts_summary(counts))
-    typer.echo(f"ollama: {cfg.ollama_url}  model: {cfg.model}")
-    client = OllamaClient(cfg)
+    typer.echo(
+        f"backend: {cfg.provider}  "
+        f"url: {cfg.mlx_url if cfg.provider == 'mlx-serve' else cfg.ollama_url}  "
+        f"model: {cfg.model}"
+    )
+    client = make_client(cfg)
     try:
         models = client.check_connection()
         report(True, "server reachable", f"{len(models)} model(s) installed")

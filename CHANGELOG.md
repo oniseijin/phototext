@@ -4,7 +4,25 @@ All notable changes to phototext are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 semantic versioning.
 
-## [Unreleased]
+## [0.8.0] - 2026-09-22
+
+### Added
+
+- **mlx-serve backend**: `provider = "ollama" | "mlx-serve"` selects the
+  LLM backend; a `[mlx-serve]` config table overlays per-provider model
+  names (`model`, `prefilter_model`, `person_model`, `embed_model`) at load,
+  so switching back is a one-line change with the ollama names kept as the
+  base. New `mlx_client.py` mirrors `OllamaClient`'s method surface and
+  exception types over the OpenAI-compatible API (`/v1/chat/completions`
+  with image content parts + `json_schema` structured output,
+  `/v1/embeddings`, `/v1/models`); `make_client(cfg)` (clients.py) is the
+  single construction point for worker/cli/people. Idle-pause coordination
+  is a no-op on mlx-serve (models coexist under LRU/budget rules).
+  Existing text/description results are model-agnostic (no reprocessing
+  needed); embeddings re-populate incrementally per model
+  (`photo_embeddings` is keyed by model, search is model-scoped).
+  e2e: `PHOTOTEXT_E2E_PROVIDER=mlx-serve tests/e2e.py` runs the full suite
+  against `tests/mock_mlx.py`.
 
 ## [0.7.0] - 2026-09-20
 

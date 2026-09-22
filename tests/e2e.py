@@ -28,6 +28,14 @@ except ImportError:
     sys.path.insert(0, str(ROOT / "src"))
 
 MODEL = "gemma4:mock"
+PROVIDER = os.environ.get("PHOTOTEXT_E2E_PROVIDER", "ollama")
+MOCK_SCRIPT = "mock_mlx.py" if PROVIDER == "mlx-serve" else "mock_ollama.py"
+
+
+def backend_config(port) -> str:
+    if PROVIDER == "ollama":
+        return f'ollama_url = "http://127.0.0.1:{port}"\n'
+    return f'provider = "mlx-serve"\nmlx_url = "http://127.0.0.1:{port}"\n'
 FAILURES: list[str] = []
 
 
@@ -176,7 +184,7 @@ def free_port() -> int:
 def start_mock(port: int, mode_file: Path, ps_file: Path | None = None) -> subprocess.Popen:
     cmd = [
         sys.executable,
-        str(ROOT / "tests" / "mock_ollama.py"),
+        str(ROOT / "tests" / MOCK_SCRIPT),
         "--model",
         MODEL,
         "--port",
@@ -189,9 +197,10 @@ def start_mock(port: int, mode_file: Path, ps_file: Path | None = None) -> subpr
     if ps_file is not None:
         cmd += ["--ps-file", str(ps_file)]
     proc = subprocess.Popen(cmd)
+    ready_path = "/v1/models" if PROVIDER == "mlx-serve" else "/api/tags"
     for _ in range(100):
         try:
-            requests.get(f"http://127.0.0.1:{port}/api/tags", timeout=1)
+            requests.get(f"http://127.0.0.1:{port}{ready_path}", timeout=1)
             return proc
         except Exception:
             time.sleep(0.1)
@@ -244,7 +253,7 @@ def main() -> int:
     mock = start_mock(port, mode_file, ps_file)
     config = work / "config.toml"
     config.write_text(
-        f'ollama_url = "http://127.0.0.1:{port}"\n'
+        backend_config(port) +
         f'model = "{MODEL}"\n'
         f'db_path = "{db_path}"\n'
         "max_attempts = 2\n"
@@ -257,7 +266,7 @@ def main() -> int:
     def fresh_cli(name: str, extra: str = "") -> CLI:
         cfgp = work / f"config-{name}.toml"
         cfgp.write_text(
-            f'ollama_url = "http://127.0.0.1:{port}"\n'
+            backend_config(port) +
             f'model = "{MODEL}"\n'
             f'db_path = "{work}/db-{name}.db"\n' + extra
         )
@@ -384,6 +393,10 @@ def main() -> int:
         check(1 <= done <= 3 and queued >= 1, f"budget respected (done={done}, queued={queued})")
 
         print("\n[10] SIGINT stops gracefully after current photo")
+        # Slow model calls widen the mid-photo window so the signal reliably
+        # lands inside the model call (with instant responses the section
+        # races the retry-loop stop check and can requeue instead).
+        mode_file.write_text("slow")
         con = db_open(db_path)
         reset_queued(con)
         con.close()
@@ -421,6 +434,11 @@ def main() -> int:
             if n:
                 break
             time.sleep(0.05)
+        # Soak inside the 3s slow-mode model call: signaling the instant
+        # 'processing' appears can race the image-prep phase (before the
+        # retry loop's stop check), which legitimately requeues the photo
+        # instead of finishing it.
+        time.sleep(1.0)
         proc.send_signal(signal.SIGINT)
         out, _ = proc.communicate(timeout=60)
         check(
@@ -438,7 +456,7 @@ def main() -> int:
         bad_port = free_port()
         bad_config = work / "bad-config.toml"
         bad_config.write_text(
-            f'ollama_url = "http://127.0.0.1:{bad_port}"\nmodel = "{MODEL}"\ndb_path = "{db_path}"\n'
+            backend_config(bad_port) + f'model = "{MODEL}"\ndb_path = "{db_path}"\n'
         )
         cli = CLI(bad_config)
         cli.run("doctor", expect=1)
@@ -753,45 +771,48 @@ def main() -> int:
         check(proc2.returncode == 2, "serve errors on a missing catalog")
 
         print("\n[21] idle detection pauses while another model is loaded")
-        c12 = fresh_cli("idledb", "idle_poll_s = 1\n")
-        idle_folder = work / "idlefolder"
-        idle_folder.mkdir()
-        make_text_image(idle_folder / "one.jpg", ["idle one"])
-        make_text_image(idle_folder / "two.jpg", ["idle two"])
-        c12.run("scan", str(idle_folder))
-        ps_file.write_text("othermodel:7b\n")
-        runlog = work / "idle-run.log"
-        with open(runlog, "w") as logf:
-            idle_proc = subprocess.Popen(
-                c12.cmd + ["run", "--skip-preflight"],
-                stdout=logf,
-                stderr=subprocess.STDOUT,
-                text=True,
+        if PROVIDER != "ollama":
+            print("  skipped for mlx-serve: no single-resident pause semantics")
+        else:
+            c12 = fresh_cli("idledb", "idle_poll_s = 1\n")
+            idle_folder = work / "idlefolder"
+            idle_folder.mkdir()
+            make_text_image(idle_folder / "one.jpg", ["idle one"])
+            make_text_image(idle_folder / "two.jpg", ["idle two"])
+            c12.run("scan", str(idle_folder))
+            ps_file.write_text("othermodel:7b\n")
+            runlog = work / "idle-run.log"
+            with open(runlog, "w") as logf:
+                idle_proc = subprocess.Popen(
+                    c12.cmd + ["run", "--skip-preflight"],
+                    stdout=logf,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+            paused = False
+            for _ in range(100):
+                if "paused: other model" in runlog.read_text():
+                    paused = True
+                    break
+                time.sleep(0.2)
+            check(paused, "run pauses while a foreign model is loaded")
+            ps_file.write_text("")
+            idle_proc.wait(timeout=60)
+            check(idle_proc.returncode == 0, "run finishes after the pause clears")
+            log = runlog.read_text()
+            check("resumed: Ollama is free" in log, "run reports resuming")
+            con = db_open(work / "db-idledb.db")
+            check(
+                count(con, "SELECT COUNT(*) FROM photos WHERE status='done'") == 2,
+                "paused run still processes everything",
             )
-        paused = False
-        for _ in range(100):
-            if "paused: other model" in runlog.read_text():
-                paused = True
-                break
-            time.sleep(0.2)
-        check(paused, "run pauses while a foreign model is loaded")
-        ps_file.write_text("")
-        idle_proc.wait(timeout=60)
-        check(idle_proc.returncode == 0, "run finishes after the pause clears")
-        log = runlog.read_text()
-        check("resumed: Ollama is free" in log, "run reports resuming")
-        con = db_open(work / "db-idledb.db")
-        check(
-            count(con, "SELECT COUNT(*) FROM photos WHERE status='done'") == 2,
-            "paused run still processes everything",
-        )
-        reset_queued(con)
-        con.close()
-        ps_file.write_text("othermodel:7b\n")
-        out = c12.run("run", "--no-idle-detection", "--skip-preflight")
-        check("paused: other model" not in out, "--no-idle-detection skips the pause")
-        check("Queue drained" in out, "run drains without pausing")
-        ps_file.write_text("")
+            reset_queued(con)
+            con.close()
+            ps_file.write_text("othermodel:7b\n")
+            out = c12.run("run", "--no-idle-detection", "--skip-preflight")
+            check("paused: other model" not in out, "--no-idle-detection skips the pause")
+            check("Queue drained" in out, "run drains without pausing")
+            ps_file.write_text("")
 
         print("\n[22] repetition-loop salvage and bounded timeouts")
         c13 = fresh_cli("loopdb")
@@ -1474,7 +1495,7 @@ def main() -> int:
         ppl_dir.mkdir()
         ppl_cfg = work / "config-peopledb.toml"
         ppl_cfg.write_text(
-            f'ollama_url = "http://127.0.0.1:{port}"\n'
+            backend_config(port) +
             f'model = "{MODEL}"\n'
             f'db_path = "{ppl_dir}/catalog.db"\n'
             "person_min_confidence = 0.6\n"
@@ -1801,7 +1822,7 @@ def main() -> int:
     check("memes" in out and "1 photo" in out, "profiles lists profile with counts")
     c25.run("--profile", "../evil", "status", expect=2)
     (work / "profiles" / "memes" / "config.toml").write_text(
-        f'ollama_url = "http://127.0.0.1:{port}"\nmodel = "{MODEL}"\n'
+        backend_config(port) + f'model = "{MODEL}"\n'
     )
     out = c25.run("--profile", "memes", "status")
     check("1 photo" in out, "profile config.toml replaces base config")
@@ -1813,7 +1834,7 @@ def main() -> int:
         def fresh_cli37(name: str, extra: str = "") -> CLI:
             cfgp = work / f"config-{name}.toml"
             cfgp.write_text(
-                f'ollama_url = "http://127.0.0.1:{port37}"\n'
+                backend_config(port37) +
                 f'model = "{MODEL}"\n'
                 f'db_path = "{work}/db-{name}.db"\n' + extra
             )
@@ -1983,7 +2004,7 @@ def main() -> int:
     try:
         cfg39 = work / "config-faces.toml"
         cfg39.write_text(
-            f'ollama_url = "http://127.0.0.1:{port39}"\n'
+            backend_config(port39) +
             f'model = "{MODEL}"\n'
             f'db_path = "{work}/db-faces.db"\n'
             "person_min_confidence = 0.6\n"
@@ -2076,7 +2097,7 @@ def main() -> int:
     try:
         cfg40 = work / "config-surrogates.toml"
         cfg40.write_text(
-            f'ollama_url = "http://127.0.0.1:{port40}"\n'
+            backend_config(port40) +
             f'model = "{MODEL}"\n'
             f'db_path = "{work}/db-surrogates.db"\n'
         )
@@ -2156,7 +2177,7 @@ def main() -> int:
     seam_entries(vanish_path, True, ghost_path)
     cloud_cfg = work / "config-clouddb.toml"
     cloud_cfg.write_text(
-        f'ollama_url = "http://127.0.0.1:{port}"\n'
+        backend_config(port) +
         f'model = "{MODEL}"\n'
         f'db_path = "{cloud_dir}/catalog.db"\n'
         "face_detection = false\n"
@@ -2350,7 +2371,7 @@ def main() -> int:
     ah.close()
     iph_cfg = work / "config-iphoto-hidden.toml"
     iph_cfg.write_text(
-        f'ollama_url = "http://127.0.0.1:{port}"\n'
+        backend_config(port) +
         f'model = "{MODEL}"\n'
         f'db_path = "{iph_dir}/catalog.db"\n'
     )
@@ -2391,7 +2412,7 @@ def main() -> int:
     try:
         cfg43 = work / "config-trickle.toml"
         cfg43.write_text(
-            f'ollama_url = "http://127.0.0.1:{port43}"\n'
+            backend_config(port43) +
             f'model = "{MODEL}"\n'
             f'db_path = "{work}/db-trickle.db"\n'
             "request_timeout_s = 2\n"
@@ -2433,7 +2454,7 @@ def main() -> int:
         def fresh_cli44(name: str, extra: str = "") -> CLI:
             cfgp = work / f"config-{name}.toml"
             cfgp.write_text(
-                f'ollama_url = "http://127.0.0.1:{port44}"\n'
+                backend_config(port44) +
                 f'model = "{MODEL}"\n'
                 f'db_path = "{work}/db-{name}.db"\n' + extra
             )
@@ -2503,7 +2524,7 @@ def main() -> int:
         seam44.write_text(json.dumps([["D-1", None, False]]))
         cfg44d = work / "config-deriv44.toml"
         cfg44d.write_text(
-            f'ollama_url = "http://127.0.0.1:{port44}"\n'
+            backend_config(port44) +
             f'model = "{MODEL}"\n'
             f'db_path = "{deriv44_dir}/catalog.db"\n'
             "process_derivatives = false\n"
@@ -2536,7 +2557,7 @@ def main() -> int:
         dead_port = free_port()
         cfg44e = work / "config-dead44.toml"
         cfg44e.write_text(
-            f'ollama_url = "http://127.0.0.1:{dead_port}"\n'
+            backend_config(dead_port) +
             f'model = "{MODEL}"\n'
             f'db_path = "{work}/db-dead44.db"\n'
             "transport_retries = 1\ntransport_backoff_s = 1\n"
@@ -2570,7 +2591,7 @@ def main() -> int:
         def fresh_cli45(name: str, extra: str = "") -> CLI:
             cfgp = work / f"config-{name}.toml"
             cfgp.write_text(
-                f'ollama_url = "http://127.0.0.1:{port45}"\n'
+                backend_config(port45) +
                 f'model = "{MODEL}"\n'
                 f'db_path = "{work}/db-{name}.db"\n' + extra
             )
@@ -2681,7 +2702,7 @@ def main() -> int:
         def fresh_cli46(name: str, extra: str = "") -> CLI:
             cfgp = work / f"config-{name}.toml"
             cfgp.write_text(
-                f'ollama_url = "http://127.0.0.1:{port46}"\n'
+                backend_config(port46) +
                 f'model = "{MODEL}"\n'
                 f'db_path = "{work}/db-{name}.db"\n'
                 f'embed_model = "nomic-mock"\n'
@@ -2771,7 +2792,7 @@ def main() -> int:
         # no embed_model: semantic search errors
         cfg46n = work / "config-noemb46.toml"
         cfg46n.write_text(
-            f'ollama_url = "http://127.0.0.1:{port46}"\n'
+            backend_config(port46) +
             f'model = "{MODEL}"\n'
             f'db_path = "{work}/db-noemb46.db"\n'
             "face_detection = false\n"
@@ -2791,7 +2812,7 @@ def main() -> int:
     side47_dir.mkdir()
     cfg47 = work / "config-side47.toml"
     cfg47.write_text(
-        f'ollama_url = "http://127.0.0.1:{port}"\n'
+        backend_config(port) +
         f'model = "{MODEL}"\n'
         f'db_path = "{side47_dir}/catalog.db"\n'
         "face_detection = false\n"

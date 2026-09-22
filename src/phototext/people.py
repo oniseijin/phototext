@@ -24,9 +24,9 @@ from .config import Config, ensure_noindex
 from .faces import MAX_FACES as PERSON_MAX_FACES
 from .faces import detect_faces, vision_problem
 from .imaging import ImageReadError, crop_jpeg, prepare_image
+from .clients import make_client
 from .ollama_client import (
     ModelOutputError,
-    OllamaClient,
     OllamaServerError,
     OllamaTimeout,
     OllamaUnreachable,
@@ -129,7 +129,7 @@ def build_description(
             "`phototext people name <photo-id> <name>`"
         )
     if client is None:
-        client = OllamaClient(cfg)
+        client = make_client(cfg)
     raw, _content = client.describe_person(crops)
     description = " ".join(str(raw.get("description") or "").split())[:1500].strip()
     if not description:
@@ -188,7 +188,7 @@ def run_matching(
     person_cfg = cfg
     if model:
         person_cfg = replace(person_cfg, person_model=model)
-    client = OllamaClient(person_cfg)
+    client = make_client(person_cfg)
     # People without a recognition profile get one before the pass; a
     # person with no profile at all cannot be matched.
     for person in selected:
