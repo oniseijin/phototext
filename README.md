@@ -18,6 +18,20 @@ up exactly where it left off. Nothing is ever written into your photo library.
 A full [web UI tour with screenshots](docs/web-ui.md) — search, people,
 memes, duplicates, trash, and the three [themes](docs/themes.md).
 
+## Why this exists
+
+My Photos library had years of screenshots-of-text — receipts, quotes,
+snippets — saved to find later and never findable again. Getting the text
+out started as a small weekend script; the script got out of hand, and
+this project is what it grew into. Somewhere along the way the
+interesting part became the tooling itself — local vision LLMs,
+structured extraction, crash-safe pipelines — and a running assessment of
+what current AI-assisted development can actually carry when a project
+outgrows its weekend. It was built during Silver Week, courtesy of a
+typhoon that closed the golf course; see also
+[video-security](https://github.com/oniseijin/video-security), its
+companion project from the same storm.
+
 ## How it works
 
 ```mermaid
