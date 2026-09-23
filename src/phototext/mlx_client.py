@@ -76,6 +76,10 @@ class MlxClient:
         state to respect (unlike single-resident Ollama)."""
         return []
 
+    def unload(self, model: str) -> None:
+        """No-op: mlx-serve keeps residency under its own LRU/budget rules."""
+        return None
+
     def preflight(self) -> list[str]:
         try:
             models = self.check_connection()

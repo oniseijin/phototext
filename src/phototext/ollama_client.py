@@ -250,6 +250,17 @@ class OllamaClient:
             content = self._chat(retry_payload)
             return parse_model_json(content), content
 
+    def unload(self, model: str) -> None:
+        """Ask Ollama to drop a model from memory (best effort)."""
+        try:
+            requests.post(
+                f"{self.base_url}/api/generate",
+                json={"model": model, "keep_alive": 0},
+                timeout=self.timeout,
+            )
+        except requests.RequestException:
+            pass
+
     def embed(self, texts: list[str]) -> list[list[float]]:
         payload = {"model": self.cfg.embed_model, "input": texts}
         try:
@@ -279,6 +290,7 @@ class OllamaClient:
         # socket timeout, so a server that trickles bytes can keep a call
         # open forever even with request_timeout_s set. The budget below
         # bounds the whole call — headers, body, and the 400-think retry.
+        payload.setdefault("keep_alive", "30m")
         try:
             started = time.monotonic()
             resp = requests.post(

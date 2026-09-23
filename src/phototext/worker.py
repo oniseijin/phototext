@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import os
+import shutil
 import warnings
 import re
 import signal
@@ -30,6 +32,57 @@ _UNIT_SECONDS = {"d": 86400.0, "h": 3600.0, "m": 60.0, "s": 1.0}
 
 class RunAborted(Exception):
     pass
+
+
+def caffeinate():
+    """Keep the Mac awake while the run works (darwin, best effort).
+
+    `caffeinate -s -i -w <pid>` prevents system sleep while our process
+    tree exists and dies with us — an overnight run must not sleep
+    mid-flight.
+    """
+    @contextlib.contextmanager
+    def _guard():
+        proc = None
+        if sys.platform == "darwin" and shutil.which("caffeinate"):
+            try:
+                proc = subprocess.Popen(
+                    ["caffeinate", "-s", "-i", "-w", str(os.getpid())],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except OSError:
+                proc = None
+        try:
+            yield proc is not None
+        finally:
+            if proc is not None:
+                with contextlib.suppress(OSError):
+                    proc.terminate()
+    return _guard()
+
+
+def _on_battery() -> bool:
+    """True on a MacBook running off battery (darwin, best effort)."""
+    if sys.platform != "darwin":
+        return False
+    try:
+        out = subprocess.run(
+            ["pmset", "-g", "batt"], capture_output=True, text=True, timeout=5,
+        ).stdout.lower()
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return "discharging" in out
+
+
+def _disk_warning(db_path) -> str | None:
+    try:
+        free = shutil.disk_usage(Path(db_path).expanduser().parent).free
+    except OSError:
+        return None
+    if free < 1024 ** 3:
+        return f"warning: only {free / 1024 ** 3:.1f} GiB free on the catalog volume"
+    return None
 
 
 def parse_duration(text: str) -> float:
@@ -136,12 +189,21 @@ def run_pipeline(
             return 1
     deadline = time.monotonic() + parse_duration(stop_after) if stop_after else None
     print(f"Processing {queued} photo(s) with model '{effective.model}'...")
+    disk_warn = _disk_warning(cfg.db_path)
+    if disk_warn:
+        print(disk_warn)
+    if _on_battery():
+        print("warning: running on battery — a long run may sleep mid-flight")
+        
     exit_code = 0
     if workers > 1:
-        exit_code = _run_multi(
-            cfg, model, workers, watch, watch_interval_s, deadline, controller,
-            slice_spec, config_path,
-        )
+        with caffeinate():
+            exit_code = _run_multi(
+                cfg, model, workers, watch, watch_interval_s, deadline, controller,
+                slice_spec, config_path,
+            )
+        if exit_code == 0:
+            _unload_used(client, effective)
         counts = db.status_counts(conn)
         print(f"Catalog now: {_summary(counts)}")
         print("Inspect results: phototext results    |    Progress: phototext status")
@@ -149,62 +211,79 @@ def run_pipeline(
     processed = 0
     failed = 0
     watching_announced = False
-    while True:
-        if controller.stop:
-            print("Stopped by user. Progress is saved; run again to continue.")
-            break
-        if deadline is not None and time.monotonic() >= deadline:
-            print("Stopped: time budget reached. Progress is saved; run again to continue.")
-            break
-        if limit is not None and processed >= limit:
-            print(f"Stopped: --limit {limit} reached. Run again to continue.")
-            break
-        if effective.idle_detection:
-            try:
-                if not _wait_while_busy(client, effective, controller):
-                    print("Stopped by user while paused. Progress is saved; run again to continue.")
+    with caffeinate():
+        while True:
+            if controller.stop:
+                print("Stopped by user. Progress is saved; run again to continue.")
+                break
+            if deadline is not None and time.monotonic() >= deadline:
+                print("Stopped: time budget reached. Progress is saved; run again to continue.")
+                break
+            if limit is not None and processed >= limit:
+                print(f"Stopped: --limit {limit} reached. Run again to continue.")
+                break
+            if effective.idle_detection:
+                try:
+                    if not _wait_while_busy(client, effective, controller):
+                        print("Stopped by user while paused. Progress is saved; run again to continue.")
+                        break
+                except RunAborted as e:
+                    print(f"aborted: {e}")
+                    print("Nothing was lost: unfinished items stay queued. Start Ollama and run again.")
+                    exit_code = 1
                     break
+            row = db.claim_next(conn, recent_first=cfg.recent_first)
+            if row is None:
+                if not watch:
+                    print(f"Queue drained: {processed} processed, {failed} failed this run.")
+                    break
+                if not watching_announced:
+                    watching_announced = True
+                    n_sources = len(db.get_sources(conn))
+                    print(
+                        f"Watching {n_sources} source(s) for new photos "
+                        f"(checking every {watch_interval_s}s; Ctrl+C to stop)"
+                    )
+                newly = _watch_scan(conn, slice_spec, cfg.process_derivatives, ocr_enabled=cfg.vision_ocr)
+                if newly:
+                    print(f"watch: {newly} new photo(s) queued")
+                    continue
+                if not _watch_wait(watch_interval_s, deadline, controller):
+                    break
+                continue
+            try:
+                outcome = _process_item(conn, client, effective, row, controller, processed + 1, queued)
             except RunAborted as e:
                 print(f"aborted: {e}")
                 print("Nothing was lost: unfinished items stay queued. Start Ollama and run again.")
                 exit_code = 1
                 break
-        row = db.claim_next(conn, recent_first=cfg.recent_first)
-        if row is None:
-            if not watch:
-                print(f"Queue drained: {processed} processed, {failed} failed this run.")
+            if outcome == "stopped":
+                print("Stopped by user. Progress is saved; run again to continue.")
                 break
-            if not watching_announced:
-                watching_announced = True
-                n_sources = len(db.get_sources(conn))
-                print(
-                    f"Watching {n_sources} source(s) for new photos "
-                    f"(checking every {watch_interval_s}s; Ctrl+C to stop)"
-                )
-            newly = _watch_scan(conn, slice_spec, cfg.process_derivatives, ocr_enabled=cfg.vision_ocr)
-            if newly:
-                print(f"watch: {newly} new photo(s) queued")
-                continue
-            if not _watch_wait(watch_interval_s, deadline, controller):
-                break
-            continue
-        try:
-            outcome = _process_item(conn, client, effective, row, controller, processed + 1, queued)
-        except RunAborted as e:
-            print(f"aborted: {e}")
-            print("Nothing was lost: unfinished items stay queued. Start Ollama and run again.")
-            exit_code = 1
-            break
-        if outcome == "stopped":
-            print("Stopped by user. Progress is saved; run again to continue.")
-            break
-        processed += 1
-        if outcome == "error":
-            failed += 1
+            processed += 1
+            if outcome == "error":
+                failed += 1
+    if exit_code == 0:
+        _unload_used(client, effective)
     counts = db.status_counts(conn)
     print(f"Catalog now: {_summary(counts)}")
     print("Inspect results: phototext results    |    Progress: phototext status")
     return exit_code
+
+
+def _unload_used(client, cfg: Config) -> None:
+    """Free model memory at a clean run end (nightly runs should not hold
+    VRAM until morning). Transport errors are ignored."""
+    try:
+        if cfg.model:
+            client.unload(cfg.model)
+            print(f"unloaded model {cfg.model} (frees memory)")
+        if cfg.two_tier and cfg.prefilter_model and cfg.prefilter_model != cfg.model:
+            client.unload(cfg.prefilter_model)
+            print(f"unloaded model {cfg.prefilter_model} (frees memory)")
+    except Exception:
+        pass
 
 
 def _watch_scan(

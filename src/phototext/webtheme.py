@@ -768,6 +768,243 @@ _THEME_TOGGLE = """\
 # THEME_CSS  — the complete compiled stylesheet
 # ---------------------------------------------------------------------------
 
+_LIGHTBOX_CSS = """\
+.lightbox {
+  display: none;
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  background: rgba(0, 0, 0, 0.85);
+  padding: 2rem;
+  cursor: zoom-out;
+  overflow: hidden;
+}
+.lightbox.open { display: flex; align-items: center; justify-content: center; }
+.lightbox-frame {
+  position: relative;
+  padding: 1rem;
+  color: var(--pt-ink);
+  border: 1px solid var(--pt-frame-edge);
+}
+.lightbox-frame::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  --c: 24px;
+  --b: 2px solid currentColor;
+  background:
+    linear-gradient(currentColor, currentColor) 0 0 / var(--c) var(--b) no-repeat,
+    linear-gradient(currentColor, currentColor) 0 0 / var(--b) var(--c) no-repeat,
+    linear-gradient(currentColor, currentColor) 100% 0 / var(--c) var(--b) no-repeat,
+    linear-gradient(currentColor, currentColor) 100% 0 / var(--b) var(--c) no-repeat,
+    linear-gradient(currentColor, currentColor) 0 100% / var(--c) var(--b) no-repeat,
+    linear-gradient(currentColor, currentColor) 0 100% / var(--b) var(--c) no-repeat,
+    linear-gradient(currentColor, currentColor) 100% 100% / var(--c) var(--b) no-repeat,
+    linear-gradient(currentColor, currentColor) 100% 100% / var(--b) var(--c) no-repeat;
+  filter: var(--pt-frame-glow);
+}
+.lightbox-zoom {
+  position: relative;
+  width: fit-content;
+  margin: 0 auto;
+  transform-origin: 50% 50%;
+}
+.lightbox-frame img {
+  display: block;
+  max-width: 92vw;
+  max-height: 80vh;
+  width: auto;
+  height: auto;
+  cursor: default;
+}
+.lightbox-zoom img.zoomed { cursor: grab; }
+.lightbox-zoom img.dragging { cursor: grabbing; }
+.lightbox-controls {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.6rem;
+}
+.lightbox-controls button {
+  font-family: var(--pt-font-mono);
+  font-size: 0.6875rem;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+  color: var(--pt-ink-dim);
+  background: transparent;
+  border: 1px solid var(--pt-line);
+  padding: 0.2rem 0.6rem;
+  cursor: pointer;
+}
+.lightbox-controls button:hover {
+  color: var(--pt-accent);
+  border-color: var(--pt-accent);
+}
+.lb-level {
+  font-family: var(--pt-font-mono);
+  font-size: 0.6875rem;
+  color: var(--pt-ink-faint);
+  min-width: 3.5rem;
+  text-align: center;
+}
+.lightbox-caption {
+  font-family: var(--pt-font-mono);
+  font-size: 0.75rem;
+  color: var(--pt-ink-dim);
+  margin: 0.6rem 0 0;
+  text-align: center;
+}
+"""
+
+LIGHTBOX_JS = """\
+(function () {
+  var box = document.getElementById('lightbox');
+  if (!box) return;
+  var frame = box.querySelector('.lightbox-frame');
+  var zoomEl = box.querySelector('.lightbox-zoom');
+  var img = zoomEl.querySelector('img');
+  var cap = box.querySelector('.lightbox-caption');
+  var level = box.querySelector('.lb-level');
+  var imgs = Array.prototype.slice.call(
+    document.querySelectorAll('.detail img:not(#pickimg)')
+  ).filter(function (el) { return !el.closest('#lightbox'); });
+  var current = -1;
+  var scale = 1;
+  var tx = 0;
+  var ty = 0;
+  var dragging = false;
+  var lx = 0;
+  var ly = 0;
+
+  function apply() {
+    if (scale < 1) { scale = 1; }
+    if (scale <= 1) { tx = 0; ty = 0; }
+    zoomEl.style.transform =
+      'translate(' + tx + 'px, ' + ty + 'px) scale(' + scale + ')';
+    if (level) { level.textContent = Math.round(scale * 100) + '%'; }
+    img.classList.toggle('zoomed', scale > 1);
+  }
+
+  function reset() {
+    scale = 1;
+    tx = 0;
+    ty = 0;
+    apply();
+  }
+
+  function open(i) {
+    var src = imgs[i];
+    if (!src) return;
+    img.src = src.src;
+    var fig = src.closest('figure');
+    var capText = '';
+    if (fig) {
+      var tag = fig.querySelector('.designation');
+      capText = tag ? tag.textContent : '';
+    }
+    cap.textContent = capText || (src.alt || '');
+    box.classList.add('open');
+    box.setAttribute('aria-hidden', 'false');
+    document.body.style.overflow = 'hidden';
+    current = i;
+    reset();
+  }
+
+  function close() {
+    box.classList.remove('open');
+    box.setAttribute('aria-hidden', 'true');
+    document.body.style.overflow = '';
+    current = -1;
+  }
+
+  function zoomBy(factor, clientX, clientY) {
+    var s0 = scale;
+    var s1 = Math.min(8, Math.max(1, s0 * factor));
+    if (s1 === s0) { return; }
+    var cx = 0;
+    var cy = 0;
+    if (clientX !== undefined) {
+      var rect = zoomEl.getBoundingClientRect();
+      cx = clientX - (rect.left + rect.width / 2);
+      cy = clientY - (rect.top + rect.height / 2);
+    }
+    tx -= (cx / s0) * (s1 - s0);
+    ty -= (cy / s0) * (s1 - s0);
+    scale = s1;
+    apply();
+  }
+
+  imgs.forEach(function (el, i) {
+    el.addEventListener('click', function (e) {
+      e.preventDefault();
+      open(i);
+    });
+  });
+
+  box.addEventListener('click', function (e) {
+    if (e.target === box || e.target === frame || e.target === zoomEl) {
+      close();
+    }
+  });
+  img.addEventListener('click', function (e) {
+    e.stopPropagation();
+  });
+  box.addEventListener('wheel', function (e) {
+    if (current < 0) { return; }
+    e.preventDefault();
+    zoomBy(e.deltaY < 0 ? 1.25 : 0.8, e.clientX, e.clientY);
+  }, { passive: false });
+
+  Array.prototype.slice.call(box.querySelectorAll('[data-zoom]')).forEach(
+    function (btn) {
+      btn.addEventListener('click', function (e) {
+        e.stopPropagation();
+        var mode = btn.getAttribute('data-zoom');
+        if (mode === 'in') { zoomBy(1.25); }
+        else if (mode === 'out') { zoomBy(0.8); }
+        else { reset(); }
+      });
+    }
+  );
+
+  img.addEventListener('dblclick', function () {
+    scale = scale > 1 ? 1 : 2.5;
+    tx = 0;
+    ty = 0;
+    apply();
+  });
+  img.addEventListener('mousedown', function (e) {
+    if (scale <= 1) { return; }
+    e.preventDefault();
+    dragging = true;
+    lx = e.clientX;
+    ly = e.clientY;
+    img.classList.add('dragging');
+  });
+  document.addEventListener('mousemove', function (e) {
+    if (!dragging) { return; }
+    tx += e.clientX - lx;
+    ty += e.clientY - ly;
+    lx = e.clientX;
+    ly = e.clientY;
+    apply();
+  });
+  document.addEventListener('mouseup', function () {
+    dragging = false;
+    img.classList.remove('dragging');
+  });
+
+  document.addEventListener('keydown', function (e) {
+    if (current < 0) return;
+    if (e.key === 'Escape') close();
+    if (e.key === 'ArrowRight') open((current + 1) % imgs.length);
+    if (e.key === 'ArrowLeft') open((current - 1 + imgs.length) % imgs.length);
+  });
+})();
+"""
+
 THEME_CSS: str = (
     _FONTS
     + "\n\n"
@@ -790,6 +1027,8 @@ THEME_CSS: str = (
     + _REDUCED_MOTION
     + "\n"
     + _PRINT
+    + "\n"
+    + _LIGHTBOX_CSS
 )
 
 

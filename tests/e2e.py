@@ -2949,6 +2949,10 @@ def main() -> int:
         d = requests.get(base48 + f"/photo/{photo48}", timeout=5)
         check("<figure class='subject'>" in d.text, "detail image is a subject frame")
         check("class='designation'" in d.text, "designation tag renders on detail")
+        check(
+            "id='lightbox'" in d.text and "lightbox-zoom" in d.text,
+            "detail page carries the lightbox",
+        )
         fr = requests.get(base48 + "/fonts/barlow-semi-condensed-400.woff2", timeout=5)
         check(fr.status_code == 200, "font file serves")
         check(

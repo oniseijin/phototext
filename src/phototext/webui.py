@@ -708,6 +708,20 @@ def render_detail(conn: sqlite3.Connection, photo_id: int, ctx: dict | None = No
             f"<figure class='subject{tone}'>{designation}"
             f"<img src='/image/{photo_id}' alt='photo {photo_id}'></figure>"
         )
+        body += (
+            "<div id='lightbox' class='lightbox' aria-hidden='true'>"
+            "<div class='lightbox-frame'>"
+            "<div class='lightbox-zoom'><img alt=''></div>"
+            "<div class='lightbox-controls'>"
+            "<button type='button' data-zoom='out' aria-label='Zoom out'>-</button>"
+            "<span class='lb-level'>100%</span>"
+            "<button type='button' data-zoom='in' aria-label='Zoom in'>+</button>"
+            "<button type='button' data-zoom='reset' aria-label='Reset zoom'>Reset</button>"
+            "</div>"
+            "<p class='lightbox-caption'></p>"
+            "</div></div>"
+            f"<script>{webtheme.LIGHTBOX_JS}</script>"
+        )
     body += photos_link
     body += "<div class='meta'>"
     body += f"<table>{meta}</table>"
