@@ -310,9 +310,10 @@ mlx-serve (`gemma-4-e4b-it-4bit`, same machine, same 2h45m nightly window):
   against `tests/mock_mlx.py` (a mock OpenAI-compatible server); suite
   green on both providers.
 
-### 0.9.0 — PoI themes, lightbox, run reliability (planned)
+### 0.9.0 — PoI themes, lightbox, run reliability (in progress)
 
-Port of the Person of Interest design system from the sibling
+Theme system **implemented** on branch `poi-themes` (runtime items below
+still pending). Port of the Person of Interest design system from the sibling
 `video-security` app (its single source of truth: `report_theme.py`),
 plus the runtime niceties worth taking from the same codebase. Decisions
 below are locked (see decision log entries).
@@ -521,7 +522,14 @@ below are locked (see decision log entries).
   card reads as "tracking"; forty read as wallpaper), mono snippets carry
   the text-is-the-product identity into the grid, and the duplicates view
   gets semantic KEEP/DERIVATIVE designations — the one place grid-level
-  brackets carry meaning.
+  brackets carry meaning. (Implementation deviations, accepted: Barlow
+  Semi Condensed has no published variable woff2 on any reachable mirror,
+  so it ships as three static latin weights — JetBrains Mono stays
+  variable; four near-identical icloud grays were consolidated into
+  ink/nav tokens with icloud keeping its exact old values, and the 6px/12px
+  radii became `radius-sm`/`radius-pill` tokens; all PoI treatments are
+  gated behind `html[data-theme='machine'/'samaritan']` selectors so icloud
+  renders unchanged, and e2e [48] gates color literals out of webui.py.)
 - **Provider overlay, not parallel configs** (user decision, 0.8.0):
   `provider` selects the backend, but model names stay single-keyed — the
   base values are the ollama tags and a `[mlx-serve]` table overlays them

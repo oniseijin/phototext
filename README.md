@@ -235,6 +235,24 @@ chips too. A **Duplicates** tab groups resized/re-encoded copies of the
 same photo (iCloud preview proxies excluded) with the largest file marked
 "keep".
 
+### Themes
+
+The sidebar carries a theme switch with three looks: **iCloud** (the
+default — the layout above), **Machine** and **Samaritan** — the
+surveillance-console aesthetic from *Person of Interest* (black + neon red
+scanlines and glowing corner brackets; white + red with hairline frames
+respectively). The choice is saved per browser; a `web_theme` value in the
+config sets the server default. PoI themes restyle the whole chrome
+(uppercase condensed type, mono captions, terminal-styled recovered text)
+and add hover-acquisition brackets on grid cards; photo detail pages get
+bracketed subject frames with designation tags, and the duplicates view
+marks its keep suggestion accordingly. The REC dot next to the brand
+pulses while the processing queue is active.
+
+Theme fonts (Barlow Semi Condensed, JetBrains Mono) are self-hosted under
+SIL OFL — license texts ship in `src/phototext/fonts/` — so the UI stays
+fully offline.
+
 ## Long runs and resume
 
 - Ctrl+C (or SIGTERM) stops gracefully after the current photo; a second Ctrl+C

@@ -4,6 +4,29 @@ All notable changes to phototext are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 semantic versioning.
 
+## [Unreleased]
+
+### Added
+
+- Web UI theme system (`src/phototext/webtheme.py`): three themes — iCloud
+  (default), **Machine** and **Samaritan** (Person of Interest
+  surveillance aesthetic) — via CSS custom properties + `data-theme`
+  attribute, a no-FOUC restore script, and a sidebar toggle; per-browser
+  choice persists in `localStorage`, and a `web_theme` config value sets
+  the server default.
+- Self-hosted theme fonts (Barlow Semi Condensed + JetBrains Mono, SIL
+  OFL; licenses bundled) served from `/fonts/` — the PoI themes work fully
+  offline.
+- PoI element treatments: bracketed subject frames with designation tags
+  on photo detail pages and person page headers, terminal-styled recovered
+  text, hover-acquisition brackets on grid cards (machine), hairline card
+  frames (samaritan), mono snippet captions, and a semantic REC dot that
+  pulses while the queue is active.
+- Duplicates view: keep suggestion carries a PoI `KEEP` designation;
+  derivatives get a `derivative` badge.
+- E2E section [48] (theme tokens parity, toggle, no-FOUC ordering, fonts
+  route + traversal guard, config default, color-literal gate).
+
 ## [0.8.0] - 2026-09-22
 
 ### Added

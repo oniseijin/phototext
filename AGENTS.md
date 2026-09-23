@@ -56,6 +56,9 @@ src/phototext/
   scanner.py       source resolution, walk, dedup, fast path, EXIF
                    date_taken at registration, Slice filters; Photos
                    library scan (asset map, offload demote, hidden sync)
+  webtheme.py     PoI theme system: TOKENS ×3 (icloud default, machine,
+                   samaritan), `--pt-*` CSS variables, no-FOUC restore JS,
+                   3-state toggle; self-hosted OFL fonts under fonts/
   webui.py         read-only local web UI (http.server): iCloud-style sidebar
                    chrome (Library/Discover/Utilities + filter groups),
                    browse/search/detail, year timeline, thumbnails, people
@@ -243,6 +246,18 @@ tests/
   (hamming <= 4) and `exclude_derivatives=True` so iCloud previews never
   pair with their originals; the memes view keeps derivatives. Read-only
   like everything else.
+- **Web themes** (`webtheme.py`): three looks — icloud (default, visually
+  the pre-0.9.0 UI), machine/samaritan (PoI) — as `--pt-*` CSS custom
+  properties switched by the `data-theme` attribute on `<html>`, restored
+  before first paint by a no-FOUC script (`pt-theme` localStorage,
+  `web_theme` config sets the server default, browser choice wins).
+  PoI-only treatments (subject brackets, designations, scanlines,
+  hover-acquisition cards, mono captions) are gated to
+  `html[data-theme='machine'/'samaritan']` selectors so icloud stays
+  pixel-identical; keep it that way — new chrome must be theme-tokenized,
+  never hardcoded (e2e [48] gates color literals out of webui.py). Fonts
+  are self-hosted OFL woff2 under `src/phototext/fonts/` served at
+  `/fonts/` (traversal-guarded, immutable cache).
 
 ## Testing rules
 
@@ -282,7 +297,10 @@ tests/
   fixtures since real Vision reads PIL text), embeddings ([46]: embed
   missing-only and --all, semantic hit with zero FTS overlap, similar,
   error paths), and sidebar scaling ([47]: pinned nav, collapsible fgroups,
-  filter boxes past 8 people/categories); the ops batch ([21] extensions
+  filter boxes past 8 people/categories); the theme system ([48]: token
+  parity, toggle + no-FOUC ordering, fonts route + traversal guard,
+  web_theme config default, and the no-color-literals gate on webui.py);
+  the ops batch ([21] extensions
   and [15]): v14 migration rewind + true-case repair from paths, raw-case
   asset storage, web bulk-delete (hidden-only and search scopes, token/
   400/404 gates, multiple-asset-row link survival), purge cache cleanup,
