@@ -1,9 +1,10 @@
 # phototext
 
-Recover text from your photos using a local Ollama vision model. phototext scans an
-iPhoto/Photos library (or any folder), sends each photo to a local vision LLM
-(e.g. `gemma4:12b`), and stores the extracted text plus a short description of each
-photo in a local SQLite catalog.
+Recover text from your photos using a local vision LLM. phototext scans an
+iPhoto/Photos library (or any folder), sends each photo to a local LLM server —
+Ollama (e.g. `gemma4:12b`) or mlx-serve (e.g. `gemma-4-e4b-it-4bit`) — and
+stores the extracted text plus a short description of each photo in a local
+SQLite catalog.
 
 It is built for long, interruptible runs: stop it anytime, restart later, and it picks
 up exactly where it left off. Nothing is ever written into your photo library.
@@ -15,9 +16,9 @@ up exactly where it left off. Nothing is ever written into your photo library.
    are processed once.
 2. `run` claims queued photos one at a time, converts/downscales the image (HEIC,
    TIFF, PSD, old iPhoto-era formats, with a macOS `sips` fallback for anything
-   Pillow cannot read), and sends it to Ollama with a JSON-schema-constrained
-   prompt. The verbatim text, a context description, the text kind, and the language
-   are stored per photo.
+   Pillow cannot read), and sends it to the configured LLM backend (Ollama or
+   mlx-serve) with a JSON-schema-constrained prompt. The verbatim text, a
+   context description, the text kind, and the language are stored per photo.
 3. Everything lands in `~/.phototext/catalog.db` (SQLite). Inspect it with
    `phototext results`, `phototext status`, or plain SQL.
 
@@ -28,8 +29,11 @@ mid-run are automatically recovered on the next `run`.
 
 - macOS
 - Python 3.11+
-- [Ollama](https://ollama.com) running locally with a vision model
-  (default: `gemma4:12b`; any multimodal tag works)
+- One local LLM server with a vision model:
+  - [Ollama](https://ollama.com) — the default provider; any multimodal tag
+    works (e.g. `gemma4:12b`), or
+  - mlx-serve (Apple silicon, OpenAI-compatible) — e.g.
+    `mlx-community/gemma-4-e4b-it-4bit`
 
 ## Install
 
@@ -66,7 +70,7 @@ uv venv .venv && uv pip install -e .
 ## Quickstart
 
 ```bash
-.venv/bin/phototext doctor                        # check Ollama, model, vision, database
+.venv/bin/phototext doctor                        # check the LLM server, model, vision, database
 .venv/bin/phototext scan "~/Pictures/Old iPhoto Library.photolibrary"
 .venv/bin/phototext run --limit 5                 # small first test
 .venv/bin/phototext results --full                # see what was extracted
@@ -82,7 +86,7 @@ uv venv .venv && uv pip install -e .
 | `phototext status` | Counts, throughput, ETA, recent errors. |
 | `phototext results` | Show recent extractions (`--status done/error/all`, `--full` for untruncated text). |
 | `phototext search QUERY` | Full-text search (FTS5) over recovered text, context, and scan-time Vision OCR text; FTS5 syntax, phrases in double quotes. `--semantic` ranks by embedding similarity instead (`--person`, `--year`, `--date-from/--date-to` filters still apply). |
-| `phototext embed` | Build text embeddings for semantic search (needs `embed_model` in the config; `--all` re-embeds). |
+| `phototext embed` | Build text embeddings for semantic search via the configured provider (needs `embed_model` in the config; `--all` re-embeds). |
 | `phototext similar <photo-id>` | Nearest photos by embedding similarity. |
 | `phototext backfill-ocr` | Record macOS Vision OCR text for photos scanned before it existed (makes them searchable without the LLM pass). |
 | `phototext export` | Export results as JSONL or CSV (`--format jsonl\|csv`, `--status`, `--output`). |
@@ -109,7 +113,7 @@ uv venv .venv && uv pip install -e .
 | `phototext search --person NAME QUERY` | Full-text search within a person's tagged photos (`--year`, `--date-from/--date-to` narrow by capture date). |
 | `phototext migrate` | Apply pending catalog schema migrations (backs up the catalog first). |
 | `phototext serve` | Local web UI: browse photos + recovered text, search box (`--host`, `--port`, `--writable` for hide/delete actions). |
-| `phototext doctor` | Diagnose config, database, Ollama, model vision, and face detection support (prints the version first). |
+| `phototext doctor` | Diagnose config, database, LLM server, model vision, and face detection support (prints the version first). |
 | `phototext --version` | Print the installed version (`doctor` shows it too). |
 | `phototext autocomplete` | Install TAB completion for the `phototext` command into your shell profile (bash or zsh). |
 | `phototext profiles` | List named profiles (alternate catalogs) with photo counts. |
@@ -123,8 +127,8 @@ Useful `run` options:
 | `--limit 50` | Process at most N photos this run. |
 | `--model TAG` | Override the model for this run. |
 | `--no-scan` | Skip rescanning sources. |
-| `--skip-preflight` | Skip the Ollama startup check. |
-| `--no-idle-detection` | Do not pause while other models are loaded in Ollama. |
+| `--skip-preflight` | Skip the provider startup check. |
+| `--no-idle-detection` | Do not pause while other models are loaded (Ollama only; mlx-serve coexists via LRU). |
 | `--watch` | Keep running: watch sources for new photos and process them as they appear (`--watch-interval`). |
 | `--workers N` | Parallel worker processes (for parallel/remote inference backends; a single local model slot serializes anyway). |
 | `--two-tier` | Check each photo with the cheap prefilter model first; textless photos finish there in seconds with a short description and category. |
@@ -235,10 +239,11 @@ same photo (iCloud preview proxies excluded) with the largest file marked
 
 - Ctrl+C (or SIGTERM) stops gracefully after the current photo; a second Ctrl+C
   forces an immediate quit.
-- Idle detection: before each photo the run checks `/api/ps` and pauses while a
-  *different* model is loaded in Ollama (e.g. you are using a coding model),
-  resuming when it unloads. Disable with `idle_detection = false` or
-  `--no-idle-detection`.
+- Idle detection (Ollama only): before each photo the run checks `/api/ps` and
+  pauses while a *different* model is loaded (e.g. you are using a coding
+  model), resuming when it unloads. Disable with `idle_detection = false` or
+  `--no-idle-detection`. On mlx-serve this is a no-op — resident models
+  coexist under the server's LRU/memory rules.
 - Dense photos (receipts, signs) that the single-pass extraction cannot parse
   automatically fall back to **quadrant tiling**: the photo is split into four
   overlapping tiles cut from the original resolution (each tile gets the full
@@ -310,18 +315,46 @@ the profile's catalog.
 `~/.phototext/config.toml` is created with defaults on first use. CLI flags
 override it.
 
+### LLM backend (`provider`)
+
+`provider = "ollama"` (default) or `"mlx-serve"` picks the LLM backend. The
+base model names (`model`, `prefilter_model`, `person_model`, `embed_model`)
+are the ollama ones; a `[mlx-serve]` table overlays them when that provider is
+active, so switching is a one-line change and switching back restores the
+ollama names untouched:
+
+```toml
+provider  = "mlx-serve"
+mlx_url   = "http://127.0.0.1:11234"   # mlx-serve server (OpenAI-compatible)
+
+[mlx-serve]
+model           = "mlx-community/gemma-4-e4b-it-4bit"
+prefilter_model = "mlx-community/gemma-4-e4b-it-4bit"
+embed_model     = "mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ"
+```
+
+The mlx-serve client speaks the OpenAI-compatible API (`/v1/chat/completions`
+with image content parts and `json_schema` structured output,
+`/v1/embeddings`) and mirrors the Ollama client's behavior, retries, and
+exception types. Extraction results are model-agnostic — nothing needs
+reprocessing when you switch providers. Embeddings are stored per model
+(`photo_embeddings` is keyed by `photo_id, model`), so switching `embed_model`
+starts a fresh incremental set while search stays model-scoped.
+
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `ollama_url` | `http://localhost:11434` | Ollama server. |
-| `model` | `gemma4:12b` | Any vision-capable model tag. |
+| `provider` | `ollama` | LLM backend: `ollama` or `mlx-serve`. |
+| `ollama_url` | `http://localhost:11434` | Ollama server (provider `ollama`). |
+| `mlx_url` | `http://127.0.0.1:11234` | mlx-serve server, OpenAI-compatible (provider `mlx-serve`). |
+| `model` | `gemma4:12b` | Any vision-capable model tag (per-provider overlays apply). |
 | `max_image_edge` | `1024` | Longest image edge (px) sent to the model. Smaller is faster. |
 | `max_output_tokens` | `2048` | Cap on generated tokens per photo; bounds repetition loops. Dense documents are ~500-1000 tokens. |
 | `num_ctx` | `8192` | Model context window; image tokens count against it. |
 | `max_attempts` | `3` | Model-call attempts per photo before it is marked failed. |
 | `request_timeout_s` | `300` | HTTP timeout for one model call. |
-| `transport_retries` / `transport_backoff_s` | `3` / `30` | What to do if Ollama drops mid-run. |
-| `structured_output` | `true` | Ollama JSON-schema-constrained output; set `false` if the model struggles. |
-| `idle_detection` | `true` | Pause the run while a different model is loaded in Ollama (`/api/ps`). |
+| `transport_retries` / `transport_backoff_s` | `3` / `30` | What to do if the LLM server drops mid-run. |
+| `structured_output` | `true` | JSON-schema-constrained output on both providers; set `false` if the model struggles. |
+| `idle_detection` | `true` | Pause the run while a different model is loaded (Ollama `/api/ps`; no-op on mlx-serve). |
 | `idle_poll_s` | `15` | How often to re-check while paused. |
 | `lease_timeout_s` | `3600` | Multi-worker runs: reclaim photos from dead workers after this long. |
 | `two_tier` | `false` | Cheap prefilter model gates the full pass; textless photos finish at the gate. |
@@ -332,7 +365,7 @@ override it.
 | `person_min_confidence` | `0.6` | Model tags below this confidence wait in the review queue. |
 | `face_detection` | `true` | macOS Vision face detection for the people pass (skip faceless photos, match on face crops). |
 | `vision_ocr` | `true` | Free macOS Vision OCR at scan time into `vision_text` (FTS-indexed) so photos are searchable before the LLM pass; silent no-op without Vision. |
-| `embed_model` | *(empty)* | Ollama embedding model for semantic search (e.g. `nomic-embed-text`); empty disables `embed`/`--semantic`/`similar`. |
+| `embed_model` | *(empty)* | Embedding model for semantic search (e.g. `nomic-embed-text` on ollama, `mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ` on mlx-serve); empty disables `embed`/`--semantic`/`similar`. |
 | `prefilter_max_edge` | `512` | Image size for gate calls (smaller is faster). |
 | `max_image_pixels` | `357913941` | Hard decode budget per image (~357 MP). Suspected decompression bombs are recorded as errors — deliberately without the `sips` fallback. |
 | `db_path` | `~/.phototext/catalog.db` | SQLite catalog location. |
@@ -349,6 +382,10 @@ burns 1500-2000+ tokens on dense documents (4+ minutes per photo, with no
 transcription-quality gain) — OCR needs perception, not reasoning. If Ollama ever
 rejects that parameter, the client automatically retries without it.
 
+On mlx-serve with `mlx-community/gemma-4-e4b-it-4bit` the same machine runs at
+**~16 s per photo** — a measured 604 photos in a 2h45m nightly window vs 406
+(~24 s/photo) on Ollama `gemma4:12b`, ≈1.5× the throughput.
+
 For a big library, expect multi-day total run time. That is what the resume design
 is for: run it in spare cycles (`--stop-after 2h`) and let it accumulate. To go
 faster: lower `max_image_edge`, or use a smaller vision model via `--model`.
@@ -359,19 +396,27 @@ faster: lower `max_image_edge`, or use a smaller vision model via `--model`.
 .venv/bin/python tests/e2e.py
 ```
 
-Self-contained: spawns a mock Ollama server, generates a fake iPhoto-style
+Self-contained: spawns a mock server, generates a fake iPhoto-style
 library (with an apdb), and covers scanning/dedup, happy path, failures,
 retry, transport loss, crash recovery, budgets, SIGINT, doctor, sips fallback,
 full-text search, schema migration with backups, export, and slice scans
 (dates, limit, ids-file, album/favorites/UUID via the library database). No
 network or real library involved.
 
+The suite is provider-parameterized — it runs against `tests/mock_ollama.py`
+by default and against `tests/mock_mlx.py` (a mock OpenAI-compatible
+mlx-serve) with:
+
+```bash
+PHOTOTEXT_E2E_PROVIDER=mlx-serve .venv/bin/python tests/e2e.py
+```
+
 ## Troubleshooting
 
 | Symptom | Fix |
 | --- | --- |
-| `doctor`: server not reachable | Start Ollama (`ollama serve` or the app). |
-| `doctor`: model not present | `ollama pull gemma4:12b` or set `model` in the config. |
+| `doctor`: server not reachable | Start the LLM server: `ollama serve` (or the app), or your mlx-serve service. |
+| `doctor`: model not present | `ollama pull gemma4:12b` (or `mlx-serve pull <model-id>` and restart the server) or set `model` in the config. |
 | `doctor`: failed on test image | The model is not vision-capable; pick a multimodal tag. |
 | Scan finds nothing in a library | Grant Full Disk Access to your terminal app, then rescan. |
 | Some photos show as `error` | `phototext results --status error`, then `phototext retry`. |

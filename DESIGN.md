@@ -1,9 +1,10 @@
 # phototext — Design
 
 A local, resumable pipeline that scans photo sources (iPhoto/Photos libraries or
-folders), sends each photo to a local Ollama vision model, and stores extracted
-text plus photo context in a queryable SQLite catalog. Run it in spare cycles,
-stop anytime, restart later — it picks up exactly where it left off.
+folders), sends each photo to a local LLM server (Ollama or mlx-serve), and
+stores extracted text plus photo context in a queryable SQLite catalog. Run it
+in spare cycles, stop anytime, restart later — it picks up exactly where it left
+off.
 
 ## Use cases
 
@@ -45,7 +46,8 @@ stop anytime, restart later — it picks up exactly where it left off.
           claim -> prepare image (decode, EXIF-orient, downscale <= 1024px JPEG;
                     Pillow + pillow-heif, with macOS `sips` fallback for formats
                     Pillow cannot decode: old iPhoto formats, PSD, some RAW)
-               -> Ollama /api/chat (structured JSON output, temperature 0)
+                -> LLM backend (Ollama /api/chat or mlx-serve
+                   /v1/chat/completions; structured JSON output, temperature 0)
                -> normalize + store (text, context, text_kind, language,
                   model, raw_response, duration)
                               ▼
@@ -92,13 +94,20 @@ add a new version.
   `UPDATE ... WHERE status='queued'` guard).
 - Ctrl+C / SIGTERM: finish the current photo, commit, exit. Second signal force
   quits. `--stop-after` and `--limit` bound a run the same way.
-- Transport loss (Ollama down mid-run): pause-and-retry with backoff; if it stays
+- Transport loss (LLM server down mid-run): pause-and-retry with backoff; if it stays
   down, the current photo is requeued and the run exits nonzero — nothing is lost.
 - Model failures (HTTP 5xx, unparseable output): retried up to `max_attempts`
   (tracked in `attempts`), then `status='error'` with the message and any raw
   output. `phototext retry` requeues errors and resets attempts.
 
-## Ollama integration
+## LLM backends
+
+Two interchangeable server backends behind `make_client(cfg)` in
+`clients.py`; `provider = "ollama" | "mlx-serve"` picks one. Both run the
+same prompt/schema at temperature 0 with the same retries and failure
+semantics.
+
+### Ollama (`provider = "ollama"`, default)
 
 - `POST /api/chat` with base64 JPEG, `stream: false`, `format` = JSON schema
   (Ollama structured outputs; `temperature: 0`, `num_ctx: 8192`), and
@@ -108,6 +117,28 @@ add a new version.
   transcription-quality gain. Measured on the same image: thinking 1974+ tokens
   (incomplete after 4 min) vs `think: false` 152 tokens / 20.7 s with a perfect
   verbatim transcription.
+- Idle detection: before each photo the run checks `/api/ps` and pauses while
+  a *foreign* model is loaded (see decision log).
+
+### mlx-serve (`provider = "mlx-serve"`)
+
+- OpenAI-compatible API: `POST /v1/chat/completions` with base64 image
+  content parts + `response_format: json_schema`, `stream: false`,
+  `temperature: 0`; `POST /v1/embeddings` for semantic search; `/v1/models`
+  for residency checks. `think` is not sent (the server has no reasoning
+  toggle to disable).
+- `mlx_client.py` mirrors `OllamaClient`'s method surface (extract, gate,
+  describe_person, match_people, embed, preflight, loaded_models) and
+  *reuses its exception types and JSON parsing* — worker/retry/normalize
+  logic is untouched by the backend switch.
+- Idle-pause is a no-op here: mlx-serve keeps multiple models resident under
+  its own LRU/memory budget rules, so there is no single model slot to
+  yield.
+- Model names live in a `[mlx-serve]` config overlay on top of the base
+  (ollama) names — see the 0.8.0 decision-log entry.
+
+### Shared (both providers)
+
 - Preflight on `run` and in `doctor`: server reachable, model installed, and a
   16x16 test image returns usable JSON (catches non-vision models).
 - Prompt asks for **verbatim transcription** (preserve line breaks and reading
@@ -151,7 +182,7 @@ phototext serve [--host H] [--port P] # read-only web UI (browse/search/reveal)
 phototext retry                     # requeue failed photos
 phototext reprocess [--errors|--no-text|--tiled|--all|--ids-file F] [--model M]
                                      # requeue selected photos for re-extraction
-phototext doctor                    # config, db, ollama, model, vision checks
+phototext doctor                    # config, db, LLM server, model, vision checks
 ```
 
 Global: `--config PATH`, `--db PATH`. Config file `~/.phototext/config.toml`
@@ -167,8 +198,8 @@ default `~/.phototext` state.
 | Corrupt/undecodable image | `error` status with message; `sips` fallback tried first |
 | No-text photos | `has_text=false`, context still stored |
 | Photo file moved/deleted | `error` with "no readable file"; rescan updates locations |
-| Ollama down at start | preflight fails, nothing started, exit 1 |
-| Ollama drops mid-run | backoff retries; then requeue + exit 1 |
+| LLM server down at start | preflight fails, nothing started, exit 1 |
+| LLM server drops mid-run | backoff retries; then requeue + exit 1 |
 | Model output unparseable | retries, then `error` with raw output saved |
 | Duplicate photos | single result via content hash |
 | Library unreadable | warning + Full Disk Access hint |
@@ -184,6 +215,12 @@ At ~180 photos/hour, large libraries take days of accumulated run time — which
 the point of the resume design. Speed knobs: `max_image_edge`, a smaller vision
 model, `num_ctx`.
 
+mlx-serve (`gemma-4-e4b-it-4bit`, same machine, same 2h45m nightly window):
+- 604 photos (~16.4 s/photo) vs 406 (~24 s/photo) on Ollama `gemma4:12b` —
+  ≈1.5× the throughput on identical work
+- Models load on demand server-side; loads add ~30-60 s only when the server
+  cold-starts a model
+
 ## Milestones
 
 ### M1 — core pipeline (implemented)
@@ -194,7 +231,8 @@ model, `num_ctx`.
 - Resumable single-process worker; budgets; graceful stop; crash recovery
 - Ollama structured extraction, preflight, retries, transport-loss safety
 - `scan / run / status / results / retry / doctor`
-- Self-contained e2e suite (mock Ollama): `tests/e2e.py`
+- Self-contained e2e suite (mock Ollama; provider-parameterized since 0.8.0):
+  `tests/e2e.py`
 
 ### M2 — slices, search, export (implemented, 0.2.0)
 
@@ -248,6 +286,29 @@ model, `num_ctx`.
   in both directions, phototext's own hide/unhide verdicts always win
   (migration backfills existing hiddens as 'user'); iPhoto apdb hidden
   import best-effort via the adaptive reader.
+
+### 0.8.0 — mlx-serve backend (implemented)
+
+- **Provider selection**: `provider = "ollama" | "mlx-serve"` in the
+  config; `make_client(cfg)` (clients.py) is the single construction point
+  for worker/cli/people. Base model names stay the ollama tags; a
+  `[mlx-serve]` table overlays per-provider names (`model`,
+  `prefilter_model`, `person_model`, `embed_model`) at load — switching
+  back is a one-line flip with the ollama names intact.
+- **`mlx_client.py`** mirrors `OllamaClient`'s method surface and exception
+  types over the OpenAI-compatible API (`/v1/chat/completions` with image
+  content parts + `json_schema`, `/v1/embeddings`, `/v1/models`) — no
+  generic "LLMBackend" interface, each provider file stays independently
+  readable.
+- **No reprocessing on switch**: text/description results are model-agnostic;
+  `photos.model` records provenance. Embeddings are per-model
+  (`photo_embeddings` keyed by `(photo_id, model)`), so an `embed_model`
+  switch starts a fresh incremental set; search is model-scoped.
+- **Idle-pause is a no-op on mlx-serve** (models coexist under LRU/memory
+  rules — no `/api/ps` equivalent to poll).
+- **e2e parameterized**: `PHOTOTEXT_E2E_PROVIDER=mlx-serve` runs the suite
+  against `tests/mock_mlx.py` (a mock OpenAI-compatible server); suite
+  green on both providers.
 
 ### 0.9.0 — PoI themes, lightbox, run reliability (planned)
 
@@ -461,6 +522,17 @@ below are locked (see decision log entries).
   the text-is-the-product identity into the grid, and the duplicates view
   gets semantic KEEP/DERIVATIVE designations — the one place grid-level
   brackets carry meaning.
+- **Provider overlay, not parallel configs** (user decision, 0.8.0):
+  `provider` selects the backend, but model names stay single-keyed — the
+  base values are the ollama tags and a `[mlx-serve]` table overlays them
+  only while that provider is active. Rollback is flipping one line; the
+  ollama setup is never destructively edited. The mlx client deliberately
+  re-implements the ollama client's surface and exception types rather
+  than adapting both to a shared interface, so worker/retry/normalize logic
+  is untouched and each provider file stays independently readable.
+  Results are model-agnostic by construction (verbatim text + context +
+  `raw_response`), so provider switches never require reprocessing; only
+  embeddings are model-keyed and re-embed incrementally per model.
 - **keep_alive + unload, never evict** (user decision, 0.9.0): port
   video-security's warm-window (`keep_alive: "30m"`) and clean-shutdown
   model unload, but NOT its single-model-residency eviction —
