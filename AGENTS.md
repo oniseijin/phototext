@@ -58,7 +58,8 @@ src/phototext/
                    library scan (asset map, offload demote, hidden sync)
   webtheme.py     PoI theme system: TOKENS ×3 (icloud default, machine,
                    samaritan), `--pt-*` CSS variables, no-FOUC restore JS,
-                   3-state toggle; self-hosted OFL fonts under fonts/
+                   3-state toggle, zero-dep lightbox; self-hosted OFL
+                   fonts under fonts/
   webui.py         read-only local web UI (http.server): iCloud-style sidebar
                    chrome (Library/Discover/Utilities + filter groups),
                    browse/search/detail, year timeline, thumbnails, people
@@ -66,7 +67,9 @@ src/phototext/
                    open-in-Photos (all known asset ids, newest first),
                    views/thumbs caches, writable bulk-delete/bulk-purge
                    routes + cache GC helpers
-  worker.py        run loop: claim/process, retries, budgets, signals
+  worker.py        run loop: claim/process, retries, budgets, signals;
+                   caffeinate sleep-guard + battery/disk warnings,
+                   keep_alive warmth + clean-end model unload
 bin/phototext-dev  dev wrapper: workspace code via repo .venv
 install.sh         installer: snapshot venv, var/ layout, bin wrappers, migrate
 CHANGELOG.md       release notes; update when bumping the version
@@ -299,8 +302,8 @@ tests/
   error paths), and sidebar scaling ([47]: pinned nav, collapsible fgroups,
   filter boxes past 8 people/categories); the theme system ([48]: token
   parity, toggle + no-FOUC ordering, fonts route + traversal guard,
-  web_theme config default, and the no-color-literals gate on webui.py);
-  the ops batch ([21] extensions
+  web_theme config default, the no-color-literals gate on webui.py, the
+  detail lightbox, rec-dot state, and the grep gate); the ops batch ([21] extensions
   and [15]): v14 migration rewind + true-case repair from paths, raw-case
   asset storage, web bulk-delete (hidden-only and search scopes, token/
   400/404 gates, multiple-asset-row link survival), purge cache cleanup,

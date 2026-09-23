@@ -310,10 +310,10 @@ mlx-serve (`gemma-4-e4b-it-4bit`, same machine, same 2h45m nightly window):
   against `tests/mock_mlx.py` (a mock OpenAI-compatible server); suite
   green on both providers.
 
-### 0.9.0 — PoI themes, lightbox, run reliability (in progress)
+### 0.9.0 — PoI themes, lightbox, run reliability (implemented, branch `poi-themes`)
 
-Theme system **implemented** on branch `poi-themes` (runtime items below
-still pending). Port of the Person of Interest design system from the sibling
+Theme system, lightbox, and the runtime items all implemented; both e2e
+provider suites green. Port of the Person of Interest design system from the sibling
 `video-security` app (its single source of truth: `report_theme.py`),
 plus the runtime niceties worth taking from the same codebase. Decisions
 below are locked (see decision log entries).

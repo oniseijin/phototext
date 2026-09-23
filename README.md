@@ -251,12 +251,19 @@ pulses while the processing queue is active.
 
 Theme fonts (Barlow Semi Condensed, JetBrains Mono) are self-hosted under
 SIL OFL — license texts ship in `src/phototext/fonts/` — so the UI stays
-fully offline.
+fully offline. On read-only servers the detail photo opens in a
+**lightbox**: click, wheel zoom-to-cursor, drag pan, keyboard
+navigation.
 
 ## Long runs and resume
 
 - Ctrl+C (or SIGTERM) stops gracefully after the current photo; a second Ctrl+C
   forces an immediate quit.
+- Sleep safety: while a run is processing, a `caffeinate` guard keeps the
+  Mac from sleeping (it dies with the process); a battery warning fires at
+  run start, and Ollama calls carry `keep_alive: 30m` so watch-mode gaps
+  don't cold-reload the model. At a clean run end phototext unloads the
+  models it used — a nightly cron frees the memory by morning.
 - Idle detection (Ollama only): before each photo the run checks `/api/ps` and
   pauses while a *different* model is loaded (e.g. you are using a coding
   model), resuming when it unloads. Disable with `idle_detection = false` or

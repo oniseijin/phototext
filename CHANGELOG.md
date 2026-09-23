@@ -26,6 +26,16 @@ semantic versioning.
   derivatives get a `derivative` badge.
 - E2E section [48] (theme tokens parity, toggle, no-FOUC ordering, fonts
   route + traversal guard, config default, color-literal gate).
+- Zero-dependency lightbox on photo detail pages (read-only mode): click
+  to open, wheel zoom-to-cursor, drag pan, keyboard nav, zoom controls —
+  framework-free vanilla JS ported from the video-security report system.
+- Run reliability: a caffeinate guard keeps the Mac awake for the length
+  of a run (dies with the process), a battery warning at run start, a
+  start-of-run disk-space preflight on the catalog volume, Ollama calls
+  now send `keep_alive: 30m` (watch-mode gaps no longer cold-reload the
+  model), and a clean run end explicitly unloads the models it used — a
+  nightly cron frees the VRAM by morning. mlx-serve keeps managing its
+  own residency (unload is a no-op there).
 
 ## [0.8.0] - 2026-09-22
 
