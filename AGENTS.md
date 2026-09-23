@@ -22,11 +22,18 @@ pushing anything:
   synthetic data.
 - Home-dir paths in prose and screenshots (`/Users/ryan/...`) are fine;
   content from the actual photo library is not.
-- Never push without being asked — each publish is the user's decision.
+- Never push without being asked — and the public repo only advances at
+  **tagged releases**: `main` is never pushed unless its tip carries a
+  version tag (`.githooks/pre-push` enforces it). Untagged commits
+  accumulate locally and ride the next release.
+- Release flow: bump the version + `CHANGELOG.md`, commit, then
+  `git tag vX.Y.Z && git push origin main vX.Y.Z`.
 
 ## Commands
 
-- Setup: `uv venv .venv && uv pip install -e .`
+- Setup: `uv venv .venv && uv pip install -e .`, then
+  `git config core.hooksPath .githooks` (the pre-push hook keeps
+  untagged `main` off the public remote)
 - Run CLI (dev, workspace code): `.venv/bin/phototext ...` or `bin/phototext-dev`
 - Install as an everyday command: `./install.sh` — snapshot venv at
   `~/.local/opt/phototext` (or `/opt/phototext` with sudo), wrappers
