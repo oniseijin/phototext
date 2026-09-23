@@ -2,9 +2,9 @@
 
 Recover text from your photos using a local vision LLM. phototext scans an
 iPhoto/Photos library (or any folder), sends each photo to a local LLM server —
-Ollama (e.g. `gemma4:12b`) or mlx-serve (e.g. `gemma-4-e4b-it-4bit`) — and
-stores the extracted text plus a short description of each photo in a local
-SQLite catalog.
+mlx-serve (Apple silicon, e.g. `mlx-community/gemma-4-e4b-it-4bit`) or Ollama
+(e.g. `gemma4:12b`) — and stores the extracted text plus a short description of
+each photo in a local SQLite catalog.
 
 It is built for long, interruptible runs: stop it anytime, restart later, and it picks
 up exactly where it left off. Nothing is ever written into your photo library.
@@ -35,8 +35,8 @@ flowchart LR
    are processed once.
 2. `run` claims queued photos one at a time, converts/downscales the image (HEIC,
    TIFF, PSD, old iPhoto-era formats, with a macOS `sips` fallback for anything
-   Pillow cannot read), and sends it to the configured LLM backend (Ollama or
-   mlx-serve) with a JSON-schema-constrained prompt. The verbatim text, a
+   Pillow cannot read), and sends it to the configured LLM backend (mlx-serve or
+   Ollama) with a JSON-schema-constrained prompt. The verbatim text, a
    context description, the text kind, and the language are stored per photo.
 3. Everything lands in `~/.phototext/catalog.db` (SQLite). Inspect it with
    `phototext results`, `phototext status`, or plain SQL.
@@ -46,13 +46,20 @@ mid-run are automatically recovered on the next `run`.
 
 ## Requirements
 
-- macOS
+- macOS (Apple silicon for mlx-serve; any Mac for Ollama)
 - Python 3.11+
 - One local LLM server with a vision model:
-  - [Ollama](https://ollama.com) — the default provider; any multimodal tag
-    works (e.g. `gemma4:12b`), or
-  - mlx-serve (Apple silicon, OpenAI-compatible) — e.g.
-    `mlx-community/gemma-4-e4b-it-4bit`
+  - **mlx-serve** — the primary backend on Apple silicon
+    (OpenAI-compatible): `pipx install mlx-serve`, then
+    `mlx-serve pull mlx-community/gemma-4-e4b-it-4bit`, or
+  - [Ollama](https://ollama.com) — the portable alternative; any multimodal
+    tag works (e.g. `gemma4:12b`)
+
+Python dependencies are installed with the package: `requests`,
+`Pillow` + `pillow-heif` (image decode/encode, HEIC), `typer` (CLI),
+`osxphotos` (Photos libraries), and `pyobjc` Vision/Quartz (macOS OCR and
+face detection). Everything else is the standard library — the catalog is
+plain SQLite.
 
 ## Install
 
@@ -89,6 +96,8 @@ uv venv .venv && uv pip install -e .
 ## Quickstart
 
 ```bash
+# on Apple silicon with mlx-serve, first put provider = "mlx-serve"
+# (and the mlx models) in ~/.phototext/config.toml — see Configuration
 .venv/bin/phototext doctor                        # check the LLM server, model, vision, database
 .venv/bin/phototext scan "~/Pictures/Old iPhoto Library.photolibrary"
 .venv/bin/phototext run --limit 5                 # small first test
@@ -369,7 +378,8 @@ override it.
 
 ### LLM backend (`provider`)
 
-`provider = "ollama"` (default) or `"mlx-serve"` picks the LLM backend. The
+On Apple silicon set `provider = "mlx-serve"` (recommended — ~1.5x faster);
+the default remains `"ollama"` for the broadest compatibility. The
 base model names (`model`, `prefilter_model`, `person_model`, `embed_model`)
 are the ollama ones; a `[mlx-serve]` table overlays them when that provider is
 active, so switching is a one-line change and switching back restores the
@@ -470,7 +480,7 @@ PHOTOTEXT_E2E_PROVIDER=mlx-serve .venv/bin/python tests/e2e.py
 
 | Symptom | Fix |
 | --- | --- |
-| `doctor`: server not reachable | Start the LLM server: `ollama serve` (or the app), or your mlx-serve service. |
+| `doctor`: server not reachable | Start the LLM server: `mlx-serve serve` (serves every pulled model), or `ollama serve` (or the app). |
 | `doctor`: model not present | `ollama pull gemma4:12b` (or `mlx-serve pull <model-id>` and restart the server) or set `model` in the config. |
 | `doctor`: failed on test image | The model is not vision-capable; pick a multimodal tag. |
 | Scan finds nothing in a library | Grant Full Disk Access to your terminal app, then rescan. |

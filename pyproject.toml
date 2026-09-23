@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "phototext"
 version = "0.9.0"
-description = "Recover text from photos using a local Ollama vision model"
+description = "Recover text from photos using local vision LLMs (mlx-serve or Ollama)"
 requires-python = ">=3.11"
 license = "MIT"
 license-files = ["LICENSE"]
