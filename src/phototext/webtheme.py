@@ -663,11 +663,17 @@ _SUBJECT = """\
 .subject {
   position: relative;
   margin: 0;
+  padding: 0;
+  border: none;
+}
+html[data-theme='machine'] .subject,
+html[data-theme='samaritan'] .subject {
   padding: .75rem;
   border: 1px solid var(--pt-frame-edge);
 }
 
-.subject::before {
+html[data-theme='machine'] .subject::before,
+html[data-theme='samaritan'] .subject::before {
   content: '';
   position: absolute;
   inset: 0;
@@ -706,6 +712,7 @@ _SUBJECT = """\
 .subject.tone-warn { color: var(--pt-review-ink); }
 
 .designation {
+  display: none;
   position: absolute;
   top: -.7em;
   left: .75rem;
@@ -717,7 +724,9 @@ _SUBJECT = """\
   color: var(--pt-ink);
   border: 1px solid var(--pt-ink);
   padding: .1rem .5rem;
-}"""
+}
+html[data-theme='machine'] .designation,
+html[data-theme='samaritan'] .designation { display: inline-block; }"""
 
 _THEME_TOGGLE = """\
 .theme-toggle {

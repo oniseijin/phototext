@@ -1588,7 +1588,8 @@ def serve(
     """Serve the read-only local web UI: browse photos, recovered text, and search."""
     cfg = _cfg()
     try:
-        webui.serve(cfg.db_path, host=host, port=port, writable=writable, person_cfg=cfg)
+        webui.serve(cfg.db_path, host=host, port=port, writable=writable,
+                    person_cfg=cfg, theme=cfg.web_theme)
     except FileNotFoundError as e:
         typer.echo(f"error: {e}", err=True)
         raise typer.Exit(2)

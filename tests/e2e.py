@@ -1980,7 +1980,10 @@ def main() -> int:
     check(up38, "duplicates tab serves")
     if up38:
         r = requests.get(base38 + "/duplicates")
-        check("keep (largest)" in r.text, "web duplicates page marks the keep candidate")
+        check("keep</span>" in r.text and "derivative</span>" in r.text,
+              "web duplicates page marks keep vs derivative")
+        check("<span class='designation'>KEEP</span>" in r.text,
+              "web duplicates page carries the PoI KEEP designation")
     proc38.terminate()
     proc38.wait(timeout=10)
     out = c38.run("duplicates", "--threshold", "0")
@@ -2880,6 +2883,106 @@ def main() -> int:
     finally:
         serve47.terminate()
         serve47.wait()
+
+    print("\n[48] web theme system (PoI machine/samaritan + icloud default)")
+    from phototext import webtheme as webtheme_mod
+    check(
+        set(webtheme_mod.TOKENS["icloud"]) == set(webtheme_mod.TOKENS["machine"])
+        == set(webtheme_mod.TOKENS["samaritan"]),
+        "theme token sets are identical",
+    )
+    theme48_dir = work / "theme48"
+    theme48_dir.mkdir()
+    cfg48 = work / "config-theme48.toml"
+    cfg48.write_text(
+        backend_config(port)
+        + f'model = "{MODEL}"\n'
+        + f'db_path = "{theme48_dir}/catalog.db"\n'
+        + "face_detection = false\n"
+    )
+    c48 = CLI(cfg48)
+    t48_src = theme48_dir / "s"
+    t48_src.mkdir()
+    make_text_image(t48_src / "one.jpg", ["theme test"])
+    c48.run("scan", str(t48_src))
+    port48 = free_port()
+    serve48 = subprocess.Popen(
+        c48.cmd + ["serve", "--port", str(port48)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    base48 = f"http://127.0.0.1:{port48}"
+    try:
+        for _ in range(60):
+            try:
+                requests.get(base48 + "/", timeout=1)
+                break
+            except Exception:
+                time.sleep(0.1)
+        r = requests.get(base48 + "/", timeout=5)
+        check(
+            "<button type='button' class='theme-toggle' id='pt-theme-toggle'>" in r.text,
+            "theme toggle button renders in the sidebar",
+        )
+        check(
+            r.text.index("localStorage.getItem('pt-theme')") < r.text.index("<style>"),
+            "no-FOUC restore script precedes the stylesheet",
+        )
+        for theme in ("icloud", "machine", "samaritan"):
+            check(
+                f"html[data-theme='{theme}']" in r.text,
+                f"{theme} token block present",
+            )
+        check("rec-dot" in r.text, "semantic rec-dot renders in the brand row")
+        photo48 = db_open(theme48_dir / "catalog.db").execute(
+            "SELECT id FROM photos ORDER BY id LIMIT 1"
+        ).fetchone()[0]
+        d = requests.get(base48 + f"/photo/{photo48}", timeout=5)
+        check("<figure class='subject'>" in d.text, "detail image is a subject frame")
+        check("class='designation'" in d.text, "designation tag renders on detail")
+        fr = requests.get(base48 + "/fonts/barlow-semi-condensed-400.woff2", timeout=5)
+        check(fr.status_code == 200, "font file serves")
+        check(
+            fr.headers.get("Content-Type", "").startswith("font/woff2"),
+            "font content-type is font/woff2",
+        )
+        check(
+            "immutable" in fr.headers.get("Cache-Control", ""),
+            "fonts are cached immutably",
+        )
+        bad = requests.get(base48 + "/fonts/../catalog.db")
+        check(bad.status_code == 404, "font traversal is blocked")
+    finally:
+        serve48.terminate()
+        serve48.wait()
+    cfg48b = work / "config-theme48b.toml"
+    cfg48b.write_text(
+        backend_config(port)
+        + f'model = "{MODEL}"\n'
+        + f'db_path = "{theme48_dir}/catalog.db"\n'
+        + "face_detection = false\n"
+        + 'web_theme = "machine"\n'
+    )
+    c48b = CLI(cfg48b)
+    port48b = free_port()
+    serve48b = subprocess.Popen(
+        c48b.cmd + ["serve", "--port", str(port48b)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    base48b = f"http://127.0.0.1:{port48b}"
+    try:
+        for _ in range(60):
+            try:
+                requests.get(base48b + "/", timeout=1)
+                break
+            except Exception:
+                time.sleep(0.1)
+        r = requests.get(base48b + "/", timeout=5)
+        check("var t='machine'" in r.text, "web_theme config sets the server default")
+    finally:
+        serve48b.terminate()
+        serve48b.wait()
 
     print()
     if FAILURES:

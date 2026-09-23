@@ -106,6 +106,10 @@ idle_detection = true
     # SQLite catalog location
     db_path = "~/.phototext/catalog.db"
 
+    # Web UI theme: "icloud" | "machine" | "samaritan" (server default;
+    # the browser's own toggle choice always wins)
+    web_theme = "icloud"
+
 # Per-provider model overlays: when `provider` matches a table below, its
 # model names replace the base values at config load (rollback = flip
 # `provider` back; the base ollama names stay intact).
@@ -146,6 +150,7 @@ class Config:
     recent_first: bool = False
     process_derivatives: bool = True
     max_image_pixels: int = 357_913_941
+    web_theme: str = "icloud"
     db_path: Path = DEFAULT_DB_PATH
 
 

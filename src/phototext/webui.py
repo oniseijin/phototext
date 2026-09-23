@@ -23,6 +23,7 @@ from urllib.request import pathname2url
 
 from . import db
 from . import people as people_mod
+from . import webtheme
 from .config import Config, ensure_noindex
 from .imaging import ImageReadError, crop_jpeg, display_size, prepare_image
 from .memes import DUPLICATE_HAMMING_DEFAULT, find_clusters
@@ -30,6 +31,10 @@ from .memes import DUPLICATE_HAMMING_DEFAULT, find_clusters
 PAGE_SIZE = 48
 THUMB_EDGE = 480
 VIEW_EDGE = 2048
+
+# Theme the restore script falls back to when the browser has no saved
+# choice; `serve(theme=...)` reassigns this per server process.
+_default_theme = webtheme.DEFAULT_THEME
 
 # Formats every mainstream browser can render natively; anything else
 # (HEIC, TIFF, PSD, ...) gets a converted JPEG on the detail page.
@@ -72,124 +77,14 @@ def _open_ro(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
-_CSS = """
-:root { color-scheme: dark; }
-* { box-sizing: border-box; }
-body { margin: 0; font: 15px/1.5 -apple-system, "Segoe UI", sans-serif;
-       background: #14161a; color: #e6e6e6; }
-.shell { display: flex; min-height: 100vh; }
-.side { width: 236px; flex-shrink: 0; background: #1c2027;
-        border-right: 1px solid #2a2f39; padding: 16px 12px;
-        display: flex; flex-direction: column; gap: 12px;
-        position: sticky; top: 0; height: 100vh; overflow-y: auto; }
-.side .brand { font-size: 17px; font-weight: 600; color: #8ab4f8; padding: 0 4px; }
-.side form.search { display: flex; gap: 6px; }
-.side form.search input[type=text] { flex: 1; min-width: 0; }
-.navgroup { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em;
-            color: #6b7380; padding: 0 6px; margin-top: 8px; }
-.navlist { display: flex; flex-direction: column; gap: 1px; }
-.navlist a { color: #c7cdd6; text-decoration: none; padding: 5px 8px;
-             border-radius: 6px; font-size: 13.5px; }
-.navlist a:hover { background: #242a33; }
-.navlist a.on { background: #2a5db0; color: white; }
-.sidefoot { margin-top: auto; font-size: 11.5px; color: #6b7380; padding: 0 6px; }
-.content { flex: 1; min-width: 0; padding: 14px 22px 40px; }
-@media (max-width: 720px) {
-  .shell { flex-direction: column; }
-  .side { width: auto; height: auto; position: static; overflow: visible; }
-  .side-scroll { overflow: visible; }
-}
-input[type=text] { flex: 1; padding: 6px 10px; border-radius: 6px; border: 1px solid #2a2f39;
-                   background: #14161a; color: #e6e6e6; }
-button { padding: 6px 14px; border-radius: 6px; border: 0; background: #2a5db0;
-         color: white; cursor: pointer; }
-nav { padding: 6px 0; display: flex; gap: 10px; flex-wrap: wrap; font-size: 13px; }
-nav a { color: #9aa4b2; text-decoration: none; padding: 3px 10px; border-radius: 12px; }
-nav a.on { background: #2a5db0; color: white; }
-.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
-         gap: 14px; margin-top: 12px; }
-.card { background: #1c2027; border-radius: 8px; overflow: hidden; text-decoration: none;
-        color: inherit; display: flex; flex-direction: column; }
-.card img { width: 100%; height: 150px; object-fit: cover; background: #0d0e11;
-            display: block; }
-.card .body { padding: 8px 10px 10px; font-size: 12.5px; }
-.card .path { color: #9aa4b2; font-size: 11px; word-break: break-all; margin-top: 4px; }
-.cardbox { position: relative; }
-.cardbox > a.card { display: flex; }
-.cardbox form.act { position: absolute; top: 6px; right: 6px; margin: 0; z-index: 2; }
-.cardbox form.act button.mini { background: rgba(13, 14, 17, 0.85); }
-.snippet { max-height: 5.4em; overflow: hidden; }
-.muted { color: #8b949e; }
-.badge { display: inline-block; font-size: 10.5px; padding: 1px 7px; margin-right: 5px;
-         border-radius: 8px; background: #2a2f39; color: #9aa4b2; }
-.badge.err { background: #5c1f1f; color: #ffb4b4; }
-.badge.ok { background: #1e3a24; color: #a8e2b8; }
-.pager { margin: 18px 0; display: flex; gap: 10px; }
-.pager a { color: #8ab4f8; text-decoration: none; }
-.detail { display: flex; gap: 24px; margin-top: 16px; flex-wrap: wrap; }
-.detail img { max-width: min(680px, 100%); max-height: 78vh; border-radius: 8px;
-              background: #0d0e11; }
-.meta { flex: 1; min-width: 300px; }
-.meta table { border-collapse: collapse; font-size: 13px; margin-bottom: 14px; }
-.meta td { padding: 3px 12px 3px 0; vertical-align: top; }
-.meta td:first-child { color: #9aa4b2; white-space: nowrap; }
-pre { background: #1c2027; padding: 12px; border-radius: 8px; white-space: pre-wrap;
-      font-size: 13px; max-width: 100%; overflow-wrap: anywhere; }
-details { margin-top: 12px; }
-ul.locs { font-size: 12.5px; color: #c7cdd6; padding-left: 18px; }
-ul.locs li { margin: 10px 0; }
-ul.locs a { color: #8ab4f8; }
-ul.locs .muted { font-size: 11.5px; }
-.actions { margin: 10px 0 4px; }
-form.act { display: inline-block; margin-right: 8px; }
-button.mini { padding: 4px 12px; border-radius: 6px; border: 1px solid #2a2f39;
-             background: #1c2027; color: #e6e6e6; font-size: 12px; cursor: pointer; }
-button.mini:hover { background: #2a2f39; }
-.trow { display: flex; gap: 12px; align-items: flex-start; background: #1c2027;
-        border-radius: 8px; padding: 8px; margin-bottom: 10px; }
-.trow img { width: 110px; height: 82px; object-fit: cover; border-radius: 6px;
-            background: #0d0e11; }
-.tbody { flex: 1; font-size: 13px; }
-.note { color: #9aa4b2; margin: 12px 0; }
-a.back { color: #8ab4f8; text-decoration: none; }
-.pickwrap { position: relative; display: inline-block; }
-.pickwrap img { cursor: crosshair; }
-.selbox { position: absolute; border: 2px solid #8ab4f8; background: rgba(138,180,248,.18);
-          display: none; pointer-events: none; }
-.tagform { display: flex; gap: 6px; margin-top: 10px; max-width: 420px; }
-.tagform input[type=text] { flex: 1; }
-.people { margin: 6px 0 10px; }
-.chipline { margin: 4px 0; }
-.chipline .badge { font-size: 12px; padding: 2px 8px; }
-.badge.review { background: #4a3a14; color: #ffd27d; }
-.face { width: 72px; height: 72px; object-fit: cover; border-radius: 8px; background: #0d0e11;
-        display: block; }
-.pcard { display: flex; gap: 14px; align-items: center; background: #1c2027; border-radius: 8px;
-         padding: 12px; margin-bottom: 10px; text-decoration: none; color: inherit; }
-.pcard .pbody { flex: 1; }
-.wideform { display: flex; gap: 6px; margin: 8px 0; max-width: 420px; }
-.wideform input[type=text] { flex: 1; padding: 6px 10px; border-radius: 6px;
-                            border: 1px solid #2a2f39; background: #14161a; color: #e6e6e6; }
-.side { overflow: hidden; }
-.side-top { flex-shrink: 0; display: flex; flex-direction: column; gap: 12px; }
-.side-scroll { flex: 1; min-height: 0; overflow-y: auto;
-               display: flex; flex-direction: column; gap: 12px; }
-details.fgroup > summary { list-style: none; cursor: pointer; font-size: 11px;
-  text-transform: uppercase; letter-spacing: .06em; color: #6b7380;
-  padding: 0 6px; display: flex; justify-content: space-between; }
-details.fgroup > summary::-webkit-details-marker { display: none; }
-summary .count { color: #475060; text-transform: none; }
-.fitems { max-height: 34vh; overflow-y: auto; }
-.ffilter { width: calc(100% - 12px); margin: 4px 6px; font-size: 12px; padding: 4px 8px; }
-"""
-
-
 def _page(title: str, body: str, sidebar: str = "") -> bytes:
     doc = (
         "<!doctype html><html><head><meta charset='utf-8'>"
-        f"<title>{esc(title)}</title><style>{_CSS}</style></head>"
+        f"<script>{webtheme.restore_js(_default_theme)}</script>"
+        f"<title>{esc(title)}</title><style>{webtheme.THEME_CSS}</style></head>"
         f"<body><div class='shell'><aside class='side'>{sidebar}</aside>"
-        f"<div class='content'>{body}</div></div></body></html>"
+        f"<div class='content'>{body}</div></div>"
+        f"<script>{webtheme.TOGGLE_JS}</script></body></html>"
     )
     return doc.encode("utf-8")
 
@@ -238,6 +133,11 @@ def _sidebar(
     the counts footer scroll below them."""
     counts = db.status_counts(conn)
     link = url_for or (lambda key: f"/?status={key}")
+    rec = counts.get("queued", 0) + counts.get("processing", 0) > 0
+    rec_dot = (
+        f"<span class='rec-dot{'on' if rec else ' off'}'"
+        f" title='{'processing queue active' if rec else 'queue idle'}'></span>"
+    )
 
     def item(href: str, label: str, on: bool = False) -> str:
         cls = " class='on'" if on else ""
@@ -262,10 +162,11 @@ def _sidebar(
     script = f"<script>{_FILTER_JS}</script>" if "class='ffilter'" in extra else ""
     return (
         "<div class='side-top'>"
-        "<div class='brand'>phototext</div>"
+        f"<div class='brand'>phototext {rec_dot}</div>"
         "<form class='search' action='/' method='get'>"
         "<input type='text' name='q' placeholder='Search recovered text and context...'"
         f" value='{esc(q)}'><button>Search</button></form>"
+        "<button type='button' class='theme-toggle' id='pt-theme-toggle'>iCloud</button>"
         "<div class='navgroup'>Library</div>"
         f"<div class='navlist'>{library}</div>"
         "<div class='navgroup'>Discover</div>"
@@ -769,6 +670,13 @@ def render_detail(conn: sqlite3.Connection, photo_id: int, ctx: dict | None = No
     body = "<p><a class='back' href='/'>&#8592; back to photos</a></p>"
     if actions:
         body += f"<div class='actions'>{actions}</div>"
+    tone = " tone-err" if row["status"] == "error" else ""
+    taken = row["date_taken"][:16].replace("T", " ") if row["date_taken"] else ""
+    designation = (
+        f"<span class='designation'>photo {photo_id}"
+        + (f" // {taken}" if taken else "")
+        + "</span>"
+    )
     body += f"<div class='detail'>"
     if writable:
         # The picker submits boxes in original-image pixels (crop_jpeg's
@@ -781,9 +689,10 @@ def render_detail(conn: sqlite3.Connection, photo_id: int, ctx: dict | None = No
             if dims:
                 pick_attrs = f" data-w='{dims[0]}' data-h='{dims[1]}'"
         body += (
+            f"<figure class='subject{tone}'>{designation}"
             "<div class='pickwrap'>"
             f"<img id='pickimg' src='/image/{photo_id}'{pick_attrs} alt='photo {photo_id}'>"
-            "<div id='selbox' class='selbox'></div></div>"
+            "<div id='selbox' class='selbox'></div></div></figure>"
             "<form class='tagform' method='post' action='/person/tag'>"
             f"<input type='hidden' name='photo_id' value='{photo_id}'>"
             f"<input type='hidden' name='token' value='{esc(ctx['token'])}'>"
@@ -795,7 +704,10 @@ def render_detail(conn: sqlite3.Connection, photo_id: int, ctx: dict | None = No
             f"<script>{_PICKER_JS}</script>"
         )
     else:
-        body += f"<img src='/image/{photo_id}' alt='photo {photo_id}'>"
+        body += (
+            f"<figure class='subject{tone}'>{designation}"
+            f"<img src='/image/{photo_id}' alt='photo {photo_id}'></figure>"
+        )
     body += photos_link
     body += "<div class='meta'>"
     body += f"<table>{meta}</table>"
@@ -894,17 +806,28 @@ def render_duplicates(conn: sqlite3.Connection, ctx: dict | None = None) -> byte
     for index, group in enumerate(clusters, 1):
         biggest = max(group, key=lambda r: r["byte_size"] or 0)
         cards = ""
+        keep_figure = ""
         for r in group[:12]:
-            mark = " <span class='badge ok'>keep (largest)</span>" if r["id"] == biggest["id"] else ""
+            if r["id"] == biggest["id"]:
+                mark = " <span class='badge ok'>keep</span>"
+            else:
+                mark = " <span class='badge'>derivative</span>"
             taken = f" <span class='badge'>{esc(r['date_taken'][:10])}</span>" if r["date_taken"] else ""
-            cards += (
+            card = (
                 f"<a class='card' href='/photo/{r['id']}'>"
                 f"<img src='/thumb/{r['id']}' alt='' loading='lazy'>"
                 f"<div class='body'>{esc(str(r['byte_size'] or 0))} bytes{mark}{taken}</div></a>"
             )
+            if r["id"] == biggest["id"]:
+                keep_figure = (
+                    "<figure class='subject'><span class='designation'>KEEP</span>"
+                    + card + "</figure>"
+                )
+            else:
+                cards += card
         body += (
             f"<p class='muted'>group {index}: {len(group)} photo(s)</p>"
-            f"<div class='cards'>{cards}</div>"
+            f"<div class='cards'>{keep_figure}{cards}</div>"
         )
     return _page("duplicates - phototext", body, sidebar)
 
@@ -1665,6 +1588,10 @@ class _Handler(BaseHTTPRequestHandler):
             return
         person_match = re.match(r"^/person/(\d+)$", route)
         face_match = re.match(r"^/face/(\d+)/(\d+)$", route)
+        font_match = re.match(r"^/fonts/([A-Za-z0-9._-]+\.woff2)$", route)
+        if font_match is not None:
+            self._route_fonts(font_match.group(1))
+            return
         if person_match is not None:
             self._route_person(int(person_match.group(1)), params, ctx)
             return
@@ -1748,6 +1675,20 @@ class _Handler(BaseHTTPRequestHandler):
         except OSError:
             pass
         self._send(200, data, "image/jpeg")
+
+    def _route_fonts(self, name: str) -> None:
+        fonts_dir = (Path(__file__).resolve().parent / "fonts")
+        target = (fonts_dir / name).resolve()
+        if not target.is_relative_to(fonts_dir) or not target.is_file():
+            self._not_found("no such font")
+            return
+        data = target.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", "font/woff2")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+        self.end_headers()
+        self.wfile.write(data)
 
     def _route_photo(self, photo_id: int, params: dict, ctx: dict) -> None:
         conn = _open_ro(self.server.phototext_db)
@@ -1885,7 +1826,9 @@ def serve(
     port: int = 8765,
     writable: bool = False,
     person_cfg: Config | None = None,
+    theme: str | None = None,
 ) -> None:
+    global _default_theme
     db_path = Path(db_path).expanduser()
     if not db_path.exists():
         raise FileNotFoundError(
@@ -1898,6 +1841,8 @@ def serve(
     views_dir.mkdir(parents=True, exist_ok=True)
     ensure_noindex(views_dir)
     token = secrets.token_hex(16) if writable else None
+    if theme is not None and theme in webtheme.THEMES:
+        _default_theme = theme
     httpd = _Server(
         (host, port), _Handler, db_path, thumbs_dir, views_dir, writable, token, person_cfg
     )
