@@ -407,6 +407,8 @@ nav a.on { background: var(--pt-accent); color: var(--pt-accent-ink); }
   background: var(--pt-image-bg);
 }
 
+.figurecol { display: flex; flex-direction: column; align-items: flex-start; }
+
 .meta { flex: 1; min-width: 300px; }
 
 .meta table { border-collapse: collapse; font-size: 13px; margin-bottom: 14px; }

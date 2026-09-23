@@ -9,7 +9,26 @@ SQLite catalog.
 It is built for long, interruptible runs: stop it anytime, restart later, and it picks
 up exactly where it left off. Nothing is ever written into your photo library.
 
+<p align="center">
+  <a href="docs/web-ui.md"><img src="docs/images/grid.webp" width="270" alt="the web UI photo grid"></a>
+  <a href="docs/web-ui.md"><img src="docs/images/search.webp" width="270" alt="full-text search over recovered text"></a>
+  <a href="docs/web-ui.md"><img src="docs/images/detail-receipt.webp" width="270" alt="a photo detail page with recovered text"></a>
+</p>
+
+A full [web UI tour with screenshots](docs/web-ui.md) — search, people,
+memes, duplicates, trash, and the three [themes](docs/themes.md).
+
 ## How it works
+
+```mermaid
+flowchart LR
+    F["folders"] --> SCAN
+    L["iPhoto / Photos<br/>libraries"] --> SCAN
+    SCAN["scan<br/>read-only walk · SHA-256 dedup<br/>slices · Vision OCR"] --> DB[("SQLite catalog<br/>~/.phototext/catalog.db")]
+    DB -->|"queued photos"| RUN["run · interruptible<br/>downscale → vision LLM<br/>JSON-schema output"]
+    RUN -->|"text · context · category<br/>raw response"| DB
+    DB --> OUT["results · FTS + semantic search<br/>export · web UI · people · memes"]
+```
 
 1. `scan` walks the library's originals (read-only) and identifies every photo by its
    SHA-256 content hash. Duplicate photos (same bytes in multiple places or albums)
@@ -196,6 +215,8 @@ processed by `run`.
 phototext serve                 # http://127.0.0.1:8765
 ```
 
+A screenshot tour of everything below lives in [docs/web-ui.md](docs/web-ui.md).
+
 A read-only local web app over the catalog, laid out like iCloud Photos: a
 left **sidebar** with the search box, the Library / Discover / Utilities
 navigation, and every filter — hidden photos, people, categories, text,
@@ -236,6 +257,12 @@ same photo (iCloud preview proxies excluded) with the largest file marked
 "keep".
 
 ### Themes
+
+<p align="center">
+  <a href="docs/themes.md"><img src="docs/images/grid.webp" width="270" alt="iCloud theme"></a>
+  <a href="docs/themes.md"><img src="docs/images/grid-machine.webp" width="270" alt="Machine theme"></a>
+  <a href="docs/themes.md"><img src="docs/images/grid-samaritan.webp" width="270" alt="Samaritan theme"></a>
+</p>
 
 The sidebar carries a theme switch with three looks: **iCloud** (the
 default — the layout above), **Machine** and **Samaritan** — the
@@ -427,6 +454,9 @@ retry, transport loss, crash recovery, budgets, SIGINT, doctor, sips fallback,
 full-text search, schema migration with backups, export, and slice scans
 (dates, limit, ids-file, album/favorites/UUID via the library database). No
 network or real library involved.
+
+The screenshots in the README and docs/ come from a separate reproducible
+demo catalog (`docs/demo/`) — synthetic photos, mock model, no real library.
 
 The suite is provider-parameterized — it runs against `tests/mock_ollama.py`
 by default and against `tests/mock_mlx.py` (a mock OpenAI-compatible

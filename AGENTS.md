@@ -73,6 +73,17 @@ src/phototext/
 bin/phototext-dev  dev wrapper: workspace code via repo .venv
 install.sh         installer: snapshot venv, var/ layout, bin wrappers, migrate
 CHANGELOG.md       release notes; update when bumping the version
+docs/
+  web-ui.md        web UI tour (screenshots)
+  themes.md        the three themes (screenshots)
+  images/          committed WebP captures for README + docs
+  demo/            screenshot demo kit: make_demo_catalog.py builds a
+                   synthetic library + catalog against demo_mock.py (a mock
+                   Ollama with authored per-photo responses); rebuild with
+                   `.venv/bin/python docs/demo/make_demo_catalog.py`, serve
+                   with `phototext --config docs/demo/build/config.toml
+                   serve` — see docs/demo/README.md before regenerating
+                   docs/images/
 tests/
   mock_ollama.py   stand-in Ollama server (modes: ok, fail500, slow, trickle)
   e2e.py           full pipeline test suite

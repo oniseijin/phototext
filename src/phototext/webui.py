@@ -677,7 +677,7 @@ def render_detail(conn: sqlite3.Connection, photo_id: int, ctx: dict | None = No
         + (f" // {taken}" if taken else "")
         + "</span>"
     )
-    body += f"<div class='detail'>"
+    body += "<div class='detail'><div class='figurecol'>"
     if writable:
         # The picker submits boxes in original-image pixels (crop_jpeg's
         # frame); /image/ may serve a downscaled conversion of HEIC and
@@ -703,11 +703,14 @@ def render_detail(conn: sqlite3.Connection, photo_id: int, ctx: dict | None = No
             "then enter a name (no box = whole photo)</p>"
             f"<script>{_PICKER_JS}</script>"
         )
+        body += "</div>"
     else:
         body += (
             f"<figure class='subject{tone}'>{designation}"
             f"<img src='/image/{photo_id}' alt='photo {photo_id}'></figure>"
         )
+        body += photos_link + "</div>"
+        photos_link = ""
         body += (
             "<div id='lightbox' class='lightbox' aria-hidden='true'>"
             "<div class='lightbox-frame'>"

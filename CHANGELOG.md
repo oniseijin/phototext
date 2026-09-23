@@ -4,7 +4,23 @@ All notable changes to phototext are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 semantic versioning.
 
-## [0.9.0] - 2026-09-23
+## [Unreleased]
+
+### Fixed
+
+- Web UI: on `serve --writable` photo pages, the person-tag form and hint
+  rendered as stretched columns beside the photo instead of a compact row
+  under it. The figure, tag form, and hint now share a `figurecol` column
+  (mirrors the read-only layout).
+
+### Added
+
+- Documentation screenshots: `docs/web-ui.md` (UI tour) and
+  `docs/themes.md` (the three themes), backed by `docs/images/` (WebP
+  captures) and a reproducible demo catalog builder (`docs/demo/`:
+  synthetic photo library + authored-response mock Ollama; the README
+  hero shots and pipeline diagram come from it).
+
 
 ### Added
 
