@@ -529,7 +529,9 @@ below are locked (see decision log entries).
   ink/nav tokens with icloud keeping its exact old values, and the 6px/12px
   radii became `radius-sm`/`radius-pill` tokens; all PoI treatments are
   gated behind `html[data-theme='machine'/'samaritan']` selectors so icloud
-  renders unchanged, and e2e [48] gates color literals out of webui.py.)
+  renders unchanged, and e2e [48] gates color literals out of webui.py;
+  scanlines sit above the lightbox (z-9999 vs 1000) on purpose — the whole
+  viewport is the Machine's CRT, zoomed photos included.)
 - **Provider overlay, not parallel configs** (user decision, 0.8.0):
   `provider` selects the backend, but model names stay single-keyed — the
   base values are the ollama tags and a `[mlx-serve]` table overlays them

@@ -581,6 +581,7 @@ _REDUCED_MOTION = """\
 
 _PRINT = """\
 @media print {
+  .lightbox { display: none; }
   body { background: #fff; color: #000; }
   body::after { display: none; }
   .theme-toggle { display: none; }

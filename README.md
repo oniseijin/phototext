@@ -459,7 +459,7 @@ PHOTOTEXT_E2E_PROVIDER=mlx-serve .venv/bin/python tests/e2e.py
 - **0.8.0**: mlx-serve LLM backend — `provider` config selects ollama vs
   mlx-serve (e4b + Qwen3 embeddings), one-line rollback, model-scoped
   embeddings, e2e-verified on both providers.
-- **0.9.0 (planned)**: Person of Interest themes (machine/samaritan) for the
+- **0.9.0** (branch `poi-themes`): Person of Interest themes (machine/samaritan) for the
   web UI, image lightbox, run reliability (caffeinate, keep-alive, disk
   preflight).
 - **Backlog**: saved searches / find-similar web strip, timeline scrubber,

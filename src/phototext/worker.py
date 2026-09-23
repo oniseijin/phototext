@@ -194,7 +194,6 @@ def run_pipeline(
         print(disk_warn)
     if _on_battery():
         print("warning: running on battery — a long run may sleep mid-flight")
-        
     exit_code = 0
     if workers > 1:
         with caffeinate():
