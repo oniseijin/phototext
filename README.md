@@ -29,7 +29,7 @@ the tooling — local vision LLMs, structured extraction, crash-safe
 pipelines — and to a running assessment of what current AI-assisted
 development can actually carry once a project outgrows its weekend. All
 of it was built during Silver Week, when a typhoon closed the golf
-course and cleared the calendar; its companion from the same storm is
+course and cleared my calendar; its companion from the same storm is
 [video-security](https://github.com/oniseijin/video-security).
 
 ## How it works
