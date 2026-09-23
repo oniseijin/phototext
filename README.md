@@ -20,17 +20,17 @@ memes, duplicates, trash, and the three [themes](docs/themes.md).
 
 ## Why this exists
 
-My Photos library had years of screenshots-of-text — receipts, quotes,
-snippets — saved to find later and never findable again. Getting the text
-out started as a small weekend script; the script got out of hand, and
-this project is what it grew into. Somewhere along the way the
-interesting part became the tooling itself — local vision LLMs,
-structured extraction, crash-safe pipelines — and a running assessment of
-what current AI-assisted development can actually carry when a project
-outgrows its weekend. It was built during Silver Week, courtesy of a
-typhoon that closed the golf course; see also
-[video-security](https://github.com/oniseijin/video-security), its
-companion project from the same storm.
+My Photos library had quietly filled with years of screenshots-of-text:
+receipts, quotes, snippets, saved to find later and never findable
+again. Getting the text out was supposed to be a small weekend script,
+but the script got out of hand, and this project is what it grew into.
+Somewhere along the way the interesting part shifted from the photos to
+the tooling — local vision LLMs, structured extraction, crash-safe
+pipelines — and to a running assessment of what current AI-assisted
+development can actually carry once a project outgrows its weekend. All
+of it was built during Silver Week, when a typhoon closed the golf
+course and cleared the calendar; its companion from the same storm is
+[video-security](https://github.com/oniseijin/video-security).
 
 ## How it works
 
