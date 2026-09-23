@@ -2,6 +2,28 @@
 
 Guidance for AI coding agents working in this repo.
 
+## Public repo guardrails
+
+This repository is public: https://github.com/oniseijin/phototext. Every
+commit publishes immediately, history included. Before committing or
+pushing anything:
+
+- **No secrets, tokens, or credentials** in code, fixtures, configs, or
+  docs — including examples that look real. If one slips into a commit,
+  say so immediately; rewriting public history is the user's call and
+  must never happen silently.
+- **No real photos or real library data.** Screenshots and fixtures come
+  from the synthetic demo kit (`docs/demo/`) or generated test fixtures
+  only. Catalog DBs, thumbnails, face crops, and logs are state, not
+  source — they stay untracked (gitignored; keep new state dirs ignored
+  and drop `.metadata_never_index` markers in them).
+- **No PII**: real names, faces, addresses, account numbers, or anything
+  from the day job. Use the demo personas (Maya, Theo, Grandma, Ada) and
+  synthetic data.
+- Home-dir paths in prose and screenshots (`/Users/ryan/...`) are fine;
+  content from the actual photo library is not.
+- Never push without being asked — each publish is the user's decision.
+
 ## Commands
 
 - Setup: `uv venv .venv && uv pip install -e .`
