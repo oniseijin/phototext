@@ -135,7 +135,7 @@ def _sidebar(
     link = url_for or (lambda key: f"/?status={key}")
     rec = counts.get("queued", 0) + counts.get("processing", 0) > 0
     rec_dot = (
-        f"<span class='rec-dot{'on' if rec else ' off'}'"
+        f"<span class='rec-dot{'' if rec else ' off'}'"
         f" title='{'processing queue active' if rec else 'queue idle'}'></span>"
     )
 
@@ -806,28 +806,27 @@ def render_duplicates(conn: sqlite3.Connection, ctx: dict | None = None) -> byte
     for index, group in enumerate(clusters, 1):
         biggest = max(group, key=lambda r: r["byte_size"] or 0)
         cards = ""
-        keep_figure = ""
         for r in group[:12]:
-            if r["id"] == biggest["id"]:
-                mark = " <span class='badge ok'>keep</span>"
-            else:
-                mark = " <span class='badge'>derivative</span>"
+            is_keep = r["id"] == biggest["id"]
+            mark = (
+                " <span class='badge ok'>keep (largest)</span>" if is_keep
+                else " <span class='badge'>derivative</span>"
+            )
             taken = f" <span class='badge'>{esc(r['date_taken'][:10])}</span>" if r["date_taken"] else ""
             card = (
                 f"<a class='card' href='/photo/{r['id']}'>"
                 f"<img src='/thumb/{r['id']}' alt='' loading='lazy'>"
                 f"<div class='body'>{esc(str(r['byte_size'] or 0))} bytes{mark}{taken}</div></a>"
             )
-            if r["id"] == biggest["id"]:
-                keep_figure = (
+            if is_keep:
+                card = (
                     "<figure class='subject'><span class='designation'>KEEP</span>"
                     + card + "</figure>"
                 )
-            else:
-                cards += card
+            cards += card
         body += (
             f"<p class='muted'>group {index}: {len(group)} photo(s)</p>"
-            f"<div class='cards'>{keep_figure}{cards}</div>"
+            f"<div class='cards'>{cards}</div>"
         )
     return _page("duplicates - phototext", body, sidebar)
 
@@ -1181,7 +1180,27 @@ def render_person(
     sidebar = _sidebar(conn, active="people")
     body = "<p><a class='back' href='/people'>&#8592; all people</a></p>"
     writable = bool(ctx and ctx.get("writable") and ctx.get("token"))
-    body += f"<h2 style='margin:6px 0'>{esc(person['name'])}</h2>"
+    header_photo = conn.execute(
+        "SELECT photo_id FROM person_tags WHERE person_id = ? AND seed = 1 "
+        "ORDER BY photo_id LIMIT 1",
+        (person_id,),
+    ).fetchone()
+    if header_photo is None:
+        header_photo = conn.execute(
+            "SELECT photo_id FROM person_tags WHERE person_id = ? "
+            "ORDER BY photo_id LIMIT 1",
+            (person_id,),
+        ).fetchone()
+    crop = ""
+    if header_photo is not None:
+        crop = (
+            "<figure class='subject'><span class='designation'>"
+            f"{esc(person['name'])}</span>"
+            f"<img class='face' style='width:120px;height:120px' "
+            f"src='/face/{person_id}/{header_photo['photo_id']}' "
+            f"alt='{esc(person['name'])}'></figure>"
+        )
+    body += f"{crop}<h2 style='margin:6px 0'>{esc(person['name'])}</h2>"
     if hidden_only:
         chip = f"<a class='on' href='/person/{person_id}'>all photos</a>"
     elif show_hidden:  # legacy mixed view (?hidden=1)
@@ -1843,6 +1862,10 @@ def serve(
     token = secrets.token_hex(16) if writable else None
     if theme is not None and theme in webtheme.THEMES:
         _default_theme = theme
+    elif theme is not None:
+        print(f"warning: unknown web_theme {theme!r}; "
+              f"using {webtheme.DEFAULT_THEME!r} "
+              f"(valid: {', '.join(webtheme.THEMES)})")
     httpd = _Server(
         (host, port), _Handler, db_path, thumbs_dir, views_dir, writable, token, person_cfg
     )

@@ -1980,7 +1980,7 @@ def main() -> int:
     check(up38, "duplicates tab serves")
     if up38:
         r = requests.get(base38 + "/duplicates")
-        check("keep</span>" in r.text and "derivative</span>" in r.text,
+        check("keep (largest)</span>" in r.text and "derivative</span>" in r.text,
               "web duplicates page marks keep vs derivative")
         check("<span class='designation'>KEEP</span>" in r.text,
               "web duplicates page carries the PoI KEEP designation")
@@ -2934,6 +2934,15 @@ def main() -> int:
                 f"{theme} token block present",
             )
         check("rec-dot" in r.text, "semantic rec-dot renders in the brand row")
+        check(
+            "class='rec-dot'" in r.text and "rec-doton" not in r.text,
+            "rec-dot is active while photos are queued (not the broken class)",
+        )
+        webui_src = (ROOT / "src/phototext/webui.py").read_text()
+        check(
+            not re.findall(r"(^|[^&])#[0-9a-fA-F]{3,8}\b|rgba?\(", webui_src),
+            "grep gate: no color literals in webui.py",
+        )
         photo48 = db_open(theme48_dir / "catalog.db").execute(
             "SELECT id FROM photos ORDER BY id LIMIT 1"
         ).fetchone()[0]

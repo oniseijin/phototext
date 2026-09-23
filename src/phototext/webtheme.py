@@ -49,6 +49,11 @@ TOKENS: dict[str, dict[str, str]] = {
         "selection-bg": "rgba(42,93,176,.5)",
         "selection-ink": "#ffffff",
         "image-bg": "#0d0e11",
+        "nav-ink": "#c7cdd6",
+        "radius-sm": "6px",
+        "radius-pill": "12px",
+        "chip-bg": "rgba(13,14,17,.85)",
+        "selbox-tint": "rgba(138,180,248,.18)",
         "frame-edge": "transparent",
         "frame-glow": "none",
         "face-glow": "none",
@@ -81,6 +86,11 @@ TOKENS: dict[str, dict[str, str]] = {
         "selection-bg": "rgba(134,0,0,.6)",
         "selection-ink": "rgba(255,0,0,.95)",
         "image-bg": "#000000",
+        "nav-ink": "rgba(255,255,255,.78)",
+        "radius-sm": "0px",
+        "radius-pill": "0px",
+        "chip-bg": "rgba(0,0,0,.85)",
+        "selbox-tint": "rgba(255,255,255,.15)",
         "frame-edge": "transparent",
         "frame-glow": "drop-shadow(0 0 6px var(--pt-ink))",
         "face-glow": "0 0 6px rgba(255,255,255,.7)",
@@ -113,6 +123,11 @@ TOKENS: dict[str, dict[str, str]] = {
         "selection-bg": "#e8000d",
         "selection-ink": "#ffffff",
         "image-bg": "#f4f4f4",
+        "nav-ink": "rgba(0,0,0,.78)",
+        "radius-sm": "0px",
+        "radius-pill": "0px",
+        "chip-bg": "rgba(255,255,255,.85)",
+        "selbox-tint": "rgba(232,0,13,.12)",
         "frame-edge": "var(--pt-line)",
         "frame-glow": "none",
         "face-glow": "none",
@@ -240,10 +255,10 @@ body::after {
 .navlist { display: flex; flex-direction: column; gap: 1px; }
 
 .navlist a {
-  color: var(--pt-ink-dim);
+  color: var(--pt-nav-ink);
   text-decoration: none;
   padding: 5px 8px;
-  border-radius: var(--pt-radius);
+  border-radius: var(--pt-radius-sm);
   font-size: 13.5px;
 }
 
@@ -269,7 +284,7 @@ body::after {
 input[type=text] {
   flex: 1;
   padding: 6px 10px;
-  border-radius: var(--pt-radius);
+  border-radius: var(--pt-radius-sm);
   border: 1px solid var(--pt-line);
   background: var(--pt-bg);
   color: var(--pt-ink);
@@ -277,7 +292,7 @@ input[type=text] {
 
 button {
   padding: 6px 14px;
-  border-radius: var(--pt-radius);
+  border-radius: var(--pt-radius-sm);
   border: 0;
   background: var(--pt-accent);
   color: var(--pt-accent-ink);
@@ -296,7 +311,7 @@ nav a {
   color: var(--pt-ink-dim);
   text-decoration: none;
   padding: 3px 10px;
-  border-radius: calc(var(--pt-radius) + 4px);
+  border-radius: var(--pt-radius-pill);
 }
 
 nav a.on { background: var(--pt-accent); color: var(--pt-accent-ink); }
@@ -353,7 +368,7 @@ nav a.on { background: var(--pt-accent); color: var(--pt-accent-ink); }
 }
 
 .cardbox form.act button.mini {
-  background: var(--pt-image-bg);
+  background: var(--pt-chip-bg);
 }
 
 .snippet {
@@ -414,7 +429,7 @@ details { margin-top: 12px; }
 
 ul.locs {
   font-size: 12.5px;
-  color: var(--pt-ink);
+  color: var(--pt-nav-ink);
   padding-left: 18px;
 }
 
@@ -430,7 +445,7 @@ form.act { display: inline-block; margin-right: 8px; }
 
 button.mini {
   padding: 4px 12px;
-  border-radius: var(--pt-radius);
+  border-radius: var(--pt-radius-sm);
   border: 1px solid var(--pt-line);
   background: var(--pt-surface-1);
   color: var(--pt-ink);
@@ -454,7 +469,7 @@ button.mini:hover { background: var(--pt-surface-2); }
   width: 110px;
   height: 82px;
   object-fit: cover;
-  border-radius: var(--pt-radius);
+  border-radius: var(--pt-radius-sm);
   background: var(--pt-image-bg);
 }
 
@@ -471,7 +486,7 @@ a.back { color: var(--pt-link); text-decoration: none; }
 .selbox {
   position: absolute;
   border: 2px solid var(--pt-link);
-  background: var(--pt-surface-2);
+  background: var(--pt-selbox-tint);
   display: none;
   pointer-events: none;
 }
@@ -514,7 +529,7 @@ a.back { color: var(--pt-link); text-decoration: none; }
 .wideform input[type=text] {
   flex: 1;
   padding: 6px 10px;
-  border-radius: var(--pt-radius);
+  border-radius: var(--pt-radius-sm);
   border: 1px solid var(--pt-line);
   background: var(--pt-bg);
   color: var(--pt-ink);
@@ -561,6 +576,7 @@ summary .count { color: var(--pt-ink-dim); text-transform: none; }
 _REDUCED_MOTION = """\
 @media (prefers-reduced-motion: reduce) {
   .rec-dot { animation: none; }
+  .card::before { transition: none; }
 }"""
 
 _PRINT = """\
@@ -582,6 +598,7 @@ html[data-theme='machine'] .selbox {
   box-shadow: var(--pt-face-glow);
 }
 
+html[data-theme='samaritan'] .selbox::after,
 html[data-theme='machine'] .selbox::after {
   content: '';
   position: absolute;
@@ -668,6 +685,7 @@ _SUBJECT = """\
 }
 html[data-theme='machine'] .subject,
 html[data-theme='samaritan'] .subject {
+  margin: .5rem 0 .75rem;
   padding: .75rem;
   border: 1px solid var(--pt-frame-edge);
 }
@@ -721,8 +739,8 @@ html[data-theme='samaritan'] .subject::before {
   text-transform: uppercase;
   letter-spacing: .08em;
   background: var(--pt-bg);
-  color: var(--pt-ink);
-  border: 1px solid var(--pt-ink);
+  color: var(--pt-tone, var(--pt-ink));
+  border: 1px solid var(--pt-tone, var(--pt-ink));
   padding: .1rem .5rem;
 }
 html[data-theme='machine'] .designation,
