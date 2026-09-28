@@ -873,6 +873,70 @@ def main() -> int:
         con.close()
         mode_file.write_text("ok")
 
+        # Regression: a photo that reads fine up front but vanishes before the
+        # tile pass (iCloud evicts the original between the two reads) must be
+        # marked error — its ImageReadError used to escape uncaught and kill
+        # the whole run (in --workers mode: one worker after another).
+        from phototext import db as dbmod23
+        from phototext import worker as workermod
+        from phototext.config import Config
+        from phototext.ollama_client import ModelOutputError
+
+        class EvictingClient:
+            """extract() deletes the file, then emits junk: the whole-image
+            pass consumes the pixels, so tiling re-opens a missing file."""
+
+            model = MODEL
+
+            def __init__(self, target: Path):
+                self.target = target
+                self.calls = 0
+
+            def extract(self, b64: str):
+                self.calls += 1
+                self.target.unlink()
+                raise ModelOutputError("mock: junk so tiling is attempted")
+
+        evict_file = tile_folder / "evict.jpg"
+        make_text_image(evict_file, ["evict me"])
+        evict_db = work / "db-evict.db"
+        evict_con = dbmod23.connect(evict_db)
+        dbmod23.upsert_source(evict_con, "evict-src", "folder")
+        evict_id, _ = dbmod23.upsert_photo(evict_con, "evict-sha-unique", 1)
+        dbmod23.upsert_location(evict_con, evict_id, 1, str(evict_file), 0, 1)
+        evict_con.commit()
+        evict_row = evict_con.execute(
+            "SELECT * FROM photos WHERE id = ?", (evict_id,)
+        ).fetchone()
+        outcome = workermod._process_item(
+            evict_con,
+            EvictingClient(evict_file),
+            Config(db_path=evict_db, model=MODEL, max_attempts=2),
+            evict_row,
+            workermod.RunController(),
+            1,
+            1,
+        )
+        check(outcome == "error", "tile-pass read failure is isolated as an error")
+        check(
+            count(
+                evict_con,
+                "SELECT COUNT(*) FROM photos WHERE id = ? AND status='error' "
+                "AND error LIKE '%unreadable%'",
+                (evict_id,),
+            ) == 1,
+            "photo evicted between reads is marked error (the run survives)",
+        )
+        check(
+            count(
+                evict_con,
+                "SELECT COUNT(*) FROM photos WHERE id = ? AND status='queued'",
+                (evict_id,),
+            ) == 0,
+            "failed photo is not left queued for another worker to die on",
+        )
+        evict_con.close()
+
         print("\n[24] reprocess selections")
         out = c15.run("reprocess", "--tiled")
         check("requeued 1" in out, "reprocess --tiled selects the tiled photo")
@@ -1003,6 +1067,33 @@ def main() -> int:
         check(
             count(con, "SELECT COUNT(*) FROM photos WHERE status='done'") == 4,
             "reclaimed photo is reprocessed",
+        )
+        con.close()
+        # Regression: a stale-lease reclaim must preserve attempts. Resetting
+        # them to 0 let a poison photo (one that kills its worker) be
+        # re-claimed and kill every worker in turn, forever.
+        con = db_open(work / "db-workdb.db")
+        poison_id = con.execute(
+            "SELECT id FROM photos WHERE status = 'done' ORDER BY id LIMIT 1"
+        ).fetchone()[0]
+        con.execute(
+            "UPDATE photos SET status='processing', started_at=?, attempts=3 "
+            "WHERE id=?",
+            (stale, poison_id),
+        )
+        con.commit()
+        con.close()
+        out = c18.run("run", "--workers", "2", "--skip-preflight", "--no-scan")
+        check("max attempts exceeded" in out, "poison photo retires at max attempts")
+        con = db_open(work / "db-workdb.db")
+        check(
+            count(
+                con,
+                "SELECT COUNT(*) FROM photos WHERE id = ? AND status='error' "
+                "AND error LIKE '%max attempts%'",
+                (poison_id,),
+            ) == 1,
+            "reclaim kept attempts so the photo is marked failed, not re-claimed",
         )
         con.close()
         c18.run("run", "--workers", "2", "--limit", "2", expect=2)
@@ -1146,6 +1237,16 @@ def main() -> int:
             cache_dir = work / d
             cache_dir.mkdir(exist_ok=True)
             (cache_dir / "3.jpg").write_bytes(b"cached")
+        # Regression: purge must clear photo_embeddings (the migration-13
+        # child table) too — with the FK enabled, the delete used to abort
+        # the whole purge on any embedded photo.
+        con = db_open(work / "db-hidedb.db")
+        con.execute(
+            "INSERT INTO photo_embeddings (photo_id, model, dims, vector) "
+            "VALUES (3, 'nomic-mock', 8, zeroblob(32))"
+        )
+        con.commit()
+        con.close()
         out = c21.run("purge", "--empty-trash")
         check("purged 1" in out, "purge --empty-trash forgets the trash")
         check("removed 2 cached" in out, "purge reports removed cache files")
@@ -1174,6 +1275,12 @@ def main() -> int:
         check("would remove 0" in out, "clean-caches dry run finds nothing left")
         con = db_open(work / "db-hidedb.db")
         check(count(con, "SELECT COUNT(*) FROM photos") == 2, "purged row gone")
+        check(
+            count(
+                con, "SELECT COUNT(*) FROM photo_embeddings WHERE photo_id = 3"
+            ) == 0,
+            "purge removes the photo's embeddings",
+        )
         con.close()
         out = c21.run("scan", str(hide_folder))
         check("new 1" in out, "rescan re-adds purged photos")
@@ -1406,11 +1513,34 @@ def main() -> int:
         con = db_open(work / "db-unscandb.db")
         check(count(con, "SELECT COUNT(*) FROM photos") == 2, "two photos registered")
         con.close()
+        # Regression: unscan (remove_source) must clear the forgotten photos'
+        # photo_embeddings too, or the FK aborts the unscan with an
+        # IntegrityError once any forgotten photo has an embedding.
+        con = db_open(work / "db-unscandb.db")
+        unique_id = con.execute(
+            "SELECT p.id FROM photos p JOIN locations l ON l.photo_id = p.id "
+            "WHERE l.path LIKE '%unique.jpg'"
+        ).fetchone()[0]
+        con.execute(
+            "INSERT INTO photo_embeddings (photo_id, model, dims, vector) "
+            "VALUES (?, 'nomic-mock', 8, zeroblob(32))",
+            (unique_id,),
+        )
+        con.commit()
+        con.close()
         out = c22.run("unscan", str(unscan_folder))
         check("forgotten 1" in out, "unscan forgets photos only seen there")
         con = db_open(work / "db-unscandb.db")
         check(count(con, "SELECT COUNT(*) FROM photos") == 1, "shared photo survives")
         check(count(con, "SELECT COUNT(*) FROM sources") == 1, "source unregistered")
+        check(
+            count(
+                con,
+                "SELECT COUNT(*) FROM photo_embeddings WHERE photo_id = ?",
+                (unique_id,),
+            ) == 0,
+            "unscan removes the forgotten photo's embeddings",
+        )
         con.close()
         c22.run("unscan", "99", expect=2)
 
@@ -1487,6 +1617,51 @@ def main() -> int:
         check(
             con.execute("SELECT COUNT(*) FROM photos WHERE sha256 LIKE 'deferred:%'").fetchone()[0] == 1,
             "promotion collapses the deferred row into the content row",
+        )
+        con.close()
+        # Regression: promoting a deferred photo whose original downloaded
+        # while identical content already exists as another row. The scan
+        # recorded the uuid in photo_assets, so the deferred-row delete used
+        # to violate the FK and raise IntegrityError — crashing the scan and
+        # every nightly run after it (the same asset kept failing).
+        con = db_open(work / "db-deferdb.db")
+        con.row_factory = None
+        cloud2 = con.execute(
+            "SELECT id FROM photos WHERE sha256 = 'deferred:CLOUD-2'"
+        ).fetchone()[0]
+        dbmod.record_asset(con, 1, "CLOUD-2", cloud2)
+        con.execute(
+            "INSERT INTO photo_embeddings (photo_id, model, dims, vector) "
+            "VALUES (?, 'nomic-mock', 8, zeroblob(32))",
+            (cloud2,),
+        )
+        con.commit()
+        raised = None
+        try:
+            dbmod.promote_deferred(
+                con, "CLOUD-2", digest, 123, 1, str(defer_folder / "real.jpg"), 1,
+            )
+            con.commit()
+        except sqlite3.IntegrityError as e:
+            raised = e
+        check(
+            raised is None,
+            "promoting a deferred row with duplicate content does not raise"
+            + (f" (got {raised})" if raised else ""),
+        )
+        check(
+            con.execute("SELECT COUNT(*) FROM photos WHERE sha256 LIKE 'deferred:%'").fetchone()[0] == 0,
+            "duplicate-content promotion still collapses the deferred row",
+        )
+        check(
+            con.execute("SELECT photo_id FROM photo_assets WHERE uuid = 'CLOUD-2'").fetchone()[0] == kept,
+            "asset identity link repoints to the surviving row",
+        )
+        check(
+            con.execute(
+                "SELECT COUNT(*) FROM photo_embeddings WHERE photo_id = ?", (cloud2,)
+            ).fetchone()[0] == 0,
+            "deferred row's extraction children are cleared on promotion",
         )
         con.close()
 
@@ -2791,6 +2966,78 @@ def main() -> int:
         # --all re-embeds everyone
         out = c46.run("embed", "--all")
         check("embedded 3 photo(s)" in out, "embed --all re-embeds all 3")
+
+        # Regression: embeddings must commit per batch — the run used to hold
+        # one transaction to the very end, so an interruption (Ctrl+C, server
+        # dying mid-backfill) rolled every embedding of the run back to zero.
+        from phototext import cli as climod
+
+        class InterruptedEmbed:
+            """Fails on the second embed call, like a server dying mid-run."""
+
+            def __init__(self):
+                self.calls = 0
+
+            def embed(self, texts):
+                self.calls += 1
+                if self.calls == 2:
+                    raise RuntimeError("mock: interrupted mid-backfill")
+                return [[0.5] * 8 for _ in texts]
+
+        con46 = db_open(work / "db-embed.db")
+        con46.row_factory = sqlite3.Row
+        batch_ids = []
+        for i in range(32):
+            sha = f"embed-batch-{i:02d}"
+            pid, _ = dbmod.upsert_photo(con46, sha, 100)
+            con46.execute(
+                "UPDATE photos SET text = ? WHERE id = ?", (f"batch text {i}", pid)
+            )
+            batch_ids.append(pid)
+        con46.commit()
+        con46.close()
+        flaky = InterruptedEmbed()
+        conn46a = db_open(work / "db-embed.db")
+        climod._embed_batch(
+            flaky,
+            conn46a,
+            "nomic-mock",
+            batch_ids,
+            [f"batch text {i}" for i in range(32)],
+        )
+        conn46a.close()
+        marks46 = ",".join("?" for _ in batch_ids)
+        params46 = tuple(batch_ids)
+        fresh46 = db_open(work / "db-embed.db")
+        check(
+            count(
+                fresh46,
+                f"SELECT COUNT(*) FROM photo_embeddings "
+                f"WHERE photo_id IN ({marks46})",
+                params46,
+            ) == 32,
+            "embed batch commits immediately (rows visible from a new connection)",
+        )
+        interrupted46 = False
+        conn46b = db_open(work / "db-embed.db")
+        try:
+            climod._embed_batch(
+                flaky, conn46b, "nomic-mock", batch_ids, ["x"] * 32
+            )
+        except Exception:
+            interrupted46 = True
+        check(interrupted46, "embed failure surfaces as an error")
+        check(
+            count(
+                fresh46,
+                f"SELECT COUNT(*) FROM photo_embeddings "
+                f"WHERE photo_id IN ({marks46})",
+                params46,
+            ) == 32,
+            "interruption keeps every batch that already committed",
+        )
+        fresh46.close()
+        conn46b.close()
 
         # no embed_model: semantic search errors
         cfg46n = work / "config-noemb46.toml"

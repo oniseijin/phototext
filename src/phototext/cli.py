@@ -942,6 +942,10 @@ def _embed_batch(client, conn, model, photo_ids, texts):
         import array
         vector_bytes = array.array("f", vec).tobytes()
         db.store_embedding(conn, photo_id, model, dims, vector_bytes)
+    # Commit per batch: the (photo_id, model) upsert is idempotent, so an
+    # interrupted backfill keeps every batch that finished instead of
+    # rolling the whole run back to zero.
+    conn.commit()
 
 
 def _dir_bytes(path: Path) -> int:

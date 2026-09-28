@@ -4,13 +4,14 @@ import base64
 import contextlib
 import os
 import shutil
-import warnings
 import re
 import signal
+import sqlite3
 import subprocess
 import sys
 import threading
 import time
+import warnings
 from dataclasses import replace
 from pathlib import Path
 
@@ -168,7 +169,10 @@ def run_pipeline(
                 scanner.scan_source(conn, src["uri"], src["id"], slice_spec,
                                 process_derivatives=cfg.process_derivatives,
                                 ocr_enabled=cfg.vision_ocr)
-            except (FileNotFoundError, ValueError) as e:
+            except (FileNotFoundError, ValueError, sqlite3.IntegrityError) as e:
+                # IntegrityError: one poisoned row (e.g. an asset whose
+                # deferred duplicate hit an FK gap) must never take down the
+                # whole night's scan phase.
                 print(f"  scan error: {e}")
                 if slice_spec is not None:
                     print("Not processing: fix the slice filters and run again.")
@@ -299,7 +303,7 @@ def _watch_scan(
                 ocr_enabled=ocr_enabled,
             )
             newly += stats.new_photos
-        except (FileNotFoundError, ValueError) as e:
+        except (FileNotFoundError, ValueError, sqlite3.IntegrityError) as e:
             print(f"  watch scan error: {e}")
     return newly
 
@@ -581,6 +585,17 @@ def _process_item(
                 db.requeue(conn, photo_id)
                 raise RunAborted(f"Ollama at {client.base_url} stayed unreachable.") from e
             continue
+        except ImageReadError as e:
+            # The file was readable for the whole-image pass but vanished or
+            # became unreadable before the tile pass (iCloud evicted the
+            # original, permissions changed). Not retryable: record it and
+            # move on instead of killing the run — or, in --workers mode,
+            # every worker in turn.
+            db.mark_error(conn, photo_id, f"unreadable image: {e}")
+            _report_error(
+                index, total, time.monotonic() - started, str(e), path, photo_id
+            )
+            return "error"
         except (OllamaServerError, ModelOutputError, OllamaTimeout) as e:
             last_error = e
             tries_left -= 1

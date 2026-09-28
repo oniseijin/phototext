@@ -352,6 +352,16 @@ def remove_source(conn: sqlite3.Connection, source_id: int) -> dict:
             "(SELECT p.id FROM photos p WHERE NOT EXISTS "
             "(SELECT 1 FROM locations l WHERE l.photo_id = p.id))"
         )
+    _delete_photo_children(
+        conn,
+        [
+            r["id"]
+            for r in conn.execute(
+                "SELECT id FROM photos p WHERE NOT EXISTS "
+                "(SELECT 1 FROM locations l WHERE l.photo_id = p.id)"
+            )
+        ],
+    )
     forgotten = conn.execute(
         "DELETE FROM photos WHERE NOT EXISTS "
         "(SELECT 1 FROM locations l WHERE l.photo_id = photos.id)"
@@ -371,6 +381,29 @@ def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?", (name,)
     ).fetchone()
     return row is not None
+
+
+def _delete_photo_children(conn: sqlite3.Connection, photo_ids: list[int]) -> None:
+    """Delete child-table rows that reference the given photos.
+
+    Must run before `DELETE FROM photos ...`: photo_embeddings (migration 13)
+    and person_tags reference photos(id), and with PRAGMA foreign_keys=ON the
+    parent delete raises IntegrityError while a child row survives. Shared by
+    every delete path (purge, unscan, deferred promotion) so none of them can
+    drift out of sync with the schema again. Chunks like purge_photos so bulk
+    deletes stay within SQLite's host-parameter limit.
+    """
+    for i in range(0, len(photo_ids), 500):
+        chunk = photo_ids[i : i + 500]
+        marks = ",".join("?" for _ in chunk)
+        if _table_exists(conn, "photo_embeddings"):
+            conn.execute(
+                f"DELETE FROM photo_embeddings WHERE photo_id IN ({marks})", chunk
+            )
+        if _table_exists(conn, "person_tags"):
+            conn.execute(
+                f"DELETE FROM person_tags WHERE photo_id IN ({marks})", chunk
+            )
 
 
 def upsert_photo(
@@ -581,6 +614,7 @@ def purge_photos(conn: sqlite3.Connection, photo_ids: list[int]) -> int:
             )
         conn.execute(f"DELETE FROM photo_assets WHERE photo_id IN ({marks})", chunk)
         conn.execute(f"DELETE FROM locations WHERE photo_id IN ({marks})", chunk)
+        _delete_photo_children(conn, chunk)
         cur = conn.execute(f"DELETE FROM photos WHERE id IN ({marks})", chunk)
         purged += cur.rowcount
     if photo_ids:
@@ -690,6 +724,17 @@ def promote_deferred(
     existing = conn.execute("SELECT id FROM photos WHERE sha256 = ?", (sha256,)).fetchone()
     if existing is not None:
         if deferred is not None:
+            # The scan that created the deferred row recorded its uuid in
+            # photo_assets, and a processed preview derivative may have left
+            # extraction children behind: repoint the identity link to the
+            # surviving row (the uuid maps to this content) and clear the
+            # children before the delete, or the FK aborts it — and every
+            # later scan crashes on the same asset.
+            conn.execute(
+                "UPDATE photo_assets SET photo_id = ? WHERE photo_id = ?",
+                (existing[0], deferred[0]),
+            )
+            _delete_photo_children(conn, [deferred[0]])
             if _table_exists(conn, "photo_warnings"):
                 conn.execute(
                     "DELETE FROM photo_warnings WHERE photo_id = ?", (deferred[0],)
@@ -940,13 +985,15 @@ def reclaim_stale(conn: sqlite3.Connection, lease_timeout_s: int = 3600) -> int:
 
     The multi-worker equivalent of startup recovery: a crashed worker's photos
     become claimable again once the lease expires, without stomping on rows
-    belonging to healthy workers.
+    belonging to healthy workers. attempts is preserved, so a photo that
+    killed its worker repeatedly hits the max-attempts guard on the next
+    claim and retires as an error instead of killing every worker in turn.
     """
     cutoff = (
         datetime.now(timezone.utc) - timedelta(seconds=lease_timeout_s)
     ).isoformat(timespec="seconds")
     cur = conn.execute(
-        "UPDATE photos SET status = 'queued', attempts = 0, error = NULL, "
+        "UPDATE photos SET status = 'queued', error = NULL, "
         "started_at = NULL, finished_at = NULL "
         "WHERE status = 'processing' AND started_at IS NOT NULL AND started_at <= ? "
         "AND deleted_at IS NULL",
