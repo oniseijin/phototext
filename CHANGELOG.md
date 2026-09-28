@@ -4,9 +4,25 @@ All notable changes to phototext are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 semantic versioning.
 
-## [Unreleased]
+## [0.9.1] - 2026-09-29
 
 ### Fixed
+
+- db: `_delete_photo_children` clears `photo_embeddings`/`person_tags`
+  before any parent photo delete — with `PRAGMA foreign_keys=ON`,
+  `remove_source`/`purge` aborted mid-delete and left orphaned child rows
+  behind. `promote_deferred` repoints `photo_assets` to the surviving row
+  and clears its children, so a deferred duplicate's FK gap can no longer
+  crash every later scan of that asset.
+- db: `reclaim_stale` preserves attempts — a photo that killed its worker
+  repeatedly now retires via the max-attempts guard instead of killing
+  every worker in turn.
+- worker: `sqlite3.IntegrityError` joins the per-source scan-error catch
+  (one poisoned row no longer takes down the night's scan phase);
+  `ImageReadError` between the whole-image and tile pass (iCloud eviction)
+  is marked error and the run moves on.
+- cli: embed backfill commits per batch — the (photo_id, model) upsert is
+  idempotent, so an interrupted run keeps finished batches.
 
 - Web UI: on `serve --writable` photo pages, the person-tag form and hint
   rendered as stretched columns beside the photo instead of a compact row
@@ -21,6 +37,7 @@ semantic versioning.
   synthetic photo library + authored-response mock Ollama; the README
   hero shots and pipeline diagram come from it).
 
+## [0.9.0] - 2026-09-23
 
 ### Added
 
