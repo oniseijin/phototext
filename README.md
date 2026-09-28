@@ -525,7 +525,7 @@ See `DESIGN.md` for the full design and decision log.
 ## AI-First Development
 
 This is an AI-first project: built with [opencode](https://opencode.ai),
-assisted by a professional software engineer.
+directed by a professional software engineer.
 
 ## License
 
