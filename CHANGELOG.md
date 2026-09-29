@@ -4,6 +4,13 @@ All notable changes to phototext are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 semantic versioning.
 
+## [0.9.2] - 2026-09-30
+
+### Changed
+
+- README: attribution — built with opencode, with help from pi, and
+  backed by ai&.
+
 ## [0.9.1] - 2026-09-29
 
 ### Fixed
